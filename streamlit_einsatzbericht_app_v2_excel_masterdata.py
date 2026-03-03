@@ -28,6 +28,9 @@ REPORT_DETAIL_END_ROW = 35
 REPORT_DETAIL_COL_START = 1  # A
 REPORT_DETAIL_COL_END = 8    # H
 REPORT_ROWS_PER_PAGE = REPORT_DETAIL_END_ROW - REPORT_DETAIL_START_ROW + 1
+MILESTONES_SHEET = "Meilensteine"
+MILESTONE_COLS = ["Projekt", "Meilenstein", "Datum", "Status", "Fortschritt", "Kommentar"]
+MILESTONE_STATUSES = ["geplant", "in arbeit", "blockiert", "erledigt"]
 
 TAET_COLS = [
     "Datum",
@@ -50,11 +53,12 @@ KEY_COLS_FOR_EMPTY_CHECK = [1, 2, 3, 4, 9, 12, 13, 14]  # ignore formula columns
 
 
 @dataclass
+@dataclass
 class WorkbookData:
     path: Path
     taetigkeiten_df: pd.DataFrame
     lookups: Dict[str, Any]
-
+    milestones_df: pd.DataFrame
 
 # ------------------------- parsing helpers -------------------------
 
@@ -749,8 +753,123 @@ def load_workbook_data(path_str: str) -> WorkbookData:
     wb = openpyxl.load_workbook(path)
     lookups = _load_lookups(wb)
     taetigkeiten_df = _read_taetigkeiten_df(wb)
-    return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, lookups=lookups)
+    milestones_df = _read_milestones_df(wb)
+    return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, lookups=lookups, milestones_df=milestones_df)
 
+
+
+# --------------------- Milestone ------------------------------------
+
+def _normalize_milestone_status(v: Any) -> str:
+    s = _safe_str(v).strip().lower()
+    if not s:
+        return "geplant"
+    # kleine Normalisierung
+    if s in {"done", "erledigt", "fertig"}:
+        return "erledigt"
+    if s in {"blocked", "blockiert"}:
+        return "blockiert"
+    if s in {"in progress", "in arbeit", "arbeit"}:
+        return "in arbeit"
+    if s in {"planned", "geplant"}:
+        return "geplant"
+    return s
+
+
+def _read_milestones_df(wb: openpyxl.Workbook) -> pd.DataFrame:
+    if MILESTONES_SHEET not in wb.sheetnames:
+        return pd.DataFrame(columns=MILESTONE_COLS + ["_excel_row"])
+
+    ws = wb[MILESTONES_SHEET]
+    rows: List[Dict[str, Any]] = []
+
+    # Header ist optional; wir lesen ab Zeile 2 robust.
+    for r in range(2, ws.max_row + 1):
+        projekt = ws.cell(r, 1).value
+        name = ws.cell(r, 2).value
+        datum = ws.cell(r, 3).value
+        status = ws.cell(r, 4).value
+        fort = ws.cell(r, 5).value
+        comment = ws.cell(r, 6).value
+
+        # Skip komplett leere Zeilen
+        if _is_blank(projekt) and _is_blank(name) and _is_blank(datum) and _is_blank(status) and _is_blank(fort) and _is_blank(comment):
+            continue
+
+        d = _to_date(datum)
+        f = _to_float_or_none(fort)
+        if f is None:
+            f = 0.0
+        # clamp 0..100
+        f = max(0.0, min(100.0, float(f)))
+
+        rec = {
+            "Projekt": _safe_str(projekt).strip(),
+            "Meilenstein": _safe_str(name).strip(),
+            "Datum": d,
+            "Status": _normalize_milestone_status(status),
+            "Fortschritt": f,
+            "Kommentar": _safe_str(comment).strip(),
+            "_excel_row": r,
+        }
+        rows.append(rec)
+
+    dfm = pd.DataFrame(rows)
+    if dfm.empty:
+        return pd.DataFrame(columns=MILESTONE_COLS + ["_excel_row"])
+
+    dfm["Datum_dt"] = pd.to_datetime(dfm["Datum"], errors="coerce")
+    dfm = dfm.sort_values(["Projekt", "Datum_dt", "_excel_row"], ascending=[True, True, True]).drop(columns=["Datum_dt"])
+    dfm = dfm.reset_index(drop=True)
+    return dfm
+
+
+def _ensure_milestones_sheet(wb: openpyxl.Workbook):
+    if MILESTONES_SHEET in wb.sheetnames:
+        ws = wb[MILESTONES_SHEET]
+    else:
+        ws = wb.create_sheet(MILESTONES_SHEET)
+
+    # Header sicherstellen
+    if ws.max_row < 1 or all(_is_blank(ws.cell(1, c).value) for c in range(1, 7)):
+        for i, h in enumerate(MILESTONE_COLS, start=1):
+            ws.cell(1, i).value = h
+    return ws
+
+
+def _find_next_milestone_row(ws) -> int:
+    # erste freie Zeile nach unten
+    for r in range(2, ws.max_row + 2):
+        if all(_is_blank(ws.cell(r, c).value) for c in range(1, 7)):
+            return r
+    return ws.max_row + 1
+
+
+def _write_milestone_row(ws, row_idx: int, rec: Dict[str, Any]) -> None:
+    projekt = _safe_str(rec.get("Projekt")).strip()
+    name = _safe_str(rec.get("Meilenstein")).strip()
+    datum = _to_date(rec.get("Datum"))
+    status = _normalize_milestone_status(rec.get("Status"))
+    fort = _to_float_or_none(rec.get("Fortschritt"))
+    if fort is None:
+        fort = 0.0
+    fort = max(0.0, min(100.0, float(fort)))
+    comment = _safe_str(rec.get("Kommentar")).strip()
+
+    ws.cell(row_idx, 1).value = projekt or None
+    ws.cell(row_idx, 2).value = name or None
+    ws.cell(row_idx, 3).value = datum
+    ws.cell(row_idx, 4).value = status or None
+    ws.cell(row_idx, 5).value = float(fort)
+    ws.cell(row_idx, 6).value = comment or None
+
+    ws.cell(row_idx, 3).number_format = "DD.MM.YYYY"
+    ws.cell(row_idx, 5).number_format = "0"
+
+
+def _clear_milestone_row(ws, row_idx: int) -> None:
+    for c in range(1, 7):
+        ws.cell(row_idx, c).value = None
 
 
 # ------------------------- workbook writing -------------------------
@@ -1629,7 +1748,7 @@ def _render_chart_block(
     )
 
 
-def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any]) -> None:
+def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_path: Path, milestones_df: pd.DataFrame) -> None:
     st.subheader("Visualisierung / Controlling")
 
     base = _viz_base_df(df)
@@ -1671,6 +1790,270 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any]) -> Non
     if x.empty:
         st.warning("Keine Daten für diese Auswahl.")
         return
+
+    # =========================
+    # Milestones / Timeline (pro Projekt)
+    # =========================
+    st.markdown("---")
+    st.subheader("Zeitschiene / Meilensteine")
+
+    today = dt.date.today()
+
+    if not isinstance(milestones_df, pd.DataFrame) or milestones_df.empty:
+        ms_all = pd.DataFrame(columns=MILESTONE_COLS + ["_excel_row"])
+    else:
+        ms_all = milestones_df.copy()
+
+    if len(sel_projects) != 1:
+        st.info("Für die Zeitschiene wähle bitte **genau ein Projekt** aus.")
+    else:
+        proj = sel_projects[0]
+        ms_proj = ms_all[ms_all["Projekt"].astype(str).str.strip() == str(proj)].copy()
+        if ms_proj.empty:
+            ms_proj = pd.DataFrame(columns=MILESTONE_COLS + ["_excel_row"])
+
+        # --- KPI: wo stehen wir ---
+        ms_kpi = ms_proj.copy()
+        ms_kpi["Datum_dt"] = pd.to_datetime(ms_kpi["Datum"], errors="coerce")
+        ms_kpi["Status"] = ms_kpi["Status"].apply(_normalize_milestone_status)
+        ms_kpi["Fortschritt"] = ms_kpi["Fortschritt"].apply(lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0))))
+
+        overdue = 0
+        done = 0
+        next_ms_name = "-"
+        next_ms_date = None
+        if not ms_kpi.empty and ms_kpi["Datum_dt"].notna().any():
+            # done
+            done = int((ms_kpi["Status"] == "erledigt").sum())
+            # overdue = datum < heute und nicht erledigt
+            overdue = int(((ms_kpi["Datum_dt"].dt.date < today) & (ms_kpi["Status"] != "erledigt")).sum())
+            # next milestone = min datum >= heute
+            upcoming = ms_kpi[ms_kpi["Datum_dt"].dt.date >= today].sort_values("Datum_dt")
+            if not upcoming.empty:
+                next_ms_name = _safe_str(upcoming.iloc[0].get("Meilenstein"))
+                next_ms_date = upcoming.iloc[0]["Datum_dt"].date()
+
+        # Gesamtfortschritt (simple): Mittelwert Fortschritt, fallback done/total
+        overall = 0.0
+        if not ms_kpi.empty:
+            if ms_kpi["Fortschritt"].notna().any():
+                overall = float(ms_kpi["Fortschritt"].mean())
+            else:
+                overall = 100.0 * (done / max(1, len(ms_kpi)))
+
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Meilensteine", f"{len(ms_kpi)}")
+        a2.metric("Erledigt", f"{done}")
+        a3.metric("Überfällig", f"{overdue}")
+        a4.metric("Gesamtfortschritt", f"{overall:.1f}%")
+
+        if next_ms_date:
+            st.caption(f"Nächster Meilenstein: **{next_ms_name}** am **{next_ms_date.strftime('%d.%m.%Y')}**")
+        else:
+            st.caption("Kein kommender Meilenstein erkannt (oder keine Datumsspalte gepflegt).")
+
+        if overall > 0:
+            st.progress(min(max(overall / 100.0, 0.0), 1.0))
+
+        # --- Editor (Excel-persistiert) ---
+        st.markdown("### Meilensteine pflegen")
+        st.caption("Die Tabelle wird im Excel-Sheet **'Meilensteine'** gespeichert (falls nicht vorhanden, wird es beim Speichern angelegt).")
+
+        # Editor DF (proj-scope)
+        editor_cols = ["_excel_row", "Datum", "Meilenstein", "Status", "Fortschritt", "Kommentar", "Löschen"]
+        ed = ms_proj.copy()
+
+        for c in ["Datum", "Meilenstein", "Status", "Fortschritt", "Kommentar", "_excel_row"]:
+            if c not in ed.columns:
+                ed[c] = None
+
+        ed["Status"] = ed["Status"].apply(_normalize_milestone_status)
+        ed["Fortschritt"] = ed["Fortschritt"].apply(lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0))))
+        ed["Löschen"] = False
+
+        data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
+
+        edited_ms = data_editor_fn(
+            ed[editor_cols],
+            key=f"milestones_editor_{proj}",
+            use_container_width=True,
+            height=320,
+            num_rows="dynamic",
+            hide_index=True,
+            disabled=["_excel_row"],
+            column_config={
+                "_excel_row": st.column_config.NumberColumn("Excel-Zeile", help="Technische ID (nicht ändern)"),
+                "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
+                "Meilenstein": st.column_config.TextColumn("Meilenstein", width="large"),
+                "Status": st.column_config.SelectboxColumn("Status", options=MILESTONE_STATUSES),
+                "Fortschritt": st.column_config.NumberColumn("Fortschritt (%)", min_value=0.0, max_value=100.0, step=5.0),
+                "Kommentar": st.column_config.TextColumn("Kommentar", width="large"),
+                "Löschen": st.column_config.CheckboxColumn("Löschen"),
+            },
+        )
+
+        if st.button("Meilensteine speichern", key=f"save_milestones_{proj}"):
+            # Altbestand mappen
+            orig_by_row: Dict[int, Dict[str, Any]] = {}
+            for _, r in ed.iterrows():
+                exr = r.get("_excel_row")
+                if exr is None or (isinstance(exr, float) and pd.isna(exr)):
+                    continue
+                try:
+                    orig_by_row[int(exr)] = {
+                        "Projekt": proj,
+                        "Datum": _to_date(r.get("Datum")),
+                        "Meilenstein": _safe_str(r.get("Meilenstein")),
+                        "Status": _normalize_milestone_status(r.get("Status")),
+                        "Fortschritt": float(_to_float_or_none(r.get("Fortschritt")) or 0.0),
+                        "Kommentar": _safe_str(r.get("Kommentar")),
+                    }
+                except Exception:
+                    pass
+
+            updates: List[Tuple[int, Dict[str, Any]]] = []
+            inserts: List[Dict[str, Any]] = []
+            deletes: List[int] = []
+
+            def _is_blank_ms_row(rr: pd.Series) -> bool:
+                return _is_blank(rr.get("Datum")) and _is_blank(rr.get("Meilenstein")) and _is_blank(rr.get("Kommentar"))
+
+            for _, r in edited_ms.iterrows():
+                exr = r.get("_excel_row")
+                mark_delete = bool(r.get("Löschen", False))
+                is_new = (exr is None) or (isinstance(exr, float) and pd.isna(exr))
+
+                if is_new:
+                    if _is_blank_ms_row(r):
+                        continue
+                    rec = {
+                        "Projekt": proj,
+                        "Datum": _to_date(r.get("Datum")),
+                        "Meilenstein": _safe_str(r.get("Meilenstein")).strip(),
+                        "Status": _normalize_milestone_status(r.get("Status")),
+                        "Fortschritt": float(_to_float_or_none(r.get("Fortschritt")) or 0.0),
+                        "Kommentar": _safe_str(r.get("Kommentar")).strip(),
+                    }
+                    # minimal
+                    if rec["Meilenstein"]:
+                        inserts.append(rec)
+                    continue
+
+                row_excel = int(exr)
+                if mark_delete:
+                    deletes.append(row_excel)
+                    continue
+
+                new_rec = {
+                    "Projekt": proj,
+                    "Datum": _to_date(r.get("Datum")),
+                    "Meilenstein": _safe_str(r.get("Meilenstein")).strip(),
+                    "Status": _normalize_milestone_status(r.get("Status")),
+                    "Fortschritt": float(_to_float_or_none(r.get("Fortschritt")) or 0.0),
+                    "Kommentar": _safe_str(r.get("Kommentar")).strip(),
+                }
+                old_rec = orig_by_row.get(row_excel)
+                if old_rec is None or new_rec != old_rec:
+                    updates.append((row_excel, new_rec))
+
+            def _mutator_ms(wb):
+                ws = _ensure_milestones_sheet(wb)
+
+                for r in deletes:
+                    _clear_milestone_row(ws, r)
+                for r, rec in updates:
+                    _write_milestone_row(ws, r, rec)
+                row_idx = _find_next_milestone_row(ws)
+                for rec in inserts:
+                    _write_milestone_row(ws, row_idx, rec)
+                    row_idx += 1
+
+            ok, msg = _save_workbook(Path(xlsx_path), _mutator_ms)
+            if ok:
+                st.success(f"Meilensteine gespeichert. Updates: {len(updates)}, Neu: {len(inserts)}, Gelöscht: {len(deletes)}. {msg}")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.error(msg)
+
+        # --- Timeline Chart ---
+
+        # Daten fürs Chart
+        plot = ms_kpi.copy()
+        if plot.empty:
+            st.info("Noch keine Meilensteine für dieses Projekt gepflegt.")
+        else:
+            plot = plot[plot["Datum_dt"].notna()].copy()
+            if plot.empty:
+                st.info("Meilensteine vorhanden, aber ohne gültiges Datum.")
+            else:
+                plot["Meilenstein"] = plot["Meilenstein"].fillna("").astype(str)
+                plot["Status"] = plot["Status"].apply(_normalize_milestone_status)
+                plot["Fortschritt"] = plot["Fortschritt"].apply(lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0))))
+
+                # --- Timeline Chart ---
+                st.markdown("### Zeitschiene")
+
+                plot = ms_kpi.copy()
+                if plot.empty:
+                    st.info("Noch keine Meilensteine für dieses Projekt gepflegt.")
+                else:
+                    plot = plot[plot["Datum_dt"].notna()].copy()
+                    if plot.empty:
+                        st.info("Meilensteine vorhanden, aber ohne gültiges Datum.")
+                    else:
+                        plot["Meilenstein"] = plot["Meilenstein"].fillna("").astype(str)
+                        plot["Status"] = plot["Status"].apply(_normalize_milestone_status)
+                        plot["Fortschritt"] = plot["Fortschritt"].apply(
+                            lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0)))
+                        )
+
+                        # IMPORTANT: spec muss JSON-serializable sein -> heute als STRING (kein datetime!)
+                        today_str = dt.date.today().strftime("%Y-%m-%d")
+
+                        timeline_spec = {
+                            "layer": [
+                                # "Heute" Linie (konstanter Wert via datum)
+                                {
+                                    "mark": {"type": "rule", "strokeDash": [6, 6]},
+                                    "encoding": {
+                                        "x": {"datum": today_str, "type": "temporal"},
+                                        "tooltip": [{"datum": today_str, "type": "temporal", "title": "Heute"}],
+                                    },
+                                },
+                                # Meilenstein-Punkte
+                                {
+                                    "mark": {"type": "point", "filled": True, "size": 80},
+                                    "encoding": {
+                                        "x": {"field": "Datum_dt", "type": "temporal"},
+                                        "y": {"field": "Meilenstein", "type": "nominal", "sort": None},
+                                        "color": {"field": "Status", "type": "nominal"},
+                                        "tooltip": [
+                                            {"field": "Meilenstein", "type": "nominal"},
+                                            {"field": "Datum_dt", "type": "temporal", "title": "Datum"},
+                                            {"field": "Status", "type": "nominal"},
+                                            {"field": "Fortschritt", "type": "quantitative", "format": ".0f"},
+                                            {"field": "Kommentar", "type": "nominal"},
+                                        ],
+                                    },
+                                },
+                                # Fortschritt als Text-Label
+                                {
+                                    "mark": {"type": "text", "align": "left", "dx": 7, "dy": -7},
+                                    "encoding": {
+                                        "x": {"field": "Datum_dt", "type": "temporal"},
+                                        "y": {"field": "Meilenstein", "type": "nominal", "sort": None},
+                                        "text": {"field": "Fortschritt", "type": "quantitative", "format": ".0f"},
+                                    },
+                                },
+                            ],
+                        }
+
+                        st.vega_lite_chart(
+                            data=plot,
+                            spec=timeline_spec,
+                            use_container_width=True,
+                        )
 
     # --- Budget & Rates (session-state, pro Projekt) ---
     budgets = st.session_state.setdefault("viz_budget_eur_by_project", {})   # {project: float}
@@ -2675,7 +3058,7 @@ def main() -> None:
             km_df = pd.DataFrame([{"Aufgabe": k, "Kodierung EB": v} for k, v in km.items()])
             st.dataframe(km_df, use_container_width=True, height=300)
     with tab4:
-        _render_visualisierung_tab(df, lookups)
+        _render_visualisierung_tab(df, lookups, data.path, data.milestones_df)
 
 if __name__ == "__main__":
     main()
