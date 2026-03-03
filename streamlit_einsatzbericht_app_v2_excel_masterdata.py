@@ -1400,6 +1400,440 @@ def _existing_keys_for_master(df_master: pd.DataFrame) -> set:
     return keys
 # ------------------------- Streamlit UI -------------------------
 
+# =========================
+# Visualization helpers (updated: chart-type selection + optional Vega JSON editor)
+# =========================
+import json
+
+
+def _to_float_or_none(v: Any) -> Optional[float]:
+    try:
+        if v is None:
+            return None
+        if isinstance(v, float) and pd.isna(v):
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _viz_base_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepare a clean base DF for visualization (hours, date parts)."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Datum_dt", "Year", "Month", "YM", "YM_dt", "Projekt", "Tätigkeit", "Hours", "Abgerechnet", "km", "Kodierung", "Info"])
+
+    x = df.copy()
+
+    # date
+    x["Datum_dt"] = pd.to_datetime(x["Datum"], errors="coerce")
+    x = x[x["Datum_dt"].notna()].copy()
+
+    x["Year"] = x["Datum_dt"].dt.year.astype(int)
+    x["Month"] = x["Datum_dt"].dt.month.astype(int)
+
+    # month key as string + proper timestamp for time axis
+    per = x["Datum_dt"].dt.to_period("M")
+    x["YM"] = per.astype(str)
+    x["YM_dt"] = per.dt.to_timestamp()  # first day of month
+
+    # hours
+    x["Hours"] = x["Zahl"].apply(_to_float_or_none)
+    x["Hours"] = pd.to_numeric(x["Hours"], errors="coerce").fillna(0.0)
+
+    # normalize type/project
+    x["Projekt"] = x["Projekt"].astype(str).fillna("").str.strip()
+    x["Tätigkeit"] = x["Tätigkeit"].astype(str).fillna("").str.strip().str.upper()
+
+    # normalize abgerechnet
+    x["Abgerechnet"] = x["Abgerechnet"].fillna("").astype(str).str.strip().str.lower()
+    x["Abgerechnet"] = x["Abgerechnet"].map(
+        lambda s: "ja" if s in {"ja", "yes", "y", "true", "1"} else ("nein" if s in {"nein", "no", "n", "false", "0"} else s)
+    )
+
+    # km
+    x["km"] = pd.to_numeric(x.get("km"), errors="coerce").fillna(0).astype(int)
+
+    # optional columns (for tooltips/table)
+    if "Kodierung" not in x.columns:
+        x["Kodierung"] = ""
+    if "Info" not in x.columns:
+        x["Info"] = ""
+
+    return x
+
+
+def _vega_spec_for_chart(
+    kind: str,
+    x_field: str,
+    y_field: str,
+    color_field: Optional[str] = None,
+    x_type: str = "ordinal",   # "temporal" for dates
+    y_type: str = "quantitative",
+    stacked: bool = False,
+    donut: bool = False,
+) -> Dict[str, Any]:
+    """Create a Vega-Lite spec (works with st.vega_lite_chart)."""
+
+    kind = (kind or "").lower().strip()
+
+    # pie / donut
+    if kind in {"pie", "donut"}:
+        inner = 60 if (kind == "donut" or donut) else 0
+        spec = {
+            "mark": {"type": "arc", "innerRadius": inner},
+            "encoding": {
+                "theta": {"field": y_field, "type": "quantitative"},
+                "color": {"field": x_field, "type": "nominal"},
+                "tooltip": [
+                    {"field": x_field, "type": "nominal"},
+                    {"field": y_field, "type": "quantitative", "format": ".2f"},
+                ],
+            },
+        }
+        return spec
+
+    # base encoding
+    enc: Dict[str, Any] = {
+        "x": {"field": x_field, "type": x_type},
+        "y": {"field": y_field, "type": y_type},
+        "tooltip": [
+            {"field": x_field, "type": x_type if x_type != "temporal" else "temporal"},
+            {"field": y_field, "type": "quantitative", "format": ".2f"},
+        ],
+    }
+
+    # color/stacking
+    if color_field:
+        enc["color"] = {"field": color_field, "type": "nominal"}
+        if stacked:
+            enc["y"]["stack"] = "zero"
+
+        # richer tooltip
+        enc["tooltip"] = [
+            {"field": x_field, "type": x_type if x_type != "temporal" else "temporal"},
+            {"field": color_field, "type": "nominal"},
+            {"field": y_field, "type": "quantitative", "format": ".2f"},
+        ]
+
+    # mark mapping
+    mark_type = "bar"
+    if kind in {"bar", "stacked bar"}:
+        mark_type = "bar"
+    elif kind in {"line"}:
+        mark_type = "line"
+    elif kind in {"area", "stacked area"}:
+        mark_type = "area"
+    else:
+        mark_type = "bar"
+
+    # make lines look decent without forcing colors
+    mark: Dict[str, Any] = {"type": mark_type}
+    if mark_type == "line":
+        mark["point"] = True
+
+    spec = {"mark": mark, "encoding": enc}
+    return spec
+
+
+def _render_chart_block(
+    *,
+    title: str,
+    df: pd.DataFrame,
+    key_prefix: str,
+    default_kind: str,
+    allowed_kinds: List[str],
+    x_field: str,
+    y_field: str,
+    color_field: Optional[str] = None,
+    x_type: str = "ordinal",
+    stacked_default: bool = False,
+    pie_ok: bool = True,
+) -> None:
+    """Reusable UI block: choose chart type + optional custom Vega JSON editor."""
+    st.markdown(f"### {title}")
+
+    if df is None or df.empty:
+        st.caption("Keine Daten.")
+        return
+
+    # chart type choice (persisted)
+    kind_key = f"{key_prefix}_kind"
+    if kind_key not in st.session_state:
+        st.session_state[kind_key] = default_kind
+
+    c1, c2, c3 = st.columns([2, 1, 2])
+    with c1:
+        kind = st.selectbox(
+            "Diagrammtyp",
+            options=allowed_kinds,
+            index=allowed_kinds.index(st.session_state[kind_key]) if st.session_state[kind_key] in allowed_kinds else 0,
+            key=kind_key,
+        )
+    with c2:
+        stacked = False
+        if color_field and kind.lower() in {"stacked bar", "stacked area"}:
+            stacked = True
+        elif color_field and kind.lower() in {"bar", "area"}:
+            stacked = st.checkbox("stacked", value=stacked_default, key=f"{key_prefix}_stacked")
+        else:
+            stacked = False
+    with c3:
+        show_custom = st.checkbox("Custom Vega-Lite JSON", value=False, key=f"{key_prefix}_custom_toggle")
+
+    # build default spec
+    is_pie = kind.lower() in {"pie", "donut"}
+    if is_pie and not pie_ok:
+        st.info("Pie/Donut macht für diese Ansicht keinen Sinn. Wähle Bar/Line/Area.")
+        return
+
+    default_spec = _vega_spec_for_chart(
+        kind=kind,
+        x_field=x_field if not is_pie else (color_field or x_field),  # for pie: category = x_field (or color_field)
+        y_field=y_field,
+        color_field=(color_field if not is_pie else None),
+        x_type=x_type if not is_pie else "nominal",
+        stacked=stacked,
+        donut=(kind.lower() == "donut"),
+    )
+
+    spec_key = f"{key_prefix}_custom_spec"
+    # store default if not present
+    if spec_key not in st.session_state:
+        st.session_state[spec_key] = json.dumps(default_spec, ensure_ascii=False, indent=2)
+
+    # if custom mode: show editor and use edited spec
+    if show_custom:
+        raw = st.text_area(
+            "Vega-Lite Spec (JSON)",
+            value=st.session_state[spec_key],
+            height=260,
+            key=f"{key_prefix}_spec_editor",
+            help="Hier kannst du die Vega-Lite JSON Spezifikation anpassen. Änderungen bleiben in dieser Session erhalten.",
+        )
+        try:
+            spec = json.loads(raw)
+            st.session_state[spec_key] = raw
+        except Exception as e:
+            st.error(f"Ungültiges JSON: {e}")
+            spec = default_spec
+    else:
+        # keep editor in sync with current default kind
+        st.session_state[spec_key] = json.dumps(default_spec, ensure_ascii=False, indent=2)
+        spec = default_spec
+
+    # render
+    st.vega_lite_chart(
+        data=df,
+        spec=spec,
+        use_container_width=True,
+    )
+
+
+def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any]) -> None:
+    st.subheader("Visualisierung / Controlling")
+
+    base = _viz_base_df(df)
+    if base.empty:
+        st.info("Keine Daten vorhanden.")
+        return
+
+    # --- Filters ---
+    all_projects = sorted([p for p in base["Projekt"].unique().tolist() if p and p != "nan"])
+    all_years = sorted(base["Year"].unique().tolist())
+    min_y = min(all_years) if all_years else dt.date.today().year
+    max_y = max(all_years) if all_years else dt.date.today().year
+
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
+    with c1:
+        sel_projects = st.multiselect(
+            "Projekte",
+            options=all_projects,
+            default=all_projects[:1] if all_projects else [],
+            help="Mehrere Projekte auswählen, um Vergleich/Portfolio zu sehen."
+        )
+    with c2:
+        y_from = st.number_input("Jahr von", min_value=2000, max_value=2100, value=int(min_y), step=1, key="viz_y_from")
+    with c3:
+        y_to = st.number_input("Jahr bis", min_value=2000, max_value=2100, value=int(max_y), step=1, key="viz_y_to")
+    with c4:
+        include_abg = st.checkbox("abgerechnete einschließen", value=True, key="viz_include_abg")
+        include_internal = st.checkbox("interne Tätigkeiten (I) einschließen", value=True, key="viz_include_internal")
+
+    x = base.copy()
+    x = x[(x["Year"] >= int(y_from)) & (x["Year"] <= int(y_to))]
+    if sel_projects:
+        x = x[x["Projekt"].isin(sel_projects)]
+    if not include_abg:
+        x = x[x["Abgerechnet"] != "ja"]
+    if not include_internal:
+        x = x[x["Tätigkeit"] != "I"]
+
+    if x.empty:
+        st.warning("Keine Daten für diese Auswahl.")
+        return
+
+    # --- Budget & Rates (session-state, pro Projekt) ---
+    budgets = st.session_state.setdefault("viz_budget_eur_by_project", {})   # {project: float}
+    rates = st.session_state.setdefault("viz_rates_by_project", {})          # {project: {F,R,K,I,default}}
+
+    st.markdown("### Budget / Stundensätze (optional)")
+    st.caption("Wenn du Budgets/Stundensätze pflegst, bekommst du Budgetverbrauch & Kostenabschätzung.")
+
+    def _get_rate_map(p: str) -> Dict[str, float]:
+        rm = rates.get(p) or {}
+        return {
+            "default": float(rm.get("default", 0.0) or 0.0),
+            "F": float(rm.get("F", 0.0) or 0.0),
+            "R": float(rm.get("R", 0.0) or 0.0),
+            "K": float(rm.get("K", 0.0) or 0.0),
+            "I": float(rm.get("I", 0.0) or 0.0),
+        }
+
+    if len(sel_projects) == 1:
+        p = sel_projects[0]
+        rm = _get_rate_map(p)
+
+        cc1, cc2, cc3, cc4, cc5 = st.columns([1, 1, 1, 1, 1])
+        with cc1:
+            b = st.number_input("Budget (€)", min_value=0.0, value=float(budgets.get(p, 0.0) or 0.0), step=100.0, key=f"viz_budget_{p}")
+        with cc2:
+            r_def = st.number_input("Rate Default (€/h)", min_value=0.0, value=float(rm["default"]), step=1.0, key=f"viz_rate_def_{p}")
+        with cc3:
+            r_f = st.number_input("Rate F (€/h)", min_value=0.0, value=float(rm["F"]), step=1.0, key=f"viz_rate_F_{p}")
+        with cc4:
+            r_r = st.number_input("Rate R (€/h)", min_value=0.0, value=float(rm["R"]), step=1.0, key=f"viz_rate_R_{p}")
+        with cc5:
+            r_k = st.number_input("Rate K (€/h)", min_value=0.0, value=float(rm["K"]), step=1.0, key=f"viz_rate_K_{p}")
+
+        budgets[p] = float(b or 0.0)
+        rates[p] = {"default": float(r_def), "F": float(r_f), "R": float(r_r), "K": float(r_k), "I": float(r_def)}
+    else:
+        st.info("Für Budgetverbrauch wähle genau **ein** Projekt aus (dann kannst du Budget & Stundensätze pflegen).")
+
+    # --- KPI aggregation ---
+    hours_by_type = x.groupby("Tätigkeit")["Hours"].sum().to_dict()
+    total_hours = float(sum(hours_by_type.values()) or 0.0)
+    total_km = int(x["km"].sum())
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Stunden gesamt", f"{total_hours:.2f} h")
+    m2.metric("F", f"{float(hours_by_type.get('F', 0.0)):.2f} h")
+    m3.metric("R", f"{float(hours_by_type.get('R', 0.0)):.2f} h")
+    m4.metric("K", f"{float(hours_by_type.get('K', 0.0)):.2f} h")
+    m5.metric("km", f"{total_km}")
+
+    # --- Cost/Budget calculation (single project only) ---
+    if len(sel_projects) == 1:
+        p = sel_projects[0]
+        rm = _get_rate_map(p)
+
+        def _rate_for(t: str) -> float:
+            t = (t or "").upper()
+            rt = float(rm.get(t, 0.0) or 0.0)
+            return rt if rt > 0 else float(rm.get("default", 0.0) or 0.0)
+
+        cost = 0.0
+        for t, h in hours_by_type.items():
+            cost += float(h or 0.0) * _rate_for(t)
+
+        budget = float(budgets.get(p, 0.0) or 0.0)
+        st.markdown("### Budgetstatus")
+        cst1, cst2, cst3 = st.columns(3)
+        fmt = lambda v: f"{v:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+        cst1.metric("Kosten (Schätzung)", fmt(cost))
+        cst2.metric("Budget", fmt(budget))
+        remaining = budget - cost
+        cst3.metric("Rest", fmt(remaining))
+
+        if budget > 0:
+            used_pct = min(max(cost / budget, 0.0), 1.0)
+            st.progress(used_pct)
+            st.caption(f"Budgetverbrauch: {used_pct*100:.1f}%")
+
+    # --- Chart data prep ---
+    # 1) Monthly by type (long)
+    monthly_long = (
+        x.groupby(["YM_dt", "YM", "Tätigkeit"], as_index=False)["Hours"]
+        .sum()
+        .sort_values(["YM_dt", "Tätigkeit"])
+    )
+
+    # 2) Hours by project
+    proj_df = x.groupby("Projekt", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
+
+    # 3) Hours by type
+    type_df = x.groupby("Tätigkeit", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
+
+    # --- Charts with type selection ---
+    _render_chart_block(
+        title="Stundenverlauf (Monate)",
+        df=monthly_long,
+        key_prefix="viz_monthly",
+        default_kind="Stacked Bar",
+        allowed_kinds=["Bar", "Line", "Area", "Stacked Bar", "Stacked Area"],
+        x_field="YM_dt",
+        y_field="Hours",
+        color_field="Tätigkeit",
+        x_type="temporal",
+        stacked_default=True,
+        pie_ok=False,
+    )
+
+    cA, cB = st.columns(2)
+
+    with cA:
+        _render_chart_block(
+            title="Stunden nach Tätigkeit (F/R/K/I)",
+            df=type_df,
+            key_prefix="viz_type",
+            default_kind="Pie",
+            allowed_kinds=["Pie", "Donut", "Bar"],
+            x_field="Tätigkeit",
+            y_field="Hours",
+            color_field=None,
+            x_type="nominal",
+            stacked_default=False,
+            pie_ok=True,
+        )
+
+    with cB:
+        _render_chart_block(
+            title="Stunden nach Projekt",
+            df=proj_df,
+            key_prefix="viz_project",
+            default_kind="Bar",
+            allowed_kinds=["Bar", "Pie", "Donut"],
+            x_field="Projekt",
+            y_field="Hours",
+            color_field=None,
+            x_type="nominal",
+            stacked_default=False,
+            pie_ok=True,
+        )
+
+    st.markdown("### Top Kodierungen (Aufgaben) nach Stunden")
+    top_kod = (
+        x.assign(Kod=x["Kodierung"].fillna("").astype(str).str.strip())
+        .groupby("Kod")["Hours"].sum()
+        .sort_values(ascending=False)
+        .head(20)
+    )
+    top_kod = top_kod[top_kod.index != ""]
+    if not top_kod.empty:
+        st.dataframe(
+            top_kod.reset_index().rename(columns={"Kod": "Kodierung", "Hours": "Stunden"}),
+            use_container_width=True,
+            height=340,
+        )
+    else:
+        st.caption("Keine Kodierungen vorhanden/gefüllt.")
+
+    st.markdown("### Detail (optional)")
+    with st.expander("Rohdaten anzeigen"):
+        show_cols = ["Datum_dt", "Projekt", "Tätigkeit", "Hours", "km", "Kodierung", "Info", "Abgerechnet"]
+        show_cols = [c for c in show_cols if c in x.columns]
+        st.dataframe(x[show_cols].sort_values("Datum_dt", ascending=False), use_container_width=True, height=420)
+
 def main() -> None:
     if st is None:
         raise RuntimeError("Streamlit ist nicht installiert. Bitte `pip install streamlit` ausführen.")
@@ -1485,7 +1919,7 @@ def main() -> None:
     df = data.taetigkeiten_df.copy()
     lookups = data.lookups
 
-    tab1, tab2, tab3 = st.tabs(["Tätigkeiten", "Einsatzbericht", "Stammdaten / Debug"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Tätigkeiten", "Einsatzbericht", "Stammdaten / Debug", "Visualisierung"])
 
     with tab1:
         st.subheader("Tätigkeiten erfassen und bearbeiten")
@@ -2240,7 +2674,8 @@ def main() -> None:
             km = lookups.get("kodierung_map_eb", {})
             km_df = pd.DataFrame([{"Aufgabe": k, "Kodierung EB": v} for k, v in km.items()])
             st.dataframe(km_df, use_container_width=True, height=300)
-
+    with tab4:
+        _render_visualisierung_tab(df, lookups)
 
 if __name__ == "__main__":
     main()
