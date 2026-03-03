@@ -1503,18 +1503,201 @@ def main() -> None:
             f_include_abg = st.checkbox("abgerechnete zeigen", value=True)
 
         filtered = _filtered_taetigkeiten(df, int(f_year), int(f_month), f_project, include_abgerechnet=f_include_abg)
-        if not filtered.empty:
-            display_df = filtered.copy()
-            display_df["Datum"] = display_df["Datum"].apply(_format_date)
-            display_df["Zeit von"] = display_df["Zeit von"].apply(_format_time)
-            display_df["Zeit bis"] = display_df["Zeit bis"].apply(_format_time)
-            display_df["Pause"] = display_df["Pause"].apply(_format_time)
-            display_df["Zahl"] = display_df["Zahl"].apply(lambda v: round(float(v), 2) if pd.notna(v) and v is not None else None)
-            cols = ["_excel_row", "Datum", "Projekt", "Zeit von", "Zeit bis", "Pause", "Zahl", "km", "Tätigkeit", "Kodierung", "Interne Projekte", "Info", "Abgerechnet", "eingetragen"]
-            st.dataframe(display_df[cols], use_container_width=True, height=320)
-            st.caption(f"Treffer: {len(display_df)}")
-        else:
+        # --- Inline Edit Table (statt nur Anzeige) ---
+        st.markdown("### Tätigkeiten (Inline bearbeiten)")
+
+        if filtered.empty:
             st.info("Keine Tätigkeiten für den aktuellen Filter gefunden.")
+        else:
+            # Spalten, die im Grid editierbar sein sollen
+            editor_cols = [
+                "_excel_row",
+                "Datum",
+                "Projekt",
+                "Zeit von",
+                "Zeit bis",
+                "Pause_Min",
+                "Dauer",
+                "km",
+                "Tätigkeit",
+                "Kodierung",
+                "Interne Projekte",
+                "Info",
+                "Abgerechnet",
+                "eingetragen",
+            ]
+
+            editor_df = filtered.copy()
+
+            # Ensure editor columns exist
+            for c in editor_cols:
+                if c not in editor_df.columns:
+                    editor_df[c] = None
+
+            # Optional: Delete marker column
+            editor_df["Löschen"] = False
+
+            projekte_opts = sorted(list(dict.fromkeys(
+                [p for p in (lookups.get("projekte") or []) if p] +
+                [p for p in df.get("Projekt", pd.Series(dtype=str)).dropna().astype(str).tolist() if p]
+            )))
+            typen_opts = list(dict.fromkeys(lookups.get("taetigkeit_typen") or ["F", "R", "I", "K"]))
+            ja_nein_opts = list(dict.fromkeys(lookups.get("ja_nein") or ["ja", "nein"]))
+            kod_opts = list(dict.fromkeys(
+                [""] +
+                (lookups.get("relevante_kodierungen") or []) +
+                (lookups.get("kodierung_aufgaben") or [])
+            ))
+            interne_opts = list(dict.fromkeys([""] + (lookups.get("interne_projekte") or [])))
+
+            # Streamlit compatibility (falls du eine ältere Version hast)
+            data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
+
+            edited_df = data_editor_fn(
+                editor_df[editor_cols + ["Löschen"]],
+                key="taetigkeiten_inline_editor",
+                use_container_width=True,
+                height=420,
+                num_rows="dynamic",  # <-- erlaubt neue Zeilen unten im Grid
+                hide_index=True,
+                disabled=["_excel_row"],  # Excel-Row ist die technische ID
+                column_config={
+                    "_excel_row": st.column_config.NumberColumn("Excel-Zeile",
+                                                                help="Technische Zeilen-ID (nicht ändern)"),
+                    "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
+                    "Projekt": st.column_config.SelectboxColumn("Projekt", options=projekte_opts),
+                    "Zeit von": st.column_config.TimeColumn("Zeit von", format="HH:mm"),
+                    "Zeit bis": st.column_config.TimeColumn("Zeit bis", format="HH:mm"),
+                    "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5),
+                    "km": st.column_config.NumberColumn("km", min_value=0, step=1),
+                    "Tätigkeit": st.column_config.SelectboxColumn("Tätigkeit", options=typen_opts),
+                    "Kodierung": st.column_config.SelectboxColumn("Kodierung (Aufgabe)", options=kod_opts),
+                    "Interne Projekte": st.column_config.SelectboxColumn("Interne Projekte", options=interne_opts),
+                    "Info": st.column_config.TextColumn("Info", width="large"),
+                    "Abgerechnet": st.column_config.SelectboxColumn("Abgerechnet", options=[""] + ja_nein_opts),
+                    "eingetragen": st.column_config.SelectboxColumn("eingetragen", options=[""] + ja_nein_opts),
+                    "Löschen": st.column_config.CheckboxColumn("Löschen"),
+                },
+            )
+
+            st.caption(
+                "✔ Du kannst direkt in der Tabelle editieren. "
+                "➕ Neue Zeilen unten hinzufügen. "
+                "🗑️ Zum Löschen Checkbox 'Löschen' setzen und speichern."
+            )
+
+            def _editor_row_to_record(r: pd.Series) -> Dict[str, Any]:
+                pause_min = 0
+                try:
+                    pause_min = int(r.get("Pause_Min") or 0)
+                except Exception:
+                    pause_min = 0
+
+                km_val = 0
+                try:
+                    km_val = int(float(r.get("km") or 0) or 0)
+                except Exception:
+                    km_val = 0
+
+                return {
+                    "Datum": _to_date(r.get("Datum")),
+                    "Projekt": _safe_str(r.get("Projekt")).strip(),
+                    "Zeit von": _to_time(r.get("Zeit von")),
+                    "Zeit bis": _to_time(r.get("Zeit bis")),
+                    "Pause_Min": pause_min,
+                    "km": km_val,
+                    "Tätigkeit": _safe_str(r.get("Tätigkeit")).strip(),
+                    "Kodierung": _safe_str(r.get("Kodierung")).strip(),
+                    "Interne Projekte": _safe_str(r.get("Interne Projekte")).strip(),
+                    "Info": _safe_str(r.get("Info")),
+                    "Abgerechnet": _normalize_yes_no(r.get("Abgerechnet")) or _safe_str(r.get("Abgerechnet")).strip(),
+                    "eingetragen": _normalize_yes_no(r.get("eingetragen")) or _safe_str(r.get("eingetragen")).strip(),
+                }
+
+            def _is_editor_row_blank(r: pd.Series) -> bool:
+                # Nutze deine KEY_COLS_FOR_EMPTY_CHECK Logik sinngemäß (Datum/Projekt/Zeit/Typ/Info/Flags)
+                return (
+                        _is_blank(r.get("Datum")) and
+                        _is_blank(r.get("Projekt")) and
+                        _is_blank(r.get("Zeit von")) and
+                        _is_blank(r.get("Zeit bis")) and
+                        _is_blank(r.get("Tätigkeit")) and
+                        _is_blank(r.get("Info")) and
+                        _is_blank(r.get("Abgerechnet")) and
+                        _is_blank(r.get("eingetragen"))
+                )
+
+            if st.button("Tabellenänderungen speichern", key="save_inline_table"):
+                # Original-Signaturen nach Excel-Zeile, um Änderungen zu erkennen
+                orig_by_row = {}
+                for _, r in editor_df.iterrows():
+                    exr = r.get("_excel_row")
+                    if exr is None or (isinstance(exr, float) and pd.isna(exr)):
+                        continue
+                    try:
+                        orig_by_row[int(exr)] = _editor_row_to_record(r)
+                    except Exception:
+                        continue
+
+                updates: List[Tuple[int, Dict[str, Any]]] = []
+                inserts: List[Dict[str, Any]] = []
+                deletes: List[int] = []
+
+                for _, r in edited_df.iterrows():
+                    exr = r.get("_excel_row")
+                    mark_delete = bool(r.get("Löschen", False))
+
+                    # neue Zeile?
+                    is_new = (exr is None) or (isinstance(exr, float) and pd.isna(exr))
+
+                    if is_new:
+                        if _is_editor_row_blank(r):
+                            continue
+                        rec = _editor_row_to_record(r)
+                        # minimale Validierung: Projekt + Datum sollte da sein
+                        if rec.get("Projekt") and rec.get("Datum"):
+                            inserts.append(rec)
+                        continue
+
+                    row_excel = int(exr)
+
+                    if mark_delete:
+                        deletes.append(row_excel)
+                        continue
+
+                    new_rec = _editor_row_to_record(r)
+                    old_rec = orig_by_row.get(row_excel)
+
+                    # Wenn wir keinen "alt"-Datensatz haben, behandeln wir es als Update
+                    if old_rec is None or _key_for_import(new_rec) != _key_for_import(old_rec):
+                        updates.append((row_excel, new_rec))
+
+                def _mutator_inline(wb):
+                    ws = wb[TAETIGKEITEN_SHEET]
+
+                    # Deletes
+                    for r in deletes:
+                        _clear_taetigkeit_row(ws, r)
+
+                    # Updates
+                    for r, rec in updates:
+                        _write_taetigkeit_row(ws, r, rec)
+
+                    # Inserts
+                    row_idx = _find_next_write_row(ws)
+                    for rec in inserts:
+                        _write_taetigkeit_row(ws, row_idx, rec)
+                        row_idx += 1
+
+                ok, msg = _save_workbook(data.path, _mutator_inline)
+                if ok:
+                    st.success(
+                        f"Gespeichert. Updates: {len(updates)}, Neu: {len(inserts)}, Gelöscht: {len(deletes)}. {msg}"
+                    )
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    st.error(msg)
 
         st.markdown("---")
         c1, c2 = st.columns(2)
