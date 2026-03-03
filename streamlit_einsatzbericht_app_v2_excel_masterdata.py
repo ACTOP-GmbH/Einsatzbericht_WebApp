@@ -1502,6 +1502,18 @@ def main() -> None:
         with filt_cols[3]:
             f_include_abg = st.checkbox("abgerechnete zeigen", value=True)
 
+        # Optionen für Editor (immer definiert -> IDE meckert nicht)
+        projekte_opts = projekte_available if projekte_available else [""]
+
+        typen_opts = list(dict.fromkeys(lookups.get("taetigkeit_typen") or ["F", "R", "I", "K"]))
+        ja_nein_opts = list(dict.fromkeys(lookups.get("ja_nein") or ["ja", "nein"]))
+
+        kod_opts = list(dict.fromkeys(
+            [""] + (lookups.get("relevante_kodierungen") or []) + (lookups.get("kodierung_aufgaben") or [])
+        ))
+
+        interne_opts = list(dict.fromkeys([""] + (lookups.get("interne_projekte") or [])))
+
         filtered = _filtered_taetigkeiten(df, int(f_year), int(f_month), f_project, include_abgerechnet=f_include_abg)
         # --- Inline Edit Table (statt nur Anzeige) ---
         st.markdown("### Tätigkeiten (Inline bearbeiten)")
@@ -1537,21 +1549,22 @@ def main() -> None:
             # Optional: Delete marker column
             editor_df["Löschen"] = False
 
-            projekte_opts = sorted(list(dict.fromkeys(
-                [p for p in (lookups.get("projekte") or []) if p] +
-                [p for p in df.get("Projekt", pd.Series(dtype=str)).dropna().astype(str).tolist() if p]
-            )))
-            typen_opts = list(dict.fromkeys(lookups.get("taetigkeit_typen") or ["F", "R", "I", "K"]))
-            ja_nein_opts = list(dict.fromkeys(lookups.get("ja_nein") or ["ja", "nein"]))
-            kod_opts = list(dict.fromkeys(
-                [""] +
-                (lookups.get("relevante_kodierungen") or []) +
-                (lookups.get("kodierung_aufgaben") or [])
-            ))
-            interne_opts = list(dict.fromkeys([""] + (lookups.get("interne_projekte") or [])))
 
             # Streamlit compatibility (falls du eine ältere Version hast)
             data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
+
+            def _calc_dauer_str(zv, zb, pause_min) -> str:
+                h = _compute_hours_decimal(zv, zb, int(pause_min or 0))
+                if h is None:
+                    return ""
+                mins = int(round(h * 60))
+                return f"{mins // 60:02d}:{mins % 60:02d}"
+
+            editor_df["Dauer"] = editor_df.apply(
+                lambda r: _calc_dauer_str(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min")),
+                axis=1
+            )
+
 
             edited_df = data_editor_fn(
                 editor_df[editor_cols + ["Löschen"]],
@@ -1560,7 +1573,7 @@ def main() -> None:
                 height=420,
                 num_rows="dynamic",  # <-- erlaubt neue Zeilen unten im Grid
                 hide_index=True,
-                disabled=["_excel_row"],  # Excel-Row ist die technische ID
+                disabled=["_excel_row", "Dauer"],  # Excel-Row ist die technische ID
                 column_config={
                     "_excel_row": st.column_config.NumberColumn("Excel-Zeile",
                                                                 help="Technische Zeilen-ID (nicht ändern)"),
@@ -1569,11 +1582,12 @@ def main() -> None:
                     "Zeit von": st.column_config.TimeColumn("Zeit von", format="HH:mm"),
                     "Zeit bis": st.column_config.TimeColumn("Zeit bis", format="HH:mm"),
                     "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5),
+                    "Dauer": st.column_config.TextColumn("Dauer", help="Berechnet aus Zeit von/bis und Pause", width="small"),
                     "km": st.column_config.NumberColumn("km", min_value=0, step=1),
                     "Tätigkeit": st.column_config.SelectboxColumn("Tätigkeit", options=typen_opts),
                     "Kodierung": st.column_config.SelectboxColumn("Kodierung (Aufgabe)", options=kod_opts),
                     "Interne Projekte": st.column_config.SelectboxColumn("Interne Projekte", options=interne_opts),
-                    "Info": st.column_config.TextColumn("Info", width="large"),
+                    "Info": st.column_config.TextColumn("Leistungsbeschreibung", width="large"),
                     "Abgerechnet": st.column_config.SelectboxColumn("Abgerechnet", options=[""] + ja_nein_opts),
                     "eingetragen": st.column_config.SelectboxColumn("eingetragen", options=[""] + ja_nein_opts),
                     "Löschen": st.column_config.CheckboxColumn("Löschen"),
