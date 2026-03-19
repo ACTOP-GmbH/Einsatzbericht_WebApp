@@ -1030,8 +1030,21 @@ def _write_taetigkeit_row(ws, row_idx: int, record: Dict[str, Any]) -> None:
     ws.cell(row_idx, 3).value = zeit_von
     ws.cell(row_idx, 4).value = zeit_bis
     ws.cell(row_idx, 5).value = pause_time
-    ws.cell(row_idx, 6).value = f'=IF(A{row_idx}="","",D{row_idx}-C{row_idx}-E{row_idx})'
-    ws.cell(row_idx, 7).value = f'=IF(A{row_idx}="","",F{row_idx}*24)'
+
+    zahl = record.get("Zahl")
+    if zeit_von is None and zeit_bis is None and zahl is not None:
+        # Manuelle Dezimalzeit für Zeilen ohne Uhrzeiten (z.B. "Organisatorisches")
+        try:
+            z_float = float(zahl)
+            ws.cell(row_idx, 6).value = z_float / 24.0  # Stunden-Zelle in Excel
+            ws.cell(row_idx, 7).value = z_float  # Zahl-Zelle in Excel
+        except Exception:
+            ws.cell(row_idx, 6).value = ""
+            ws.cell(row_idx, 7).value = ""
+    else:
+        ws.cell(row_idx, 6).value = f'=IF(A{row_idx}="","",D{row_idx}-C{row_idx}-E{row_idx})'
+        ws.cell(row_idx, 7).value = f'=IF(A{row_idx}="","",F{row_idx}*24)'
+
     ws.cell(row_idx, 8).value = km_val
     ws.cell(row_idx, 9).value = taet_typ or None
     ws.cell(row_idx, 10).value = kodierung
@@ -1382,7 +1395,8 @@ def _existing_keys(df: pd.DataFrame) -> set:
 
 
 @st.cache_data(show_spinner=False, max_entries=100)
-def _parse_and_store_uploaded_report(file_name: str, file_bytes: bytes) -> Tuple[Dict[str, Any], pd.DataFrame]:
+def _parse_and_store_uploaded_report(file_name: str, file_bytes: bytes, allowed_types: Tuple[str, ...]) -> Tuple[
+    Dict[str, Any], pd.DataFrame]:
     h = hashlib.md5(file_bytes).hexdigest()[:8]
     script_dir = Path(__file__).resolve().parent
     reports_dir = script_dir / "imports_reports"
@@ -1393,7 +1407,7 @@ def _parse_and_store_uploaded_report(file_name: str, file_bytes: bytes) -> Tuple
     if not target.exists():
         target.write_bytes(file_bytes)
 
-    meta, lines = _read_einsatzbericht_xlsx(target)
+    meta, lines = _read_einsatzbericht_xlsx(target, list(allowed_types))
     meta["original_filename"] = file_name
     return meta, lines
 
@@ -1491,7 +1505,7 @@ def _find_header(ws, max_rows: int = 80, max_cols: int = 30) -> Tuple[Optional[i
     return None, {}
 
 
-def _read_einsatzbericht_xlsx(path: Path) -> Tuple[Dict[str, Any], pd.DataFrame]:
+def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dict[str, Any], pd.DataFrame]:
     wb = openpyxl.load_workbook(path, data_only=True)
     ws = None
     for sheet_name in ["Einsatzbericht", "Tabelle1"]:
@@ -1531,48 +1545,75 @@ def _read_einsatzbericht_xlsx(path: Path) -> Tuple[Dict[str, Any], pd.DataFrame]
     rows = []
     empty_streak = 0
     start = header_row + 1
+    last_seen_date = None
+
+    # Eiserne Regel: Gültige Stammdaten (case-insensitive für Abgleich)
+    valid_arts = {str(t).strip().lower() for t in allowed_types if str(t).strip()}
 
     for r in range(start, start + 400):
         a = ws.cell(r, c_datum).value if c_datum else None
         b = ws.cell(r, c_beginn).value if c_beginn else None
         e = ws.cell(r, c_ende).value if c_ende else None
         t = ws.cell(r, c_text).value if c_text else None
+        z_val = ws.cell(r, c_zeit).value if c_zeit else None
+        art_val = ws.cell(r, c_art).value if c_art else None
 
-        if _is_blank(a) and _is_blank(b) and _is_blank(e) and _is_blank(t):
+        if _is_blank(a) and _is_blank(b) and _is_blank(e) and _is_blank(t) and _is_blank(z_val) and _is_blank(art_val):
             empty_streak += 1
             if empty_streak >= 5:
                 break
             continue
         empty_streak = 0
 
+        art = _safe_str(art_val).strip()
+
+        # WICHTIGE FILTER-REGEL: Ohne Art ("F", "R", etc.), die exakt in den Stammdaten existiert, ist die Zeile ungültig.
+        # "Stunden" oder "Adham Aijou" fallen hier durchs Raster und werden ignoriert.
+        if not art or art.lower() not in valid_arts:
+            continue
+
         datum = _to_date(a)
+        if datum is not None:
+            last_seen_date = datum
+        elif last_seen_date is not None:
+            # Fallback für die "Organisatorisches" Zeile ohne Datum, erbt das letzte gelesene Datum
+            datum = last_seen_date
+
         beginn = _to_time(b)
         ende = _to_time(e)
+        text = _safe_str(t).strip()
 
-        # Lese Zeit (h) zuerst, da wir sie zur Korrektur der Pause verwenden koennen
+        # WICHTIGE FILTER-REGEL 2: Fehlen die Uhrzeiten (z.B. Organisatorisches), muss zwingend ein Text da sein.
+        if beginn is None and ende is None and not text:
+            continue
+
+        # Lese Zeit (h) - absolut robust gegenüber Excel Formatting
         zeit_h = None
-        if c_zeit:
-            v = ws.cell(r, c_zeit).value
-            try:
-                zeit_h = None if _is_blank(v) else float(str(v).strip().replace(',', '.'))
-            except Exception:
-                zeit_h = None
+        if not _is_blank(z_val):
+            if isinstance(z_val, (int, float)):
+                zeit_h = float(z_val)
+            elif isinstance(z_val, (dt.time, dt.datetime)):
+                zeit_h = z_val.hour + z_val.minute / 60.0
+            else:
+                try:
+                    zeit_h = float(str(z_val).strip().replace(',', '.'))
+                except Exception:
+                    zeit_h = None
 
         pause_min = 0
         if c_pause:
             p_val = ws.cell(r, c_pause).value
             if not _is_blank(p_val):
-                if isinstance(p_val, str):
+                if isinstance(p_val, (int, float)):
+                    pause_min = int(round(float(p_val) * 60))
+                elif isinstance(p_val, (dt.time, dt.datetime)):
+                    pause_min = p_val.hour * 60 + p_val.minute
+                elif isinstance(p_val, str):
                     s_val = p_val.strip().replace(',', '.')
                     try:
-                        p_float = float(s_val)
-                        pause_min = int(round(p_float * 60))
+                        pause_min = int(round(float(s_val) * 60))
                     except ValueError:
                         pause_min = _time_to_minutes(_to_time(p_val))
-                elif isinstance(p_val, (int, float)):
-                    pause_min = int(round(p_val * 60))
-                else:
-                    pause_min = _time_to_minutes(_to_time(p_val))
 
         # Kreuz-Check mit Zeit (h): Umgeht Excels absurde Uhrzeit-Formatierung
         if beginn is not None and ende is not None and zeit_h is not None:
@@ -1580,17 +1621,18 @@ def _read_einsatzbericht_xlsx(path: Path) -> Tuple[Dict[str, Any], pd.DataFrame]
             if total_duration_hours is not None:
                 inferred_pause_hours = total_duration_hours - zeit_h
                 inferred_pause_min = int(round(inferred_pause_hours * 60))
-                # Nur verwenden, wenn die errechnete Pause Sinn macht (zwischen 0 und 12 Stunden)
-                if 0 <= inferred_pause_min < 720:
-                    pause_min = inferred_pause_min
+                if -5 <= inferred_pause_min < 720:
+                    pause_min = max(0, inferred_pause_min)
+
+        # Sicherheits-Reset falls 0,75 als 18:00 Uhr (= 1080 Minuten) gedeutet wurde
+        if pause_min >= 720:
+            pause_min = 0
 
         # Fallback falls Zeit (h) leer ist
         if zeit_h is None and beginn is not None and ende is not None:
             zeit_h = _compute_hours_decimal(beginn, ende, pause_min)
 
-        art = _safe_str(ws.cell(r, c_art).value).strip() if c_art else ""
         kod_eb = _safe_str(ws.cell(r, c_kod).value).strip() if c_kod else ""
-        text = _safe_str(t).strip()
 
         rows.append({
             "Datum": datum,
@@ -1628,7 +1670,7 @@ def _key_for_import(rec: Dict[str, Any]) -> tuple:
     pause = int(rec.get("Pause_Min") or 0)
 
     if not zv and not zb:
-        zeit_h = rec.get("Zeit_h") or rec.get("Zeit (h)") or ""
+        zeit_h = rec.get("Zeit_h") or rec.get("Zeit (h)") or rec.get("Zahl") or ""
         return (d, "<NO_TIME>", typ, str(zeit_h), info)
 
     return (d, zv, zb, pause, typ, info)
@@ -2429,6 +2471,7 @@ def main() -> None:
                 "Zeit von",
                 "Zeit bis",
                 "Pause_Min",
+                "Zahl",
                 "Dauer",
                 "km",
                 "Tätigkeit",
@@ -2449,15 +2492,21 @@ def main() -> None:
 
             data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
 
-            def _calc_dauer_str(zv, zb, pause_min) -> str:
+            def _calc_dauer_str(zv, zb, pause_min, zahl) -> str:
                 h = _compute_hours_decimal(zv, zb, int(pause_min or 0))
                 if h is None:
-                    return ""
+                    try:
+                        if zahl is not None and pd.notna(zahl):
+                            h = float(zahl)
+                        else:
+                            return ""
+                    except Exception:
+                        return ""
                 mins = int(round(h * 60))
                 return f"{mins // 60:02d}:{mins % 60:02d}"
 
             editor_df["Dauer"] = editor_df.apply(
-                lambda r: _calc_dauer_str(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min")),
+                lambda r: _calc_dauer_str(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min"), r.get("Zahl")),
                 axis=1
             )
 
@@ -2477,7 +2526,11 @@ def main() -> None:
                     "Zeit von": st.column_config.TimeColumn("Zeit von", format="HH:mm"),
                     "Zeit bis": st.column_config.TimeColumn("Zeit bis", format="HH:mm"),
                     "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5),
-                    "Dauer": st.column_config.TextColumn("Dauer", help="Berechnet aus Zeit von/bis und Pause",
+                    "Zahl": st.column_config.NumberColumn("Zeit (h)",
+                                                          help="Dezimalstunden für manuelle Angaben (z.B. Organisatorisches)",
+                                                          min_value=0.0, step=0.25, format="%.2f"),
+                    "Dauer": st.column_config.TextColumn("Dauer",
+                                                         help="Berechnet aus Zeit von/bis und Pause (oder Zeit h)",
                                                          width="small"),
                     "km": st.column_config.NumberColumn("km", min_value=0, step=1),
                     "Tätigkeit": st.column_config.SelectboxColumn("Tätigkeit", options=typen_opts),
@@ -2515,6 +2568,7 @@ def main() -> None:
                     "Zeit von": _to_time(r.get("Zeit von")),
                     "Zeit bis": _to_time(r.get("Zeit bis")),
                     "Pause_Min": pause_min,
+                    "Zahl": r.get("Zahl"),
                     "km": km_val,
                     "Tätigkeit": _safe_str(r.get("Tätigkeit")).strip(),
                     "Kodierung": _safe_str(r.get("Kodierung")).strip(),
@@ -2729,8 +2783,10 @@ def main() -> None:
                 for i, uf in enumerate(report_files, start=1):
                     try:
                         file_name = getattr(uf, "name", f"report_{i}.xlsx")
-                        # Caching: wird nur beim ersten Durchlauf geparst/gespeichert
-                        meta, lines = _parse_and_store_uploaded_report(file_name, uf.getvalue())
+
+                        # Die erlaubten Tätigkeiten als Tuple (hashbar für Cache) an die Lesefunktion übergeben!
+                        allowed_arts_tuple = tuple(lookups.get("taetigkeit_typen") or ["F", "R", "I", "K"])
+                        meta, lines = _parse_and_store_uploaded_report(file_name, uf.getvalue(), allowed_arts_tuple)
 
                         st.write("Import-Zeilen erkannt:", len(lines))
                         meta_list.append(meta)
@@ -2755,7 +2811,7 @@ def main() -> None:
                         )
 
                         if lines.empty:
-                            st.info("Keine Zeilen im Einsatzbericht gefunden.")
+                            st.info("Keine gültigen Tätigkeits-Zeilen im Einsatzbericht gefunden.")
                             continue
 
                         for _, row in lines.iterrows():
@@ -2790,7 +2846,7 @@ def main() -> None:
                                 "Info": info,
                                 "Abgerechnet": "nein" if set_abgerechnet else "",
                                 "eingetragen": "ja" if set_eingetragen else "",
-                                "Zeit_h": row.get("Zeit_h"),
+                                "Zahl": row.get("Zeit_h"),
                             }
 
                             k = _key_for_import(rec)
@@ -2811,6 +2867,7 @@ def main() -> None:
                         "Zeit von": _format_time(r["Zeit von"]),
                         "Zeit bis": _format_time(r["Zeit bis"]),
                         "Pause (Min)": r["Pause_Min"],
+                        "Zeit (h)": r.get("Zahl"),
                         "Typ": r["Tätigkeit"],
                         "Kodierung (Aufgabe)": r["Kodierung"],
                         "Info": _safe_str(r["Info"])[:80],
