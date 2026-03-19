@@ -4,17 +4,23 @@ import datetime as dt
 import math
 import os
 import shutil
+import sys
+import subprocess
+import tempfile
+import json
+import re
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import openpyxl
 import pandas as pd
+
 try:
     import streamlit as st
 except ModuleNotFoundError:  # pragma: no cover
     st = None
-
 
 APP_TITLE = "Einsatzbericht Manager (MVP)"
 TAETIGKEITEN_SHEET = "Tätigkeiten"
@@ -26,7 +32,7 @@ RELEVANTE_KODIERUNG_SHEET = "relevante Kodierung"
 REPORT_DETAIL_START_ROW = 17
 REPORT_DETAIL_END_ROW = 35
 REPORT_DETAIL_COL_START = 1  # A
-REPORT_DETAIL_COL_END = 8    # H
+REPORT_DETAIL_COL_END = 8  # H
 REPORT_ROWS_PER_PAGE = REPORT_DETAIL_END_ROW - REPORT_DETAIL_START_ROW + 1
 MILESTONES_SHEET = "Meilensteine"
 MILESTONE_COLS = ["Projekt", "Meilenstein", "Datum", "Status", "Fortschritt", "Kommentar"]
@@ -53,12 +59,12 @@ KEY_COLS_FOR_EMPTY_CHECK = [1, 2, 3, 4, 9, 12, 13, 14]  # ignore formula columns
 
 
 @dataclass
-@dataclass
 class WorkbookData:
     path: Path
     taetigkeiten_df: pd.DataFrame
     lookups: Dict[str, Any]
     milestones_df: pd.DataFrame
+
 
 # ------------------------- parsing helpers -------------------------
 
@@ -98,7 +104,6 @@ def _to_date(value: Any) -> Optional[dt.date]:
         value = value.strip()
         if not value:
             return None
-        # try ISO first, then common DE format
         for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
             try:
                 return dt.datetime.strptime(value, fmt).date()
@@ -119,7 +124,6 @@ def _to_time(value: Any) -> Optional[dt.time]:
         total_seconds %= 24 * 3600
         return dt.time(total_seconds // 3600, (total_seconds % 3600) // 60, total_seconds % 60)
     if isinstance(value, (int, float)) and not pd.isna(value):
-        # Excel serial fraction of a day
         frac = float(value) % 1
         total_seconds = int(round(frac * 24 * 3600))
         total_seconds %= 24 * 3600
@@ -212,7 +216,6 @@ def _read_list_column(ws, col_idx: int, start_row: int = 2) -> List[str]:
 def _load_lookups(wb: openpyxl.Workbook) -> Dict[str, Any]:
     lookups: Dict[str, Any] = {}
 
-    # Hilfstabelle
     if HILFS_SHEET not in wb.sheetnames:
         raise ValueError(f"Arbeitsblatt '{HILFS_SHEET}' nicht gefunden.")
     h = wb[HILFS_SHEET]
@@ -245,7 +248,6 @@ def _load_lookups(wb: openpyxl.Workbook) -> Dict[str, Any]:
         }
     lookups["projekt_infos"] = projekt_infos
 
-    # Kodierung Joyson mapping: Aufgabe -> Kodierung EB / Kodierung intern
     kodierung_map_eb: Dict[str, str] = {}
     kodierung_map_intern: Dict[str, str] = {}
     kodierungen_aufgaben: List[str] = []
@@ -270,8 +272,6 @@ def _load_lookups(wb: openpyxl.Workbook) -> Dict[str, Any]:
     lookups["kodierung_map_eb"] = kodierung_map_eb
     lookups["kodierung_map_intern"] = kodierung_map_intern
 
-    # Relevante Kodierungen: Quelle der Wahrheit = Marker in 'Kodierung Joyson' (Spalte A)
-    # (Das Sheet 'relevante Kodierung' kann Formeln enthalten, deren Cache ohne Excel-Neuberechnung veraltet sein kann.)
     relevante: List[str] = []
     if KODIERUNG_SHEET in wb.sheetnames:
         k = wb[KODIERUNG_SHEET]
@@ -338,7 +338,6 @@ def _read_taetigkeiten_df(wb: openpyxl.Workbook) -> pd.DataFrame:
     return df
 
 
-
 def _default_excel_candidates() -> List[Path]:
     script_dir = Path(__file__).resolve().parent
     cwd = Path.cwd()
@@ -352,9 +351,7 @@ def _default_excel_candidates() -> List[Path]:
             cands.append(base / n)
         for p in sorted(base.glob("*.xlsx")):
             cands.append(p)
-    # Dev fallback for this environment
     cands.append(Path("/mnt/data/__Tätigkeiten_Überblick - Kopie.xlsx"))
-    # de-duplicate preserving order
     out: List[Path] = []
     seen = set()
     for c in cands:
@@ -374,7 +371,6 @@ def _resolve_excel_path(path_str: str) -> Path:
                 return p.resolve()
         except Exception:
             pass
-        # Relative paths: prefer script dir, then cwd
         candidates = [
             Path(__file__).resolve().parent / p,
             Path.cwd() / p,
@@ -382,19 +378,14 @@ def _resolve_excel_path(path_str: str) -> Path:
         for c in candidates:
             if c.exists():
                 return c.resolve()
-        # As last resort return normalized absolute for clean error
         return p.resolve()
     for c in _default_excel_candidates():
         if c.exists():
             return c.resolve()
-    # default target in ./data for helpful message
     return (Path(__file__).resolve().parent / "data" / "Tätigkeiten_Überblick.xlsx").resolve()
 
+
 def _store_uploaded_excel(uploaded_file) -> Path:
-    """
-    Speichert eine hochgeladene Excel-Datei als lokale Arbeitskopie und gibt den Pfad zurück.
-    Wichtig: Für Excel-COM (PDF/Druck) brauchen wir eine echte Datei auf Disk.
-    """
     if uploaded_file is None:
         raise ValueError("Keine Datei hochgeladen.")
 
@@ -412,40 +403,87 @@ def _store_uploaded_excel(uploaded_file) -> Path:
     stem = Path(original_name).stem
     target = imports_dir / f"{stem}_import_{ts}.xlsx"
 
-    # uploaded_file ist ein Streamlit UploadedFile
     data = uploaded_file.getvalue()
     target.write_bytes(data)
 
     return target.resolve()
 
-def _prepare_report_formula_in_excel_sheet(ws) -> None:
-    # Fallback (legacy): repair original FILTER spill in A17 using Excel itself.
-    # NOTE: The app now prefers direct page filling for robust multi-page export/print.
+
+# ------------------------- Cross-Platform Excel Automation -------------------------
+
+def _prepare_report_formula_in_excel_sheet_com(ws) -> None:
     try:
         ws.Range(f"A{REPORT_DETAIL_START_ROW}:H200").ClearContents()
     except Exception:
         ws.Range(f"A{REPORT_DETAIL_START_ROW}:H{REPORT_DETAIL_END_ROW}").ClearContents()
-    # Correct project filter (column B = project / C12)
     formula_en = '=FILTER(Berechnung!C2:J444,Berechnung!B2:B444=Einsatzbericht!C12,"")'
     try:
         ws.Range(f"A{REPORT_DETAIL_START_ROW}").Formula2 = formula_en
     except Exception:
-        # Fallback for localized Excel
-        ws.Range(f"A{REPORT_DETAIL_START_ROW}").FormulaLocal = '=FILTER(Berechnung!C2:J444;Berechnung!B2:B444=Einsatzbericht!C12;"")'
+        ws.Range(
+            f"A{REPORT_DETAIL_START_ROW}").FormulaLocal = '=FILTER(Berechnung!C2:J444;Berechnung!B2:B444=Einsatzbericht!C12;"")'
 
 
-def _clear_original_report_detail_area(ws) -> None:
+def _clear_original_report_detail_area_com(ws) -> None:
     ws.Range(f"A{REPORT_DETAIL_START_ROW}:H{REPORT_DETAIL_END_ROW}").ClearContents()
 
 
-def _report_row_to_excel_values(row: pd.Series) -> List[Any]:
-    """Convert a web report row into values for template columns A:H.
+def _write_original_report_page_com(ws, page_df: pd.DataFrame, year: int, month: int, project: str) -> None:
+    ws.Range("K2").Value = int(year)
+    ws.Range("K3").Value = int(month)
+    ws.Range("C12").Value = str(project)
 
-    IMPORTANT (pywin32/Excel COM):
-    Writing ``datetime.date`` / ``datetime.time`` directly may raise
-    ``must be a pywintypes time object`` on some systems. We therefore write
-    display strings for date/time columns and keep only the decimal hours numeric.
-    """
+    _clear_original_report_detail_area_com(ws)
+
+    if page_df is None or page_df.empty:
+        return
+
+    page_df = page_df.reset_index(drop=True)
+    max_rows = min(len(page_df), REPORT_ROWS_PER_PAGE)
+    rows_2d = []
+    for idx in range(max_rows):
+        rows_2d.append(_report_row_to_excel_values(page_df.iloc[idx]))
+
+    if rows_2d:
+        start = REPORT_DETAIL_START_ROW
+        end = REPORT_DETAIL_START_ROW + len(rows_2d) - 1
+        ws.Range(f"A{start}:H{end}").Value = tuple(tuple(r) for r in rows_2d)
+
+
+def _prepare_report_formula_in_excel_sheet_openpyxl(ws) -> None:
+    for r in range(REPORT_DETAIL_START_ROW, REPORT_DETAIL_END_ROW + 1):
+        for c in range(REPORT_DETAIL_COL_START, REPORT_DETAIL_COL_END + 1):
+            ws.cell(r, c).value = None
+    formula_en = '=FILTER(Berechnung!C2:J444,Berechnung!B2:B444=Einsatzbericht!C12,"")'
+    ws.cell(REPORT_DETAIL_START_ROW, 1).value = formula_en
+
+
+def _write_original_report_page_openpyxl(ws, page_df: pd.DataFrame, year: int, month: int, project: str) -> None:
+    ws["K2"].value = int(year)
+    ws["K3"].value = int(month)
+    ws["C12"].value = str(project)
+
+    for r in range(REPORT_DETAIL_START_ROW, REPORT_DETAIL_END_ROW + 1):
+        for c in range(REPORT_DETAIL_COL_START, REPORT_DETAIL_COL_END + 1):
+            ws.cell(r, c).value = None
+
+    if page_df is None or page_df.empty:
+        return
+
+    page_df = page_df.reset_index(drop=True)
+    max_rows = min(len(page_df), REPORT_ROWS_PER_PAGE)
+    rows_2d = []
+    for idx in range(max_rows):
+        rows_2d.append(_report_row_to_excel_values(page_df.iloc[idx]))
+
+    if rows_2d:
+        start = REPORT_DETAIL_START_ROW
+        for row_offset, row_data in enumerate(rows_2d):
+            for col_offset, val in enumerate(row_data):
+                ws.cell(start + row_offset, REPORT_DETAIL_COL_START + col_offset).value = val
+
+
+def _report_row_to_excel_values(row: pd.Series) -> List[Any]:
     datum = _format_date(row.get("Datum")) or _safe_str(row.get("Datum"))
     beginn = _format_time(row.get("Beginn")) or _safe_str(row.get("Beginn"))
     ende = _format_time(row.get("Ende")) or _safe_str(row.get("Ende"))
@@ -470,33 +508,6 @@ def _report_row_to_excel_values(row: pd.Series) -> List[Any]:
     return [datum, beginn, ende, pause, zeit_h, art, kod_eb, leistung]
 
 
-def _write_original_report_page(ws, page_df: pd.DataFrame, year: int, month: int, project: str) -> None:
-    """
-    Fill the ORIGINAL 'Einsatzbericht' template directly (A17:H35) for one page.
-    This avoids fragile spill formulas and allows deterministic multi-page export.
-    """
-    ws.Range("K2").Value = int(year)
-    ws.Range("K3").Value = int(month)
-    ws.Range("C12").Value = str(project)
-
-    _clear_original_report_detail_area(ws)
-
-    if page_df is None or page_df.empty:
-        return
-
-    # Write rows directly into template area (A:H)
-    page_df = page_df.reset_index(drop=True)
-    max_rows = min(len(page_df), REPORT_ROWS_PER_PAGE)
-    rows_2d = []
-    for idx in range(max_rows):
-        rows_2d.append(_report_row_to_excel_values(page_df.iloc[idx]))
-
-    if rows_2d:
-        start = REPORT_DETAIL_START_ROW
-        end = REPORT_DETAIL_START_ROW + len(rows_2d) - 1
-        ws.Range(f"A{start}:H{end}").Value = tuple(tuple(r) for r in rows_2d)
-
-
 def _split_report_pages(report_df: Optional[pd.DataFrame]) -> List[pd.DataFrame]:
     if report_df is None:
         return []
@@ -509,29 +520,25 @@ def _split_report_pages(report_df: Optional[pd.DataFrame]) -> List[pd.DataFrame]
     return pages
 
 
-def _excel_original_report_action(
-    xlsx_path: Path,
-    year: int,
-    month: int,
-    project: str,
-    action: str,
-    pdf_output_path: Optional[Path] = None,
-    xlsx_output_path: Optional[Path] = None,
-    report_df: Optional[pd.DataFrame] = None,
-) -> Tuple[bool, str]:
-    """
-    action: 'pdf' | 'xlsx' | 'print' | 'open'
-    Uses Microsoft Excel via pywin32. Preferably fills the original sheet template directly
-    from report_df (robust, paginated). Falls back to repairing Excel FILTER if needed.
-    """
+def _excel_original_report_action_com(
+        xlsx_path: Path,
+        year: int,
+        month: int,
+        project: str,
+        action: str,
+        pdf_output_path: Optional[Path] = None,
+        xlsx_output_path: Optional[Path] = None,
+        report_df: Optional[pd.DataFrame] = None,
+) -> Tuple[bool, str, List[Path]]:
+    """Original Windows-only COM automation path via pywin32."""
     try:
         import pythoncom  # type: ignore
         import win32com.client as win32  # type: ignore
-    except Exception as e:
-        return False, f"Excel-Automation nicht verfügbar (pywin32 / Excel): {e}"
+    except ImportError:
+        raise RuntimeError("win32com is not available.")
 
     if not Path(xlsx_path).exists():
-        return False, f"Excel-Datei nicht gefunden: {xlsx_path}"
+        return False, f"Excel-Datei nicht gefunden: {xlsx_path}", []
 
     excel = None
     wb = None
@@ -542,7 +549,6 @@ def _excel_original_report_action(
         excel.DisplayAlerts = False
         excel.ScreenUpdating = False
 
-        # Optional optimizations (dürfen nicht fatal sein)
         try:
             excel.EnableEvents = False
         except Exception:
@@ -550,11 +556,11 @@ def _excel_original_report_action(
 
         manual_calc_enabled = False
         try:
-            # Manche Excel-Dateien/Setups erlauben das nicht -> dann einfach weiter mit AutoCalc
             excel.Calculation = -4135  # xlCalculationManual
             manual_calc_enabled = True
         except Exception:
             manual_calc_enabled = False
+
         wb = excel.Workbooks.Open(str(Path(xlsx_path).resolve()), UpdateLinks=False, ReadOnly=False)
         ws = wb.Worksheets("Einsatzbericht")
 
@@ -564,8 +570,6 @@ def _excel_original_report_action(
         page_count = len(pages)
 
         def _recalc() -> None:
-            # Direktes Befüllen des Formulars braucht meist nur Sheet/normalen Recalc,
-            # kein FullRebuild (sehr langsam).
             try:
                 ws.Calculate()
                 return
@@ -576,7 +580,6 @@ def _excel_original_report_action(
                 return
             except Exception:
                 pass
-            # Nur als allerletzter Notnagel:
             try:
                 excel.CalculateFull()
             except Exception:
@@ -591,19 +594,20 @@ def _excel_original_report_action(
             exported_files: List[Path] = []
             for page_idx, page_df in enumerate(pages, start=1):
                 if report_df is not None:
-                    _write_original_report_page(ws, page_df, int(year), int(month), str(project))
+                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project))
                 else:
                     ws.Range("K2").Value = int(year)
                     ws.Range("K3").Value = int(month)
                     ws.Range("C12").Value = str(project)
-                    _prepare_report_formula_in_excel_sheet(ws)
+                    _prepare_report_formula_in_excel_sheet_com(ws)
                 _recalc()
 
                 if page_count > 1:
-                    out_path = pdf_output_path.with_name(f"{pdf_output_path.stem}_{page_idx:02d}{pdf_output_path.suffix}")
+                    out_path = pdf_output_path.with_name(
+                        f"{pdf_output_path.stem}_{page_idx:02d}{pdf_output_path.suffix}")
                 else:
                     out_path = pdf_output_path
-                ws.ExportAsFixedFormat(0, str(out_path))  # 0 = xlTypePDF
+                ws.ExportAsFixedFormat(0, str(out_path))
                 exported_files.append(out_path)
 
             wb.Close(SaveChanges=False)
@@ -612,14 +616,11 @@ def _excel_original_report_action(
                     excel.Calculation = -4105  # xlCalculationAutomatic
             except Exception:
                 pass
-            try:
-                excel.EnableEvents = True
-            except Exception:
-                pass
             excel.Quit()
             if page_count > 1:
-                return True, f"{page_count} PDFs exportiert ({REPORT_ROWS_PER_PAGE} Positionen pro Formularseite): {exported_files[0].name} ... {exported_files[-1].name}"
-            return True, f"PDF exportiert: {exported_files[0]}"
+                return True, f"{page_count} PDFs exportiert ({REPORT_ROWS_PER_PAGE} Positionen pro Formularseite).", exported_files
+            return True, f"PDF exportiert.", exported_files
+
         if action == "xlsx":
             if xlsx_output_path is None:
                 xlsx_output_path = Path(xlsx_path).with_name(f"Einsatzbericht_{project}_{year}-{int(month):02d}.xlsx")
@@ -629,94 +630,77 @@ def _excel_original_report_action(
             exported_files: List[Path] = []
             for page_idx, page_df in enumerate(pages, start=1):
                 if report_df is not None:
-                    _write_original_report_page(ws, page_df, int(year), int(month), str(project))
+                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project))
                 else:
                     ws.Range("K2").Value = int(year)
                     ws.Range("K3").Value = int(month)
                     ws.Range("C12").Value = str(project)
-                    _prepare_report_formula_in_excel_sheet(ws)
+                    _prepare_report_formula_in_excel_sheet_com(ws)
                 _recalc()
 
                 if page_count > 1:
-                    out_path = xlsx_output_path.with_name(f"{xlsx_output_path.stem}_{page_idx:02d}{xlsx_output_path.suffix}")
+                    out_path = xlsx_output_path.with_name(
+                        f"{xlsx_output_path.stem}_{page_idx:02d}{xlsx_output_path.suffix}")
                 else:
                     out_path = xlsx_output_path
 
-                # Speichert eine vorbereitete Kopie des Workbooks (Original bleibt unverändert)
                 wb.SaveCopyAs(str(out_path))
                 exported_files.append(out_path)
 
             wb.Close(SaveChanges=False)
             try:
                 if manual_calc_enabled:
-                    excel.Calculation = -4105  # xlCalculationAutomatic
-            except Exception:
-                pass
-            try:
-                excel.EnableEvents = True
+                    excel.Calculation = -4105
             except Exception:
                 pass
             excel.Quit()
             if page_count > 1:
-                return True, f"{page_count} Excel-Kopien exportiert ({REPORT_ROWS_PER_PAGE} Positionen pro Formularseite): {exported_files[0].name} ... {exported_files[-1].name}"
-            return True, f"Excel-Kopie exportiert: {exported_files[0]}"
+                return True, f"{page_count} Excel-Kopien exportiert ({REPORT_ROWS_PER_PAGE} Positionen pro Formularseite).", exported_files
+            return True, f"Excel-Kopie exportiert.", exported_files
+
         if action == "print":
             for page_df in pages:
                 if report_df is not None:
-                    _write_original_report_page(ws, page_df, int(year), int(month), str(project))
+                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project))
                 else:
                     ws.Range("K2").Value = int(year)
                     ws.Range("K3").Value = int(month)
                     ws.Range("C12").Value = str(project)
-                    _prepare_report_formula_in_excel_sheet(ws)
+                    _prepare_report_formula_in_excel_sheet_com(ws)
                 _recalc()
                 ws.PrintOut()
             wb.Close(SaveChanges=False)
             try:
                 if manual_calc_enabled:
-                    excel.Calculation = -4105  # xlCalculationAutomatic
-            except Exception:
-                pass
-            try:
-                excel.EnableEvents = True
+                    excel.Calculation = -4105
             except Exception:
                 pass
             excel.Quit()
             if page_count > 1:
-                return True, f"{page_count} Druckaufträge gesendet ({REPORT_ROWS_PER_PAGE} Positionen pro Formularseite)."
-            return True, "Druckauftrag an Standarddrucker gesendet."
+                return True, f"{page_count} Druckaufträge gesendet ({REPORT_ROWS_PER_PAGE} Positionen pro Formularseite).", []
+            return True, "Druckauftrag an Standarddrucker gesendet.", []
 
         if action == "open":
-            # Prepare first page for manual inspection in Excel. (PDF/Druck paginates automatically.)
             if report_df is not None:
-                _write_original_report_page(ws, pages[0], int(year), int(month), str(project))
+                _write_original_report_page_com(ws, pages[0], int(year), int(month), str(project))
             else:
                 ws.Range("K2").Value = int(year)
                 ws.Range("K3").Value = int(month)
                 ws.Range("C12").Value = str(project)
-                _prepare_report_formula_in_excel_sheet(ws)
+                _prepare_report_formula_in_excel_sheet_com(ws)
             _recalc()
             excel.Visible = True
             excel.ScreenUpdating = True
             excel.DisplayAlerts = True
             if page_count > 1:
-                return True, f"Originaldatei in Excel geöffnet (Seite 1/{page_count} vorbereitet). PDF/Druck erstellt weitere Seiten automatisch."
-            return True, "Originaldatei in Excel geöffnet (Bericht vorbereitet)."
+                return True, f"Originaldatei in Excel geöffnet (Seite 1/{page_count} vorbereitet). PDF/Druck erstellt weitere Seiten automatisch.", []
+            return True, "Originaldatei in Excel geöffnet (Bericht vorbereitet).", []
 
         if wb is not None:
             wb.Close(SaveChanges=False)
         if excel is not None:
-            try:
-                if manual_calc_enabled:
-                    excel.Calculation = -4105  # xlCalculationAutomatic
-            except Exception:
-                pass
-            try:
-                excel.EnableEvents = True
-            except Exception:
-                pass
             excel.Quit()
-        return False, f"Unbekannte Aktion: {action} (erwartet: pdf | xlsx | print | open)"
+        return False, f"Unbekannte Aktion: {action}", []
 
     except Exception as e:
         try:
@@ -726,24 +710,165 @@ def _excel_original_report_action(
             pass
         try:
             if excel is not None:
-                try:
-                    if manual_calc_enabled:
-                        excel.Calculation = -4105  # xlCalculationAutomatic
-                except Exception:
-                    pass
-                try:
-                    excel.EnableEvents = True
-                except Exception:
-                    pass
                 excel.Quit()
         except Exception:
             pass
-        return False, f"Fehler bei Excel-Druck/PDF: {e}"
+        raise e
     finally:
         try:
             pythoncom.CoUninitialize()
         except Exception:
             pass
+
+
+def _excel_original_report_action_fallback(
+        xlsx_path: Path,
+        year: int,
+        month: int,
+        project: str,
+        action: str,
+        pdf_output_path: Optional[Path] = None,
+        xlsx_output_path: Optional[Path] = None,
+        report_df: Optional[pd.DataFrame] = None,
+        is_mac: bool = False,
+) -> Tuple[bool, str, List[Path]]:
+    """Cross-Platform Fallback (macOS / Linux / fallback for Windows without win32com)."""
+    try:
+        wb = openpyxl.load_workbook(xlsx_path)
+        if "Einsatzbericht" not in wb.sheetnames:
+            return False, "Blatt 'Einsatzbericht' nicht gefunden.", []
+        ws = wb["Einsatzbericht"]
+
+        pages = _split_report_pages(report_df)
+        if not pages:
+            pages = [pd.DataFrame()]
+        page_count = len(pages)
+
+        exported_files: List[Path] = []
+
+        if action == "pdf":
+            if pdf_output_path is None:
+                pdf_output_path = Path(xlsx_path).with_name(f"Einsatzbericht_{project}_{year}-{int(month):02d}.pdf")
+            pdf_output_path = Path(pdf_output_path)
+            pdf_output_path.parent.mkdir(parents=True, exist_ok=True)
+        elif action == "xlsx":
+            if xlsx_output_path is None:
+                xlsx_output_path = Path(xlsx_path).with_name(f"Einsatzbericht_{project}_{year}-{int(month):02d}.xlsx")
+            xlsx_output_path = Path(xlsx_output_path)
+            xlsx_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        for page_idx, page_df in enumerate(pages, start=1):
+            if report_df is not None:
+                _write_original_report_page_openpyxl(ws, page_df, year, month, project)
+            else:
+                ws["K2"].value = int(year)
+                ws["K3"].value = int(month)
+                ws["C12"].value = str(project)
+                _prepare_report_formula_in_excel_sheet_openpyxl(ws)
+
+            if action == "xlsx":
+                if page_count > 1:
+                    out_path = xlsx_output_path.with_name(
+                        f"{xlsx_output_path.stem}_{page_idx:02d}{xlsx_output_path.suffix}")
+                else:
+                    out_path = xlsx_output_path
+                wb.save(out_path)
+                exported_files.append(out_path)
+
+            elif action == "open":
+                tmp_dir = Path(tempfile.gettempdir())
+                tmp_file = tmp_dir / f"Einsatzbericht_Temp_{project}_{year}-{int(month):02d}_{page_idx:02d}.xlsx"
+                wb.save(tmp_file)
+                if is_mac:
+                    subprocess.call(["open", str(tmp_file)])
+                elif sys.platform == "win32":
+                    os.startfile(str(tmp_file))
+                else:
+                    subprocess.call(["xdg-open", str(tmp_file)])
+                exported_files.append(tmp_file)
+
+            elif action == "pdf":
+                if not is_mac:
+                    return False, "Direkter PDF-Export erfordert Windows (pywin32) oder macOS (AppleScript).", []
+
+                if page_count > 1:
+                    out_path = pdf_output_path.with_name(
+                        f"{pdf_output_path.stem}_{page_idx:02d}{pdf_output_path.suffix}")
+                else:
+                    out_path = pdf_output_path
+
+                tmp_file = Path(tempfile.gettempdir()) / f"tmp_pdf_export_{page_idx}.xlsx"
+                wb.save(tmp_file)
+
+                script = f'''
+                tell application "Microsoft Excel"
+                    set wb to open POSIX file "{tmp_file.resolve()}"
+                    save wb in POSIX file "{out_path.resolve()}" as PDF file format
+                    close wb saving no
+                end tell
+                '''
+                subprocess.run(["osascript", "-e", script], check=True)
+                exported_files.append(out_path)
+
+            elif action == "print":
+                if not is_mac:
+                    return False, "Direkter Druck erfordert Windows (pywin32) oder macOS (AppleScript).", []
+                tmp_file = Path(tempfile.gettempdir()) / f"tmp_print_export_{page_idx}.xlsx"
+                wb.save(tmp_file)
+                script = f'''
+                tell application "Microsoft Excel"
+                    set wb to open POSIX file "{tmp_file.resolve()}"
+                    print out active sheet
+                    close wb saving no
+                end tell
+                '''
+                subprocess.run(["osascript", "-e", script], check=True)
+
+        if action == "pdf":
+            msg = f"{page_count} PDFs exportiert" if page_count > 1 else "PDF exportiert"
+            return True, f"{msg}", exported_files
+        elif action == "xlsx":
+            msg = f"{page_count} Excel-Kopien exportiert" if page_count > 1 else "Excel-Kopie exportiert"
+            return True, f"{msg}", exported_files
+        elif action == "open":
+            return True, f"Datei(en) geöffnet ({len(exported_files)} Seite(n) vorbereitet).", exported_files
+        elif action == "print":
+            return True, f"{page_count} Druckaufträge via AppleScript an Excel gesendet.", []
+
+        return False, f"Unbekannte Aktion: {action}", []
+
+    except Exception as e:
+        return False, f"Fehler bei macOS/Cross-Platform Verarbeitung: {e}", []
+
+
+def _excel_original_report_action(
+        xlsx_path: Path,
+        year: int,
+        month: int,
+        project: str,
+        action: str,
+        pdf_output_path: Optional[Path] = None,
+        xlsx_output_path: Optional[Path] = None,
+        report_df: Optional[pd.DataFrame] = None,
+) -> Tuple[bool, str, List[Path]]:
+    """
+    Main dispatcher: Uses COM on Windows if available. Otherwise, falls back
+    to a robust cross-platform implementation (openpyxl + osascript on macOS).
+    """
+    is_windows = sys.platform == "win32"
+    is_mac = sys.platform == "darwin"
+
+    if is_windows:
+        try:
+            return _excel_original_report_action_com(
+                xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df
+            )
+        except Exception:
+            pass  # Fallthrough to fallback
+
+    return _excel_original_report_action_fallback(
+        xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df, is_mac
+    )
 
 
 def load_workbook_data(path_str: str) -> WorkbookData:
@@ -757,6 +882,10 @@ def load_workbook_data(path_str: str) -> WorkbookData:
     return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, lookups=lookups, milestones_df=milestones_df)
 
 
+@st.cache_data(show_spinner=False)
+def _cached_load_workbook_data(path_str: str, modified_time: float) -> WorkbookData:
+    return load_workbook_data(path_str)
+
 
 # --------------------- Milestone ------------------------------------
 
@@ -764,7 +893,6 @@ def _normalize_milestone_status(v: Any) -> str:
     s = _safe_str(v).strip().lower()
     if not s:
         return "geplant"
-    # kleine Normalisierung
     if s in {"done", "erledigt", "fertig"}:
         return "erledigt"
     if s in {"blocked", "blockiert"}:
@@ -783,7 +911,6 @@ def _read_milestones_df(wb: openpyxl.Workbook) -> pd.DataFrame:
     ws = wb[MILESTONES_SHEET]
     rows: List[Dict[str, Any]] = []
 
-    # Header ist optional; wir lesen ab Zeile 2 robust.
     for r in range(2, ws.max_row + 1):
         projekt = ws.cell(r, 1).value
         name = ws.cell(r, 2).value
@@ -792,15 +919,14 @@ def _read_milestones_df(wb: openpyxl.Workbook) -> pd.DataFrame:
         fort = ws.cell(r, 5).value
         comment = ws.cell(r, 6).value
 
-        # Skip komplett leere Zeilen
-        if _is_blank(projekt) and _is_blank(name) and _is_blank(datum) and _is_blank(status) and _is_blank(fort) and _is_blank(comment):
+        if _is_blank(projekt) and _is_blank(name) and _is_blank(datum) and _is_blank(status) and _is_blank(
+                fort) and _is_blank(comment):
             continue
 
         d = _to_date(datum)
         f = _to_float_or_none(fort)
         if f is None:
             f = 0.0
-        # clamp 0..100
         f = max(0.0, min(100.0, float(f)))
 
         rec = {
@@ -819,7 +945,8 @@ def _read_milestones_df(wb: openpyxl.Workbook) -> pd.DataFrame:
         return pd.DataFrame(columns=MILESTONE_COLS + ["_excel_row"])
 
     dfm["Datum_dt"] = pd.to_datetime(dfm["Datum"], errors="coerce")
-    dfm = dfm.sort_values(["Projekt", "Datum_dt", "_excel_row"], ascending=[True, True, True]).drop(columns=["Datum_dt"])
+    dfm = dfm.sort_values(["Projekt", "Datum_dt", "_excel_row"], ascending=[True, True, True]).drop(
+        columns=["Datum_dt"])
     dfm = dfm.reset_index(drop=True)
     return dfm
 
@@ -830,7 +957,6 @@ def _ensure_milestones_sheet(wb: openpyxl.Workbook):
     else:
         ws = wb.create_sheet(MILESTONES_SHEET)
 
-    # Header sicherstellen
     if ws.max_row < 1 or all(_is_blank(ws.cell(1, c).value) for c in range(1, 7)):
         for i, h in enumerate(MILESTONE_COLS, start=1):
             ws.cell(1, i).value = h
@@ -838,7 +964,6 @@ def _ensure_milestones_sheet(wb: openpyxl.Workbook):
 
 
 def _find_next_milestone_row(ws) -> int:
-    # erste freie Zeile nach unten
     for r in range(2, ws.max_row + 2):
         if all(_is_blank(ws.cell(r, c).value) for c in range(1, 7)):
             return r
@@ -915,7 +1040,6 @@ def _write_taetigkeit_row(ws, row_idx: int, record: Dict[str, Any]) -> None:
     ws.cell(row_idx, 13).value = abgerechnet
     ws.cell(row_idx, 14).value = eingetragen
 
-    # number formats for safety
     ws.cell(row_idx, 1).number_format = "DD.MM.YYYY"
     for c in (3, 4, 5, 6):
         ws.cell(row_idx, c).number_format = "hh:mm"
@@ -946,10 +1070,10 @@ def _find_next_hilfstabelle_project_row(ws) -> int:
 
 
 def _upsert_project_stammdaten(
-    wb: openpyxl.Workbook,
-    project_data: Dict[str, Any],
-    original_project: Optional[str] = None,
-    rename_taetigkeiten: bool = False,
+        wb: openpyxl.Workbook,
+        project_data: Dict[str, Any],
+        original_project: Optional[str] = None,
+        rename_taetigkeiten: bool = False,
 ) -> Tuple[bool, str]:
     if HILFS_SHEET not in wb.sheetnames:
         return False, f"Arbeitsblatt '{HILFS_SHEET}' nicht gefunden."
@@ -1020,7 +1144,6 @@ def _set_relevante_kodierungen(wb: openpyxl.Workbook, selected_aufgaben: List[st
 
 
 def _save_workbook(path: Path, mutator) -> Tuple[bool, str]:
-    """Load workbook, apply mutator(wb), save with backup. Returns (ok, message)."""
     try:
         backup_path = path.with_suffix(path.suffix + f".bak-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}")
         shutil.copy2(path, backup_path)
@@ -1040,7 +1163,8 @@ def _save_workbook(path: Path, mutator) -> Tuple[bool, str]:
 
 # ------------------------- reporting logic -------------------------
 
-def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: int, project: str, include_abgerechnet: bool) -> pd.DataFrame:
+def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: int, project: str,
+                  include_abgerechnet: bool) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
@@ -1051,7 +1175,6 @@ def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: i
     x = x[x["Datum_dt"].dt.month == int(month)]
     x = x[x["Projekt"].astype(str) == str(project)]
 
-    # Excel logic: interne Tätigkeiten raus
     x = x[x["Tätigkeit"].astype(str).str.upper() != "I"]
 
     if not include_abgerechnet:
@@ -1067,12 +1190,13 @@ def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: i
     x["Art"] = x["Tätigkeit"]
     x["Leistungsbeschreibung"] = x["Info"].fillna("")
 
-    # Sort ascending like report
     x["_sort_date"] = pd.to_datetime(x["Datum"], format="%d.%m.%Y", errors="coerce")
     x["_sort_start"] = x["Zeit von"].apply(lambda t: _time_to_minutes(t) if t else -1)
     x = x.sort_values(["_sort_date", "_sort_start", "_excel_row"]).drop(columns=["_sort_date", "_sort_start"])
 
-    return x[["_excel_row", "Datum", "Beginn", "Ende", "Pause", "Zeit (h)", "Art", "Kodierung EB", "Leistungsbeschreibung", "Abgerechnet"]].reset_index(drop=True)
+    return x[
+        ["_excel_row", "Datum", "Beginn", "Ende", "Pause", "Zeit (h)", "Art", "Kodierung EB", "Leistungsbeschreibung",
+         "Abgerechnet"]].reset_index(drop=True)
 
 
 def _summaries_from_report(report_df: pd.DataFrame) -> Dict[str, float]:
@@ -1102,12 +1226,14 @@ def _project_defaults(df: pd.DataFrame) -> Tuple[int, int]:
     return latest.year, latest.month
 
 
-def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Optional[Dict[str, Any]] = None) -> Dict[
+    str, Any]:
     defaults = defaults or {}
     projekte = list(dict.fromkeys([*(lookups.get("projekte") or []), _safe_str(defaults.get("Projekt"))]))
     projekte = [p for p in projekte if p]
     typen = list(dict.fromkeys([*(lookups.get("taetigkeit_typen") or []), _safe_str(defaults.get("Tätigkeit"))]))
-    ja_nein = list(dict.fromkeys([*(lookups.get("ja_nein") or ["ja", "nein"]), _safe_str(defaults.get("Abgerechnet")), _safe_str(defaults.get("eingetragen"))]))
+    ja_nein = list(dict.fromkeys([*(lookups.get("ja_nein") or ["ja", "nein"]), _safe_str(defaults.get("Abgerechnet")),
+                                  _safe_str(defaults.get("eingetragen"))]))
     kod_options = list(
         dict.fromkeys(
             [""]
@@ -1116,7 +1242,8 @@ def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Opti
             + [_safe_str(defaults.get("Kodierung"))]
         )
     )
-    interne_options = list(dict.fromkeys([""] + (lookups.get("interne_projekte") or []) + [_safe_str(defaults.get("Interne Projekte"))]))
+    interne_options = list(
+        dict.fromkeys([""] + (lookups.get("interne_projekte") or []) + [_safe_str(defaults.get("Interne Projekte"))]))
 
     d_default = _to_date(defaults.get("Datum")) or dt.date.today()
     zv_default = _to_time(defaults.get("Zeit von")) or dt.time(8, 0)
@@ -1135,50 +1262,59 @@ def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Opti
         projekt = st.selectbox(
             "Projekt",
             options=projekte if projekte else [""],
-            index=(projekte.index(_safe_str(defaults.get("Projekt"))) if _safe_str(defaults.get("Projekt")) in projekte else 0),
+            index=(projekte.index(_safe_str(defaults.get("Projekt"))) if _safe_str(
+                defaults.get("Projekt")) in projekte else 0),
             key=f"{prefix}_projekt",
         )
     with col2:
         zeit_von = st.time_input("Zeit von", value=zv_default, key=f"{prefix}_zv")
         zeit_bis = st.time_input("Zeit bis", value=zb_default, key=f"{prefix}_zb")
     with col3:
-        pause_min = st.number_input("Pause (Minuten)", min_value=0, max_value=600, value=pause_min_default, step=5, key=f"{prefix}_pause")
+        pause_min = st.number_input("Pause (Minuten)", min_value=0, max_value=600, value=pause_min_default, step=5,
+                                    key=f"{prefix}_pause")
         km = st.number_input("km", min_value=0, value=km_default, step=1, key=f"{prefix}_km")
     with col4:
         taet_typ = st.selectbox(
             "Tätigkeit (Typ)",
             options=typen if typen else ["F", "R", "I"],
-            index=(typen.index(_safe_str(defaults.get("Tätigkeit"))) if _safe_str(defaults.get("Tätigkeit")) in typen else 0),
+            index=(typen.index(_safe_str(defaults.get("Tätigkeit"))) if _safe_str(
+                defaults.get("Tätigkeit")) in typen else 0),
             key=f"{prefix}_typ",
         )
         kodierung = st.selectbox(
             "Kodierung (Aufgabe)",
             options=kod_options,
-            index=(kod_options.index(_safe_str(defaults.get("Kodierung"))) if _safe_str(defaults.get("Kodierung")) in kod_options else 0),
+            index=(kod_options.index(_safe_str(defaults.get("Kodierung"))) if _safe_str(
+                defaults.get("Kodierung")) in kod_options else 0),
             key=f"{prefix}_kod",
         )
 
     col5, col6, col7 = st.columns([2, 1, 1])
     with col5:
-        info = st.text_area("Info / Leistungsbeschreibung", value=_safe_str(defaults.get("Info")), height=80, key=f"{prefix}_info")
+        info = st.text_area("Info / Leistungsbeschreibung", value=_safe_str(defaults.get("Info")), height=80,
+                            key=f"{prefix}_info")
     with col6:
         interne = st.selectbox(
             "Interne Projekte",
             options=interne_options,
-            index=(interne_options.index(_safe_str(defaults.get("Interne Projekte"))) if _safe_str(defaults.get("Interne Projekte")) in interne_options else 0),
+            index=(interne_options.index(_safe_str(defaults.get("Interne Projekte"))) if _safe_str(
+                defaults.get("Interne Projekte")) in interne_options else 0),
             key=f"{prefix}_intern",
         )
     with col7:
         abgerechnet = st.selectbox(
             "Abgerechnet",
             options=ja_nein if ja_nein else ["ja", "nein"],
-            index=((ja_nein.index(_safe_str(defaults.get("Abgerechnet"))) if _safe_str(defaults.get("Abgerechnet")) in ja_nein else (ja_nein.index("nein") if "nein" in ja_nein else 0))),
+            index=((ja_nein.index(_safe_str(defaults.get("Abgerechnet"))) if _safe_str(
+                defaults.get("Abgerechnet")) in ja_nein else (ja_nein.index("nein") if "nein" in ja_nein else 0))),
             key=f"{prefix}_abg",
         )
         eingetragen = st.selectbox(
             "eingetragen",
             options=[""] + (ja_nein if ja_nein else ["ja", "nein"]),
-            index=([""] + (ja_nein if ja_nein else ["ja", "nein"])).index(_safe_str(defaults.get("eingetragen"))) if _safe_str(defaults.get("eingetragen")) in ([""] + (ja_nein if ja_nein else ["ja", "nein"])) else 0,
+            index=([""] + (ja_nein if ja_nein else ["ja", "nein"])).index(
+                _safe_str(defaults.get("eingetragen"))) if _safe_str(defaults.get("eingetragen")) in (
+                        [""] + (ja_nein if ja_nein else ["ja", "nein"])) else 0,
             key=f"{prefix}_eing",
         )
 
@@ -1186,7 +1322,8 @@ def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Opti
     if hours is None:
         st.warning("Zeitangaben ergeben keine gültige Dauer.")
     else:
-        st.caption(f"Berechnete Dauer: **{hours:.2f} h** ({int(round(hours*60))//60:02d}:{int(round(hours*60))%60:02d})")
+        st.caption(
+            f"Berechnete Dauer: **{hours:.2f} h** ({int(round(hours * 60)) // 60:02d}:{int(round(hours * 60)) % 60:02d})")
 
     return {
         "Datum": datum,
@@ -1204,7 +1341,8 @@ def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Opti
     }
 
 
-def _filtered_taetigkeiten(df: pd.DataFrame, year: Optional[int], month: Optional[int], project: str, include_abgerechnet: bool) -> pd.DataFrame:
+def _filtered_taetigkeiten(df: pd.DataFrame, year: Optional[int], month: Optional[int], project: str,
+                           include_abgerechnet: bool) -> pd.DataFrame:
     x = df.copy()
     if x.empty:
         return x
@@ -1217,8 +1355,9 @@ def _filtered_taetigkeiten(df: pd.DataFrame, year: Optional[int], month: Optiona
     if not include_abgerechnet:
         x = x[x["Abgerechnet"].fillna("").astype(str).str.strip().str.lower() != "ja"]
     return x.reset_index(drop=True)
+
+
 def _row_key_from_series(s: pd.Series) -> tuple:
-    """Key used to detect duplicates across workbooks."""
     return (
         _format_date(s.get("Datum")),
         _safe_str(s.get("Projekt")).strip(),
@@ -1242,68 +1381,51 @@ def _existing_keys(df: pd.DataFrame) -> set:
     return keys
 
 
-def _import_df_from_xlsx(path: Path) -> pd.DataFrame:
-    """Load source workbook and read the 'Tätigkeiten' sheet using the same parser as the app."""
-    wb = openpyxl.load_workbook(path)
-    if TAETIGKEITEN_SHEET not in wb.sheetnames:
-        raise ValueError(f"Quelle hat kein Sheet '{TAETIGKEITEN_SHEET}'.")
-    return _read_taetigkeiten_df(wb)
-
-
-def _store_uploaded_import_file(uploaded_file) -> Path:
-    """Store uploaded import source file to disk (separate from 'working copy' logic)."""
-    if uploaded_file is None:
-        raise ValueError("Keine Datei hochgeladen.")
-    name = Path(getattr(uploaded_file, "name", "import.xlsx")).name
-    if Path(name).suffix.lower() != ".xlsx":
-        raise ValueError("Bitte eine .xlsx-Datei hochladen.")
-
-    script_dir = Path(__file__).resolve().parent
-    imports_dir = script_dir / "imports_lines"
-    imports_dir.mkdir(parents=True, exist_ok=True)
-
-    ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    target = imports_dir / f"{Path(name).stem}_lines_{ts}.xlsx"
-    target.write_bytes(uploaded_file.getvalue())
-    return target.resolve()
-
-
-def _series_to_write_record(s: pd.Series, project_value: str) -> Dict[str, Any]:
-    """Convert a parsed Tätigkeiten row into a write payload for _write_taetigkeit_row."""
-    pause_min = int(s.get("Pause_Min") or _time_to_minutes(s.get("Pause")) or 0)
-    return {
-        "Datum": _to_date(s.get("Datum")),
-        "Projekt": project_value,
-        "Zeit von": _to_time(s.get("Zeit von")),
-        "Zeit bis": _to_time(s.get("Zeit bis")),
-        "Pause_Min": pause_min,
-        "km": int(float(s.get("km") or 0) or 0),
-        "Tätigkeit": _safe_str(s.get("Tätigkeit")).strip(),
-        "Kodierung": _safe_str(s.get("Kodierung")).strip(),
-        "Interne Projekte": _safe_str(s.get("Interne Projekte")).strip(),
-        "Info": _safe_str(s.get("Info")),
-        "Abgerechnet": _safe_str(s.get("Abgerechnet")).strip() or None,
-        "eingetragen": _safe_str(s.get("eingetragen")).strip() or None,
-    }
-def _store_uploaded_report_file(uploaded_file) -> Path:
-    if uploaded_file is None:
-        raise ValueError("Keine Datei hochgeladen.")
-    name = Path(getattr(uploaded_file, "name", "report.xlsx")).name
-    if Path(name).suffix.lower() != ".xlsx":
-        raise ValueError("Bitte eine .xlsx-Datei hochladen.")
-
+@st.cache_data(show_spinner=False, max_entries=100)
+def _parse_and_store_uploaded_report(file_name: str, file_bytes: bytes) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    h = hashlib.md5(file_bytes).hexdigest()[:8]
     script_dir = Path(__file__).resolve().parent
     reports_dir = script_dir / "imports_reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    target = reports_dir / f"{Path(name).stem}_report_{ts}.xlsx"
-    target.write_bytes(uploaded_file.getvalue())
-    return target.resolve()
+    stem = Path(file_name).stem
+    target = reports_dir / f"{stem}_{h}.xlsx"
+    if not target.exists():
+        target.write_bytes(file_bytes)
+
+    meta, lines = _read_einsatzbericht_xlsx(target)
+    meta["original_filename"] = file_name
+    return meta, lines
+
+
+def _guess_project(meta: Dict[str, Any], filename: str, lookups: Dict[str, Any], target_projects: List[str]) -> str:
+    det = _safe_str(meta.get("project")).strip()
+    fname_lower = filename.lower()
+
+    if det in target_projects:
+        return det
+
+    for p in sorted(target_projects, key=len, reverse=True):
+        if p and p.lower() in fname_lower:
+            return p
+
+    infos = lookups.get("projekt_infos", {})
+    if det:
+        det_lower = det.lower()
+        for p, p_data in infos.items():
+            kunde = _safe_str(p_data.get("Kunde")).strip().lower()
+            if kunde and (kunde in det_lower or det_lower in kunde):
+                return p
+
+    for p, p_data in infos.items():
+        kunde = _safe_str(p_data.get("Kunde")).strip().lower()
+        if kunde and kunde in fname_lower:
+            return p
+
+    return ""
 
 
 def _build_reverse_kod_map_eb_to_aufgabe(lookups: Dict[str, Any]) -> Dict[str, str]:
-    # Aufgabe -> EB  ==>  EB -> Aufgabe (nur wenn eindeutig)
     fwd = lookups.get("kodierung_map_eb", {}) or {}
     rev: Dict[str, str] = {}
     collisions = set()
@@ -1320,12 +1442,12 @@ def _build_reverse_kod_map_eb_to_aufgabe(lookups: Dict[str, Any]) -> Dict[str, s
         rev.pop(c, None)
     return rev
 
-import re
 
 GER_MONTHS = {
     "januar": 1, "februar": 2, "märz": 3, "maerz": 3, "april": 4, "mai": 5, "juni": 6,
     "juli": 7, "august": 8, "september": 9, "oktober": 10, "november": 11, "dezember": 12,
 }
+
 
 def _parse_month_year_from_filename(p: Path) -> Tuple[Optional[int], Optional[int]]:
     s = p.stem.lower()
@@ -1339,17 +1461,13 @@ def _parse_month_year_from_filename(p: Path) -> Tuple[Optional[int], Optional[in
     mm = re.search(r"\b(januar|februar|märz|maerz|april|mai|juni|juli|august|september|oktober|november|dezember)\b", s)
     if mm:
         m = GER_MONTHS.get(mm.group(1))
-
-    # optional: auch "02 februar" o.ä. enthalten -> reicht meist mit Monatswort
     return y, m
 
+
 def _read_project_from_sheet(ws) -> str:
-    # 1) Template-style
     c12 = _safe_str(ws["C12"].value).strip()
     if c12:
         return c12
-
-    # 2) Alt/Export-style: "Firma:" rechts daneben (z.B. A6/B6)
     for r in range(1, 50):
         for c in range(1, 12):
             v = ws.cell(r, c).value
@@ -1358,6 +1476,7 @@ def _read_project_from_sheet(ws) -> str:
                 if right:
                     return right
     return ""
+
 
 def _find_header(ws, max_rows: int = 80, max_cols: int = 30) -> Tuple[Optional[int], Dict[str, int]]:
     required = {"datum", "beginn", "ende", "art"}
@@ -1371,25 +1490,23 @@ def _find_header(ws, max_rows: int = 80, max_cols: int = 30) -> Tuple[Optional[i
             return r, mapping
     return None, {}
 
+
 def _read_einsatzbericht_xlsx(path: Path) -> Tuple[Dict[str, Any], pd.DataFrame]:
     wb = openpyxl.load_workbook(path, data_only=True)
-
-    # Sheet fallback
     ws = None
     for sheet_name in ["Einsatzbericht", "Tabelle1"]:
         if sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             break
     if ws is None:
-        # notfalls erstes Sheet
         ws = wb[wb.sheetnames[0]]
 
     header_row, col = _find_header(ws)
     if header_row is None:
         meta = {"project": "", "year": None, "month": None, "source_path": str(path)}
-        return meta, pd.DataFrame(columns=["Datum","Beginn","Ende","Pause_Min","Zeit_h","Art","Kodierung_EB","Leistungsbeschreibung"])
+        return meta, pd.DataFrame(
+            columns=["Datum", "Beginn", "Ende", "Pause_Min", "Zeit_h", "Art", "Kodierung_EB", "Leistungsbeschreibung"])
 
-    # Meta robust
     project = _read_project_from_sheet(ws)
 
     year = ws["K2"].value
@@ -1409,10 +1526,9 @@ def _read_einsatzbericht_xlsx(path: Path) -> Tuple[Dict[str, Any], pd.DataFrame]
     c_zeit = c("zeit  (h)") or c("zeit (h)") or c("zeit")
     c_art = c("art")
     c_text = c("leistungsbeschreibung") or c("beschreibung")
-    c_kod = c("kodierung") or c("kodierung eb")  # optional
+    c_kod = c("kodierung") or c("kodierung eb")
 
     rows = []
-
     empty_streak = 0
     start = header_row + 1
 
@@ -1446,7 +1562,6 @@ def _read_einsatzbericht_xlsx(path: Path) -> Tuple[Dict[str, Any], pd.DataFrame]
             except Exception:
                 zeit_h = None
 
-        # nur rechnen, wenn Beginn+Ende existieren
         if zeit_h is None and beginn is not None and ende is not None:
             zeit_h = _compute_hours_decimal(beginn, ende, pause_min)
 
@@ -1466,8 +1581,6 @@ def _read_einsatzbericht_xlsx(path: Path) -> Tuple[Dict[str, Any], pd.DataFrame]
         })
 
     df_lines = pd.DataFrame(rows)
-
-    # final meta fallback: wenn year/month immer noch fehlen -> aus erstem Datum
     if (year is None or month is None) and not df_lines.empty:
         first_date = df_lines["Datum"].dropna().iloc[0] if df_lines["Datum"].notna().any() else None
         if isinstance(first_date, dt.date):
@@ -1482,6 +1595,7 @@ def _read_einsatzbericht_xlsx(path: Path) -> Tuple[Dict[str, Any], pd.DataFrame]
     }
     return meta, df_lines
 
+
 def _key_for_import(rec: Dict[str, Any]) -> tuple:
     d = _format_date(rec.get("Datum"))
     zv = _format_time(rec.get("Zeit von"))
@@ -1490,8 +1604,6 @@ def _key_for_import(rec: Dict[str, Any]) -> tuple:
     typ = _safe_str(rec.get("Tätigkeit")).strip()
     pause = int(rec.get("Pause_Min") or 0)
 
-    # Wenn keine Zeiten vorhanden sind, nimm Info+Zeit_h in den Key,
-    # sonst kollidiert alles bei ("", "", "", ...)
     if not zv and not zb:
         zeit_h = rec.get("Zeit_h") or rec.get("Zeit (h)") or ""
         return (d, "<NO_TIME>", typ, str(zeit_h), info)
@@ -1517,13 +1629,9 @@ def _existing_keys_for_master(df_master: pd.DataFrame) -> set:
         }
         keys.add(_key_for_import(rec))
     return keys
+
+
 # ------------------------- Streamlit UI -------------------------
-
-# =========================
-# Visualization helpers (updated: chart-type selection + optional Vega JSON editor)
-# =========================
-import json
-
 
 def _to_float_or_none(v: Any) -> Optional[float]:
     try:
@@ -1537,42 +1645,35 @@ def _to_float_or_none(v: Any) -> Optional[float]:
 
 
 def _viz_base_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Prepare a clean base DF for visualization (hours, date parts)."""
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Datum_dt", "Year", "Month", "YM", "YM_dt", "Projekt", "Tätigkeit", "Hours", "Abgerechnet", "km", "Kodierung", "Info"])
+        return pd.DataFrame(
+            columns=["Datum_dt", "Year", "Month", "YM", "YM_dt", "Projekt", "Tätigkeit", "Hours", "Abgerechnet", "km",
+                     "Kodierung", "Info"])
 
     x = df.copy()
-
-    # date
     x["Datum_dt"] = pd.to_datetime(x["Datum"], errors="coerce")
     x = x[x["Datum_dt"].notna()].copy()
 
     x["Year"] = x["Datum_dt"].dt.year.astype(int)
     x["Month"] = x["Datum_dt"].dt.month.astype(int)
 
-    # month key as string + proper timestamp for time axis
     per = x["Datum_dt"].dt.to_period("M")
     x["YM"] = per.astype(str)
-    x["YM_dt"] = per.dt.to_timestamp()  # first day of month
+    x["YM_dt"] = per.dt.to_timestamp()
 
-    # hours
     x["Hours"] = x["Zahl"].apply(_to_float_or_none)
     x["Hours"] = pd.to_numeric(x["Hours"], errors="coerce").fillna(0.0)
 
-    # normalize type/project
     x["Projekt"] = x["Projekt"].astype(str).fillna("").str.strip()
     x["Tätigkeit"] = x["Tätigkeit"].astype(str).fillna("").str.strip().str.upper()
 
-    # normalize abgerechnet
     x["Abgerechnet"] = x["Abgerechnet"].fillna("").astype(str).str.strip().str.lower()
     x["Abgerechnet"] = x["Abgerechnet"].map(
-        lambda s: "ja" if s in {"ja", "yes", "y", "true", "1"} else ("nein" if s in {"nein", "no", "n", "false", "0"} else s)
+        lambda s: "ja" if s in {"ja", "yes", "y", "true", "1"} else (
+            "nein" if s in {"nein", "no", "n", "false", "0"} else s)
     )
-
-    # km
     x["km"] = pd.to_numeric(x.get("km"), errors="coerce").fillna(0).astype(int)
 
-    # optional columns (for tooltips/table)
     if "Kodierung" not in x.columns:
         x["Kodierung"] = ""
     if "Info" not in x.columns:
@@ -1582,20 +1683,17 @@ def _viz_base_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _vega_spec_for_chart(
-    kind: str,
-    x_field: str,
-    y_field: str,
-    color_field: Optional[str] = None,
-    x_type: str = "ordinal",   # "temporal" for dates
-    y_type: str = "quantitative",
-    stacked: bool = False,
-    donut: bool = False,
+        kind: str,
+        x_field: str,
+        y_field: str,
+        color_field: Optional[str] = None,
+        x_type: str = "ordinal",
+        y_type: str = "quantitative",
+        stacked: bool = False,
+        donut: bool = False,
 ) -> Dict[str, Any]:
-    """Create a Vega-Lite spec (works with st.vega_lite_chart)."""
-
     kind = (kind or "").lower().strip()
 
-    # pie / donut
     if kind in {"pie", "donut"}:
         inner = 60 if (kind == "donut" or donut) else 0
         spec = {
@@ -1611,7 +1709,6 @@ def _vega_spec_for_chart(
         }
         return spec
 
-    # base encoding
     enc: Dict[str, Any] = {
         "x": {"field": x_field, "type": x_type},
         "y": {"field": y_field, "type": y_type},
@@ -1621,20 +1718,17 @@ def _vega_spec_for_chart(
         ],
     }
 
-    # color/stacking
     if color_field:
         enc["color"] = {"field": color_field, "type": "nominal"}
         if stacked:
             enc["y"]["stack"] = "zero"
 
-        # richer tooltip
         enc["tooltip"] = [
             {"field": x_field, "type": x_type if x_type != "temporal" else "temporal"},
             {"field": color_field, "type": "nominal"},
             {"field": y_field, "type": "quantitative", "format": ".2f"},
         ]
 
-    # mark mapping
     mark_type = "bar"
     if kind in {"bar", "stacked bar"}:
         mark_type = "bar"
@@ -1642,10 +1736,7 @@ def _vega_spec_for_chart(
         mark_type = "line"
     elif kind in {"area", "stacked area"}:
         mark_type = "area"
-    else:
-        mark_type = "bar"
 
-    # make lines look decent without forcing colors
     mark: Dict[str, Any] = {"type": mark_type}
     if mark_type == "line":
         mark["point"] = True
@@ -1655,27 +1746,25 @@ def _vega_spec_for_chart(
 
 
 def _render_chart_block(
-    *,
-    title: str,
-    df: pd.DataFrame,
-    key_prefix: str,
-    default_kind: str,
-    allowed_kinds: List[str],
-    x_field: str,
-    y_field: str,
-    color_field: Optional[str] = None,
-    x_type: str = "ordinal",
-    stacked_default: bool = False,
-    pie_ok: bool = True,
+        *,
+        title: str,
+        df: pd.DataFrame,
+        key_prefix: str,
+        default_kind: str,
+        allowed_kinds: List[str],
+        x_field: str,
+        y_field: str,
+        color_field: Optional[str] = None,
+        x_type: str = "ordinal",
+        stacked_default: bool = False,
+        pie_ok: bool = True,
 ) -> None:
-    """Reusable UI block: choose chart type + optional custom Vega JSON editor."""
     st.markdown(f"### {title}")
 
     if df is None or df.empty:
         st.caption("Keine Daten.")
         return
 
-    # chart type choice (persisted)
     kind_key = f"{key_prefix}_kind"
     if kind_key not in st.session_state:
         st.session_state[kind_key] = default_kind
@@ -1694,12 +1783,9 @@ def _render_chart_block(
             stacked = True
         elif color_field and kind.lower() in {"bar", "area"}:
             stacked = st.checkbox("stacked", value=stacked_default, key=f"{key_prefix}_stacked")
-        else:
-            stacked = False
     with c3:
         show_custom = st.checkbox("Custom Vega-Lite JSON", value=False, key=f"{key_prefix}_custom_toggle")
 
-    # build default spec
     is_pie = kind.lower() in {"pie", "donut"}
     if is_pie and not pie_ok:
         st.info("Pie/Donut macht für diese Ansicht keinen Sinn. Wähle Bar/Line/Area.")
@@ -1707,7 +1793,7 @@ def _render_chart_block(
 
     default_spec = _vega_spec_for_chart(
         kind=kind,
-        x_field=x_field if not is_pie else (color_field or x_field),  # for pie: category = x_field (or color_field)
+        x_field=x_field if not is_pie else (color_field or x_field),
         y_field=y_field,
         color_field=(color_field if not is_pie else None),
         x_type=x_type if not is_pie else "nominal",
@@ -1716,18 +1802,16 @@ def _render_chart_block(
     )
 
     spec_key = f"{key_prefix}_custom_spec"
-    # store default if not present
     if spec_key not in st.session_state:
         st.session_state[spec_key] = json.dumps(default_spec, ensure_ascii=False, indent=2)
 
-    # if custom mode: show editor and use edited spec
     if show_custom:
         raw = st.text_area(
             "Vega-Lite Spec (JSON)",
             value=st.session_state[spec_key],
             height=260,
             key=f"{key_prefix}_spec_editor",
-            help="Hier kannst du die Vega-Lite JSON Spezifikation anpassen. Änderungen bleiben in dieser Session erhalten.",
+            help="Hier kannst du die Vega-Lite JSON Spezifikation anpassen.",
         )
         try:
             spec = json.loads(raw)
@@ -1736,11 +1820,9 @@ def _render_chart_block(
             st.error(f"Ungültiges JSON: {e}")
             spec = default_spec
     else:
-        # keep editor in sync with current default kind
         st.session_state[spec_key] = json.dumps(default_spec, ensure_ascii=False, indent=2)
         spec = default_spec
 
-    # render
     st.vega_lite_chart(
         data=df,
         spec=spec,
@@ -1748,7 +1830,8 @@ def _render_chart_block(
     )
 
 
-def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_path: Path, milestones_df: pd.DataFrame) -> None:
+def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_path: Path,
+                               milestones_df: pd.DataFrame) -> None:
     st.subheader("Visualisierung / Controlling")
 
     base = _viz_base_df(df)
@@ -1756,7 +1839,6 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
         st.info("Keine Daten vorhanden.")
         return
 
-    # --- Filters ---
     all_projects = sorted([p for p in base["Projekt"].unique().tolist() if p and p != "nan"])
     all_years = sorted(base["Year"].unique().tolist())
     min_y = min(all_years) if all_years else dt.date.today().year
@@ -1791,9 +1873,6 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
         st.warning("Keine Daten für diese Auswahl.")
         return
 
-    # =========================
-    # Milestones / Timeline (pro Projekt)
-    # =========================
     st.markdown("---")
     st.subheader("Zeitschiene / Meilensteine")
 
@@ -1812,28 +1891,24 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
         if ms_proj.empty:
             ms_proj = pd.DataFrame(columns=MILESTONE_COLS + ["_excel_row"])
 
-        # --- KPI: wo stehen wir ---
         ms_kpi = ms_proj.copy()
         ms_kpi["Datum_dt"] = pd.to_datetime(ms_kpi["Datum"], errors="coerce")
         ms_kpi["Status"] = ms_kpi["Status"].apply(_normalize_milestone_status)
-        ms_kpi["Fortschritt"] = ms_kpi["Fortschritt"].apply(lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0))))
+        ms_kpi["Fortschritt"] = ms_kpi["Fortschritt"].apply(
+            lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0))))
 
         overdue = 0
         done = 0
         next_ms_name = "-"
         next_ms_date = None
         if not ms_kpi.empty and ms_kpi["Datum_dt"].notna().any():
-            # done
             done = int((ms_kpi["Status"] == "erledigt").sum())
-            # overdue = datum < heute und nicht erledigt
             overdue = int(((ms_kpi["Datum_dt"].dt.date < today) & (ms_kpi["Status"] != "erledigt")).sum())
-            # next milestone = min datum >= heute
             upcoming = ms_kpi[ms_kpi["Datum_dt"].dt.date >= today].sort_values("Datum_dt")
             if not upcoming.empty:
                 next_ms_name = _safe_str(upcoming.iloc[0].get("Meilenstein"))
                 next_ms_date = upcoming.iloc[0]["Datum_dt"].date()
 
-        # Gesamtfortschritt (simple): Mittelwert Fortschritt, fallback done/total
         overall = 0.0
         if not ms_kpi.empty:
             if ms_kpi["Fortschritt"].notna().any():
@@ -1855,11 +1930,9 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
         if overall > 0:
             st.progress(min(max(overall / 100.0, 0.0), 1.0))
 
-        # --- Editor (Excel-persistiert) ---
         st.markdown("### Meilensteine pflegen")
-        st.caption("Die Tabelle wird im Excel-Sheet **'Meilensteine'** gespeichert (falls nicht vorhanden, wird es beim Speichern angelegt).")
+        st.caption("Die Tabelle wird im Excel-Sheet **'Meilensteine'** gespeichert.")
 
-        # Editor DF (proj-scope)
         editor_cols = ["_excel_row", "Datum", "Meilenstein", "Status", "Fortschritt", "Kommentar", "Löschen"]
         ed = ms_proj.copy()
 
@@ -1886,21 +1959,23 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
                 "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
                 "Meilenstein": st.column_config.TextColumn("Meilenstein", width="large"),
                 "Status": st.column_config.SelectboxColumn("Status", options=MILESTONE_STATUSES),
-                "Fortschritt": st.column_config.NumberColumn("Fortschritt (%)", min_value=0.0, max_value=100.0, step=5.0),
+                "Fortschritt": st.column_config.NumberColumn("Fortschritt (%)", min_value=0.0, max_value=100.0,
+                                                             step=5.0),
                 "Kommentar": st.column_config.TextColumn("Kommentar", width="large"),
                 "Löschen": st.column_config.CheckboxColumn("Löschen"),
             },
         )
 
         if st.button("Meilensteine speichern", key=f"save_milestones_{proj}"):
-            # Altbestand mappen
             orig_by_row: Dict[int, Dict[str, Any]] = {}
+            original_excel_rows = set()
             for _, r in ed.iterrows():
                 exr = r.get("_excel_row")
                 if exr is None or (isinstance(exr, float) and pd.isna(exr)):
                     continue
                 try:
-                    orig_by_row[int(exr)] = {
+                    row_idx = int(exr)
+                    orig_by_row[row_idx] = {
                         "Projekt": proj,
                         "Datum": _to_date(r.get("Datum")),
                         "Meilenstein": _safe_str(r.get("Meilenstein")),
@@ -1908,15 +1983,18 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
                         "Fortschritt": float(_to_float_or_none(r.get("Fortschritt")) or 0.0),
                         "Kommentar": _safe_str(r.get("Kommentar")),
                     }
+                    original_excel_rows.add(row_idx)
                 except Exception:
                     pass
 
             updates: List[Tuple[int, Dict[str, Any]]] = []
             inserts: List[Dict[str, Any]] = []
             deletes: List[int] = []
+            kept_excel_rows = set()
 
             def _is_blank_ms_row(rr: pd.Series) -> bool:
-                return _is_blank(rr.get("Datum")) and _is_blank(rr.get("Meilenstein")) and _is_blank(rr.get("Kommentar"))
+                return _is_blank(rr.get("Datum")) and _is_blank(rr.get("Meilenstein")) and _is_blank(
+                    rr.get("Kommentar"))
 
             for _, r in edited_ms.iterrows():
                 exr = r.get("_excel_row")
@@ -1934,12 +2012,13 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
                         "Fortschritt": float(_to_float_or_none(r.get("Fortschritt")) or 0.0),
                         "Kommentar": _safe_str(r.get("Kommentar")).strip(),
                     }
-                    # minimal
                     if rec["Meilenstein"]:
                         inserts.append(rec)
                     continue
 
                 row_excel = int(exr)
+                kept_excel_rows.add(row_excel)
+
                 if mark_delete:
                     deletes.append(row_excel)
                     continue
@@ -1956,9 +2035,12 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
                 if old_rec is None or new_rec != old_rec:
                     updates.append((row_excel, new_rec))
 
+            for r_id in original_excel_rows:
+                if r_id not in kept_excel_rows and r_id not in deletes:
+                    deletes.append(r_id)
+
             def _mutator_ms(wb):
                 ws = _ensure_milestones_sheet(wb)
-
                 for r in deletes:
                     _clear_milestone_row(ws, r)
                 for r, rec in updates:
@@ -1970,15 +2052,13 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
 
             ok, msg = _save_workbook(Path(xlsx_path), _mutator_ms)
             if ok:
-                st.success(f"Meilensteine gespeichert. Updates: {len(updates)}, Neu: {len(inserts)}, Gelöscht: {len(deletes)}. {msg}")
+                st.success(
+                    f"Meilensteine gespeichert. Updates: {len(updates)}, Neu: {len(inserts)}, Gelöscht: {len(deletes)}. {msg}")
                 st.cache_data.clear()
                 st.rerun()
             else:
                 st.error(msg)
 
-        # --- Timeline Chart ---
-
-        # Daten fürs Chart
         plot = ms_kpi.copy()
         if plot.empty:
             st.info("Noch keine Meilensteine für dieses Projekt gepflegt.")
@@ -1989,75 +2069,56 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
             else:
                 plot["Meilenstein"] = plot["Meilenstein"].fillna("").astype(str)
                 plot["Status"] = plot["Status"].apply(_normalize_milestone_status)
-                plot["Fortschritt"] = plot["Fortschritt"].apply(lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0))))
+                plot["Fortschritt"] = plot["Fortschritt"].apply(
+                    lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0)))
+                )
 
-                # --- Timeline Chart ---
                 st.markdown("### Zeitschiene")
+                today_str = dt.date.today().strftime("%Y-%m-%d")
 
-                plot = ms_kpi.copy()
-                if plot.empty:
-                    st.info("Noch keine Meilensteine für dieses Projekt gepflegt.")
-                else:
-                    plot = plot[plot["Datum_dt"].notna()].copy()
-                    if plot.empty:
-                        st.info("Meilensteine vorhanden, aber ohne gültiges Datum.")
-                    else:
-                        plot["Meilenstein"] = plot["Meilenstein"].fillna("").astype(str)
-                        plot["Status"] = plot["Status"].apply(_normalize_milestone_status)
-                        plot["Fortschritt"] = plot["Fortschritt"].apply(
-                            lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0)))
-                        )
+                timeline_spec = {
+                    "layer": [
+                        {
+                            "mark": {"type": "rule", "strokeDash": [6, 6]},
+                            "encoding": {
+                                "x": {"datum": today_str, "type": "temporal"},
+                                "tooltip": [{"datum": today_str, "type": "temporal", "title": "Heute"}],
+                            },
+                        },
+                        {
+                            "mark": {"type": "point", "filled": True, "size": 80},
+                            "encoding": {
+                                "x": {"field": "Datum_dt", "type": "temporal"},
+                                "y": {"field": "Meilenstein", "type": "nominal", "sort": None},
+                                "color": {"field": "Status", "type": "nominal"},
+                                "tooltip": [
+                                    {"field": "Meilenstein", "type": "nominal"},
+                                    {"field": "Datum_dt", "type": "temporal", "title": "Datum"},
+                                    {"field": "Status", "type": "nominal"},
+                                    {"field": "Fortschritt", "type": "quantitative", "format": ".0f"},
+                                    {"field": "Kommentar", "type": "nominal"},
+                                ],
+                            },
+                        },
+                        {
+                            "mark": {"type": "text", "align": "left", "dx": 7, "dy": -7},
+                            "encoding": {
+                                "x": {"field": "Datum_dt", "type": "temporal"},
+                                "y": {"field": "Meilenstein", "type": "nominal", "sort": None},
+                                "text": {"field": "Fortschritt", "type": "quantitative", "format": ".0f"},
+                            },
+                        },
+                    ],
+                }
 
-                        # IMPORTANT: spec muss JSON-serializable sein -> heute als STRING (kein datetime!)
-                        today_str = dt.date.today().strftime("%Y-%m-%d")
+                st.vega_lite_chart(
+                    data=plot,
+                    spec=timeline_spec,
+                    use_container_width=True,
+                )
 
-                        timeline_spec = {
-                            "layer": [
-                                # "Heute" Linie (konstanter Wert via datum)
-                                {
-                                    "mark": {"type": "rule", "strokeDash": [6, 6]},
-                                    "encoding": {
-                                        "x": {"datum": today_str, "type": "temporal"},
-                                        "tooltip": [{"datum": today_str, "type": "temporal", "title": "Heute"}],
-                                    },
-                                },
-                                # Meilenstein-Punkte
-                                {
-                                    "mark": {"type": "point", "filled": True, "size": 80},
-                                    "encoding": {
-                                        "x": {"field": "Datum_dt", "type": "temporal"},
-                                        "y": {"field": "Meilenstein", "type": "nominal", "sort": None},
-                                        "color": {"field": "Status", "type": "nominal"},
-                                        "tooltip": [
-                                            {"field": "Meilenstein", "type": "nominal"},
-                                            {"field": "Datum_dt", "type": "temporal", "title": "Datum"},
-                                            {"field": "Status", "type": "nominal"},
-                                            {"field": "Fortschritt", "type": "quantitative", "format": ".0f"},
-                                            {"field": "Kommentar", "type": "nominal"},
-                                        ],
-                                    },
-                                },
-                                # Fortschritt als Text-Label
-                                {
-                                    "mark": {"type": "text", "align": "left", "dx": 7, "dy": -7},
-                                    "encoding": {
-                                        "x": {"field": "Datum_dt", "type": "temporal"},
-                                        "y": {"field": "Meilenstein", "type": "nominal", "sort": None},
-                                        "text": {"field": "Fortschritt", "type": "quantitative", "format": ".0f"},
-                                    },
-                                },
-                            ],
-                        }
-
-                        st.vega_lite_chart(
-                            data=plot,
-                            spec=timeline_spec,
-                            use_container_width=True,
-                        )
-
-    # --- Budget & Rates (session-state, pro Projekt) ---
-    budgets = st.session_state.setdefault("viz_budget_eur_by_project", {})   # {project: float}
-    rates = st.session_state.setdefault("viz_rates_by_project", {})          # {project: {F,R,K,I,default}}
+    budgets = st.session_state.setdefault("viz_budget_eur_by_project", {})
+    rates = st.session_state.setdefault("viz_rates_by_project", {})
 
     st.markdown("### Budget / Stundensätze (optional)")
     st.caption("Wenn du Budgets/Stundensätze pflegst, bekommst du Budgetverbrauch & Kostenabschätzung.")
@@ -2078,9 +2139,11 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
 
         cc1, cc2, cc3, cc4, cc5 = st.columns([1, 1, 1, 1, 1])
         with cc1:
-            b = st.number_input("Budget (€)", min_value=0.0, value=float(budgets.get(p, 0.0) or 0.0), step=100.0, key=f"viz_budget_{p}")
+            b = st.number_input("Budget (€)", min_value=0.0, value=float(budgets.get(p, 0.0) or 0.0), step=100.0,
+                                key=f"viz_budget_{p}")
         with cc2:
-            r_def = st.number_input("Rate Default (€/h)", min_value=0.0, value=float(rm["default"]), step=1.0, key=f"viz_rate_def_{p}")
+            r_def = st.number_input("Rate Default (€/h)", min_value=0.0, value=float(rm["default"]), step=1.0,
+                                    key=f"viz_rate_def_{p}")
         with cc3:
             r_f = st.number_input("Rate F (€/h)", min_value=0.0, value=float(rm["F"]), step=1.0, key=f"viz_rate_F_{p}")
         with cc4:
@@ -2093,7 +2156,6 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
     else:
         st.info("Für Budgetverbrauch wähle genau **ein** Projekt aus (dann kannst du Budget & Stundensätze pflegen).")
 
-    # --- KPI aggregation ---
     hours_by_type = x.groupby("Tätigkeit")["Hours"].sum().to_dict()
     total_hours = float(sum(hours_by_type.values()) or 0.0)
     total_km = int(x["km"].sum())
@@ -2105,7 +2167,6 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
     m4.metric("K", f"{float(hours_by_type.get('K', 0.0)):.2f} h")
     m5.metric("km", f"{total_km}")
 
-    # --- Cost/Budget calculation (single project only) ---
     if len(sel_projects) == 1:
         p = sel_projects[0]
         rm = _get_rate_map(p)
@@ -2131,23 +2192,16 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
         if budget > 0:
             used_pct = min(max(cost / budget, 0.0), 1.0)
             st.progress(used_pct)
-            st.caption(f"Budgetverbrauch: {used_pct*100:.1f}%")
+            st.caption(f"Budgetverbrauch: {used_pct * 100:.1f}%")
 
-    # --- Chart data prep ---
-    # 1) Monthly by type (long)
     monthly_long = (
         x.groupby(["YM_dt", "YM", "Tätigkeit"], as_index=False)["Hours"]
         .sum()
         .sort_values(["YM_dt", "Tätigkeit"])
     )
-
-    # 2) Hours by project
     proj_df = x.groupby("Projekt", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
-
-    # 3) Hours by type
     type_df = x.groupby("Tätigkeit", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
 
-    # --- Charts with type selection ---
     _render_chart_block(
         title="Stundenverlauf (Monate)",
         df=monthly_long,
@@ -2217,6 +2271,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
         show_cols = [c for c in show_cols if c in x.columns]
         st.dataframe(x[show_cols].sort_values("Datum_dt", ascending=False), use_container_width=True, height=420)
 
+
 def main() -> None:
     if st is None:
         raise RuntimeError("Streamlit ist nicht installiert. Bitte `pip install streamlit` ausführen.")
@@ -2224,8 +2279,6 @@ def main() -> None:
     st.title(APP_TITLE)
     st.caption("Lokale Webapp für Tätigkeiten-Erfassung und Einsatzbericht-Auswertung (Excel-basiert, MVP)")
 
-    # Robust default path handling: if a remembered path no longer exists (e.g. moved folder),
-    # fall back to auto-discovery instead of showing a broken default forever.
     remembered_path = _safe_str(st.session_state.get("excel_path", "")).strip()
     default_path = ""
     if remembered_path:
@@ -2251,9 +2304,7 @@ def main() -> None:
         st.session_state["excel_path_input"] = pending_import_path
         st.session_state["excel_path"] = pending_import_path
         st.session_state["_pending_import_excel_path"] = ""
-    # Keep the visible sidebar widget in sync with the remembered path.
     if _safe_str(st.session_state.get("excel_path_input", "")).strip():
-        # If the visible widget points to a non-existent path, reset it too.
         try:
             _tmp_vis = _resolve_excel_path(_safe_str(st.session_state.get("excel_path_input", "")).strip())
             if not _tmp_vis.exists():
@@ -2278,7 +2329,7 @@ def main() -> None:
                 try:
                     imported_path = _store_uploaded_excel(uploaded_excel)
                     st.session_state["_pending_import_excel_path"] = str(imported_path)
-                    st.session_state["excel_path"] = str(imported_path)  # optional
+                    st.session_state["excel_path"] = str(imported_path)
                     st.cache_data.clear()
                     st.rerun()
                 except Exception as e:
@@ -2286,15 +2337,21 @@ def main() -> None:
         st.session_state["excel_path"] = excel_path
         reload_clicked = st.button("Neu laden")
         st.info(
-            "Hinweis: Relative Pfade sind erlaubt (z. B. `Tätigkeiten_Überblick.xlsx` oder `data/Tätigkeiten_Überblick.xlsx`).\n\n"
-            "Beim Speichern wird eine Backup-Datei erstellt. openpyxl kann eingebettete WMF-Bilder nicht vollständig erhalten; arbeite deshalb am besten auf einer Kopie der Datei."
+            "Hinweis: Relative Pfade sind erlaubt.\n\n"
+            "Unter Windows nutzt die App Microsoft Excel (via pywin32) für den originalgetreuen Druck/PDF-Export. "
+            "Unter macOS wird stattdessen 'openpyxl' in Kombination mit AppleScript verwendet, um Microsoft Excel fernzusteuern."
         )
 
     if reload_clicked:
         st.cache_data.clear()
 
     try:
-        data = load_workbook_data(excel_path)
+        resolved_path = _resolve_excel_path(excel_path)
+        if resolved_path.exists():
+            mtime = resolved_path.stat().st_mtime
+            data = _cached_load_workbook_data(str(resolved_path), mtime)
+        else:
+            data = load_workbook_data(excel_path)  # triggers FileNotFoundError cleanly
     except Exception as e:
         st.error(f"Datei konnte nicht geladen werden: {e}")
         st.stop()
@@ -2308,20 +2365,25 @@ def main() -> None:
         st.subheader("Tätigkeiten erfassen und bearbeiten")
 
         y_default, m_default = _project_defaults(df)
-        projekte_available = sorted(list(dict.fromkeys([p for p in (lookups.get("projekte") or []) if p] + [p for p in df.get("Projekt", pd.Series(dtype=str)).dropna().astype(str).tolist() if p])))
+        projekte_available = sorted(list(dict.fromkeys([p for p in (lookups.get("projekte") or []) if p] + [p for p in
+                                                                                                            df.get(
+                                                                                                                "Projekt",
+                                                                                                                pd.Series(
+                                                                                                                    dtype=str)).dropna().astype(
+                                                                                                                str).tolist()
+                                                                                                            if p])))
         filt_cols = st.columns([1, 1, 2, 1])
         with filt_cols[0]:
             f_year = st.number_input("Jahr-Filter", min_value=2000, max_value=2100, value=int(y_default), step=1)
         with filt_cols[1]:
-            f_month = st.selectbox("Monat-Filter", options=list(range(1, 13)), index=max(0, min(11, int(m_default) - 1)))
+            f_month = st.selectbox("Monat-Filter", options=list(range(1, 13)),
+                                   index=max(0, min(11, int(m_default) - 1)))
         with filt_cols[2]:
             f_project = st.selectbox("Projekt-Filter", options=[""] + projekte_available, index=0)
         with filt_cols[3]:
             f_include_abg = st.checkbox("abgerechnete zeigen", value=True)
 
-        # Optionen für Editor (immer definiert -> IDE meckert nicht)
         projekte_opts = projekte_available if projekte_available else [""]
-
         typen_opts = list(dict.fromkeys(lookups.get("taetigkeit_typen") or ["F", "R", "I", "K"]))
         ja_nein_opts = list(dict.fromkeys(lookups.get("ja_nein") or ["ja", "nein"]))
 
@@ -2332,13 +2394,11 @@ def main() -> None:
         interne_opts = list(dict.fromkeys([""] + (lookups.get("interne_projekte") or [])))
 
         filtered = _filtered_taetigkeiten(df, int(f_year), int(f_month), f_project, include_abgerechnet=f_include_abg)
-        # --- Inline Edit Table (statt nur Anzeige) ---
         st.markdown("### Tätigkeiten (Inline bearbeiten)")
 
         if filtered.empty:
             st.info("Keine Tätigkeiten für den aktuellen Filter gefunden.")
         else:
-            # Spalten, die im Grid editierbar sein sollen
             editor_cols = [
                 "_excel_row",
                 "Datum",
@@ -2358,16 +2418,12 @@ def main() -> None:
 
             editor_df = filtered.copy()
 
-            # Ensure editor columns exist
             for c in editor_cols:
                 if c not in editor_df.columns:
                     editor_df[c] = None
 
-            # Optional: Delete marker column
             editor_df["Löschen"] = False
 
-
-            # Streamlit compatibility (falls du eine ältere Version hast)
             data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
 
             def _calc_dauer_str(zv, zb, pause_min) -> str:
@@ -2382,15 +2438,14 @@ def main() -> None:
                 axis=1
             )
 
-
             edited_df = data_editor_fn(
                 editor_df[editor_cols + ["Löschen"]],
                 key="taetigkeiten_inline_editor",
                 use_container_width=True,
                 height=420,
-                num_rows="dynamic",  # <-- erlaubt neue Zeilen unten im Grid
+                num_rows="dynamic",
                 hide_index=True,
-                disabled=["_excel_row", "Dauer"],  # Excel-Row ist die technische ID
+                disabled=["_excel_row", "Dauer"],
                 column_config={
                     "_excel_row": st.column_config.NumberColumn("Excel-Zeile",
                                                                 help="Technische Zeilen-ID (nicht ändern)"),
@@ -2399,7 +2454,8 @@ def main() -> None:
                     "Zeit von": st.column_config.TimeColumn("Zeit von", format="HH:mm"),
                     "Zeit bis": st.column_config.TimeColumn("Zeit bis", format="HH:mm"),
                     "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5),
-                    "Dauer": st.column_config.TextColumn("Dauer", help="Berechnet aus Zeit von/bis und Pause", width="small"),
+                    "Dauer": st.column_config.TextColumn("Dauer", help="Berechnet aus Zeit von/bis und Pause",
+                                                         width="small"),
                     "km": st.column_config.NumberColumn("km", min_value=0, step=1),
                     "Tätigkeit": st.column_config.SelectboxColumn("Tätigkeit", options=typen_opts),
                     "Kodierung": st.column_config.SelectboxColumn("Kodierung (Aufgabe)", options=kod_opts),
@@ -2446,7 +2502,6 @@ def main() -> None:
                 }
 
             def _is_editor_row_blank(r: pd.Series) -> bool:
-                # Nutze deine KEY_COLS_FOR_EMPTY_CHECK Logik sinngemäß (Datum/Projekt/Zeit/Typ/Info/Flags)
                 return (
                         _is_blank(r.get("Datum")) and
                         _is_blank(r.get("Projekt")) and
@@ -2459,38 +2514,39 @@ def main() -> None:
                 )
 
             if st.button("Tabellenänderungen speichern", key="save_inline_table"):
-                # Original-Signaturen nach Excel-Zeile, um Änderungen zu erkennen
                 orig_by_row = {}
+                original_excel_rows = set()
                 for _, r in editor_df.iterrows():
                     exr = r.get("_excel_row")
                     if exr is None or (isinstance(exr, float) and pd.isna(exr)):
                         continue
                     try:
-                        orig_by_row[int(exr)] = _editor_row_to_record(r)
+                        row_idx = int(exr)
+                        orig_by_row[row_idx] = _editor_row_to_record(r)
+                        original_excel_rows.add(row_idx)
                     except Exception:
                         continue
 
                 updates: List[Tuple[int, Dict[str, Any]]] = []
                 inserts: List[Dict[str, Any]] = []
                 deletes: List[int] = []
+                kept_excel_rows = set()
 
                 for _, r in edited_df.iterrows():
                     exr = r.get("_excel_row")
                     mark_delete = bool(r.get("Löschen", False))
-
-                    # neue Zeile?
                     is_new = (exr is None) or (isinstance(exr, float) and pd.isna(exr))
 
                     if is_new:
                         if _is_editor_row_blank(r):
                             continue
                         rec = _editor_row_to_record(r)
-                        # minimale Validierung: Projekt + Datum sollte da sein
                         if rec.get("Projekt") and rec.get("Datum"):
                             inserts.append(rec)
                         continue
 
                     row_excel = int(exr)
+                    kept_excel_rows.add(row_excel)
 
                     if mark_delete:
                         deletes.append(row_excel)
@@ -2499,22 +2555,19 @@ def main() -> None:
                     new_rec = _editor_row_to_record(r)
                     old_rec = orig_by_row.get(row_excel)
 
-                    # Wenn wir keinen "alt"-Datensatz haben, behandeln wir es als Update
                     if old_rec is None or _key_for_import(new_rec) != _key_for_import(old_rec):
                         updates.append((row_excel, new_rec))
 
+                for r_id in original_excel_rows:
+                    if r_id not in kept_excel_rows and r_id not in deletes:
+                        deletes.append(r_id)
+
                 def _mutator_inline(wb):
                     ws = wb[TAETIGKEITEN_SHEET]
-
-                    # Deletes
                     for r in deletes:
                         _clear_taetigkeit_row(ws, r)
-
-                    # Updates
                     for r, rec in updates:
                         _write_taetigkeit_row(ws, r, rec)
-
-                    # Inserts
                     row_idx = _find_next_write_row(ws)
                     for rec in inserts:
                         _write_taetigkeit_row(ws, row_idx, rec)
@@ -2539,7 +2592,8 @@ def main() -> None:
                 defaults_add = {
                     "Datum": dt.date.today(),
                     "Projekt": f_project or (projekte_available[0] if projekte_available else ""),
-                    "Tätigkeit": "F" if "F" in (lookups.get("taetigkeit_typen") or []) else (lookups.get("taetigkeit_typen") or [""])[0],
+                    "Tätigkeit": "F" if "F" in (lookups.get("taetigkeit_typen") or []) else
+                    (lookups.get("taetigkeit_typen") or [""])[0],
                     "Abgerechnet": "nein" if "nein" in (lookups.get("ja_nein") or []) else "",
                 }
                 rec_add = _render_taetigkeit_form("add", lookups, defaults=defaults_add)
@@ -2549,6 +2603,7 @@ def main() -> None:
                     ws = wb[TAETIGKEITEN_SHEET]
                     row_idx = _find_next_write_row(ws)
                     _write_taetigkeit_row(ws, row_idx, rec_add)
+
                 ok, msg = _save_workbook(data.path, _mutator_add)
                 if ok:
                     st.success(msg)
@@ -2564,7 +2619,8 @@ def main() -> None:
             else:
                 options = filtered.to_dict(orient="records")
                 labels = [_display_row_label(pd.Series(o)) for o in options]
-                idx = st.selectbox("Eintrag auswählen", options=list(range(len(options))), format_func=lambda i: labels[i], key="edit_row_selector")
+                idx = st.selectbox("Eintrag auswählen", options=list(range(len(options))),
+                                   format_func=lambda i: labels[i], key="edit_row_selector")
                 selected = options[int(idx)]
 
                 with st.form("edit_form", clear_on_submit=False):
@@ -2577,6 +2633,7 @@ def main() -> None:
                     def _mutator_edit(wb):
                         ws = wb[TAETIGKEITEN_SHEET]
                         _write_taetigkeit_row(ws, row_excel, rec_edit)
+
                     ok, msg = _save_workbook(data.path, _mutator_edit)
                     if ok:
                         st.success(f"Zeile {row_excel} aktualisiert. {msg}")
@@ -2588,6 +2645,7 @@ def main() -> None:
                     def _mutator_delete(wb):
                         ws = wb[TAETIGKEITEN_SHEET]
                         _clear_taetigkeit_row(ws, row_excel)
+
                     ok, msg = _save_workbook(data.path, _mutator_delete)
                     if ok:
                         st.success(f"Zeile {row_excel} geleert. {msg}")
@@ -2601,10 +2659,12 @@ def main() -> None:
         if not filtered.empty:
             if st.button("Gefilterte Treffer als 'abgerechnet = ja' markieren"):
                 rows_to_mark = [int(r) for r in filtered["_excel_row"].tolist()]
+
                 def _mutator_mark(wb):
                     ws = wb[TAETIGKEITEN_SHEET]
                     for r in rows_to_mark:
                         ws.cell(r, 13).value = "ja"
+
                 ok, msg = _save_workbook(data.path, _mutator_mark)
                 if ok:
                     st.success(f"{len(rows_to_mark)} Einträge markiert. {msg}")
@@ -2614,12 +2674,13 @@ def main() -> None:
                     st.error(msg)
         else:
             st.caption("Keine Treffer für Schnellaktion.")
+
         st.markdown("---")
         st.markdown("### Migration: Einsatzbericht importieren")
 
         with st.expander("Einsatzbericht(e) (Excel-Layout) hochladen und in Tätigkeiten übernehmen"):
             report_files = st.file_uploader(
-                "Einsatzbericht-Excel auswählen (.xlsx) – gerne mehrere Dateien (z. B. _01, _02 ...)",
+                "Einsatzbericht-Excel auswählen (.xlsx)",
                 type=["xlsx"],
                 accept_multiple_files=True,
                 key="upload_reports",
@@ -2629,7 +2690,6 @@ def main() -> None:
                                          key="import_km_default")
             set_eingetragen = st.checkbox("eingetragen automatisch = ja", value=True, key="import_set_eingetragen")
             set_abgerechnet = st.checkbox("abgerechnet automatisch = nein", value=True, key="import_set_abgerechnet")
-            tag_info = st.checkbox("Info markieren mit ''", value=True, key="import_tag_info")
 
             if report_files:
                 rev_kod_map = _build_reverse_kod_map_eb_to_aufgabe(lookups)
@@ -2638,7 +2698,6 @@ def main() -> None:
                 all_records: List[Dict[str, Any]] = []
                 meta_list = []
 
-                # Projekte im Ziel
                 target_projects = sorted(list(dict.fromkeys(
                     [p for p in (lookups.get("projekte") or []) if p] +
                     [p for p in df.get("Projekt", pd.Series(dtype=str)).dropna().astype(str).tolist() if p]
@@ -2646,22 +2705,25 @@ def main() -> None:
 
                 for i, uf in enumerate(report_files, start=1):
                     try:
-                        p = _store_uploaded_report_file(uf)
-                        meta, lines = _read_einsatzbericht_xlsx(p)
+                        file_name = getattr(uf, "name", f"report_{i}.xlsx")
+                        # Caching: wird nur beim ersten Durchlauf geparst/gespeichert
+                        meta, lines = _parse_and_store_uploaded_report(file_name, uf.getvalue())
+
                         st.write("Import-Zeilen erkannt:", len(lines))
-                        st.dataframe(lines.head())
                         meta_list.append(meta)
 
                         detected_project = meta.get("project") or ""
                         st.write(
-                            f"""**Datei {i}:** `{Path(meta['source_path']).name}`
-                        Projekt erkannt: `{detected_project or '-'}`
+                            f"""**Datei {i}:** `{file_name}`
+                        Projekt/Firma (aus Excel): `{detected_project or '-'}`
                         Monat/Jahr: {meta.get('month')}/{meta.get('year')}"""
                         )
 
-                        # pro Datei: Mapping detected -> target
-                        default_target = detected_project if detected_project in target_projects else (
-                            target_projects[0] if target_projects else "")
+                        guessed_proj = _guess_project(meta, file_name, lookups, target_projects)
+                        default_target = guessed_proj if guessed_proj in target_projects else (
+                            target_projects[0] if target_projects else ""
+                        )
+
                         target_project = st.selectbox(
                             f"Ziel-Projekt für Datei {i}",
                             options=target_projects if target_projects else [""],
@@ -2682,12 +2744,15 @@ def main() -> None:
                             kod_eb = _safe_str(row.get("Kodierung_EB")).strip()
                             text = _safe_str(row.get("Leistungsbeschreibung")).strip()
 
-                            # Reverse mapping EB -> Aufgabe (falls möglich)
-                            aufgabe = rev_kod_map.get(kod_eb, "")
+                            aufgabe = rev_kod_map.get(kod_eb.lower(), "")
                             info = text
                             if kod_eb and not aufgabe:
-                                # EB-Code mitführen, falls kein Reverse-Mapping möglich
-                                info = (info + f"  [EB:{kod_eb}]").strip()
+                                all_aufgaben = [a.lower() for a in (lookups.get("kodierung_aufgaben") or [])]
+                                if kod_eb.lower() in all_aufgaben:
+                                    idx = all_aufgaben.index(kod_eb.lower())
+                                    aufgabe = (lookups.get("kodierung_aufgaben") or [])[idx]
+                                else:
+                                    info = (info + f"  [EB:{kod_eb}]").strip()
 
                             rec = {
                                 "Datum": datum,
@@ -2697,16 +2762,13 @@ def main() -> None:
                                 "Pause_Min": pause_min,
                                 "km": int(default_km),
                                 "Tätigkeit": art,
-                                "Kodierung": aufgabe or "",  # Aufgabe (wenn gefunden)
+                                "Kodierung": aufgabe or "",
                                 "Interne Projekte": "",
                                 "Info": info,
                                 "Abgerechnet": "nein" if set_abgerechnet else "",
                                 "eingetragen": "ja" if set_eingetragen else "",
                                 "Zeit_h": row.get("Zeit_h"),
                             }
-
-
-                            # If Info contains "organi" then
 
                             k = _key_for_import(rec)
                             if k in existing_keys:
@@ -2747,20 +2809,28 @@ def main() -> None:
                             st.rerun()
                         else:
                             st.error(msg)
+
     with tab2:
         st.subheader("Einsatzbericht (Web-Ansicht)")
 
         rep_col1, rep_col2, rep_col3, rep_col4 = st.columns([1, 1, 2, 1])
-        rep_projects = sorted(list(dict.fromkeys([p for p in (lookups.get("projekte") or []) if p] + [p for p in df.get("Projekt", pd.Series(dtype=str)).dropna().astype(str).tolist() if p])))
+        rep_projects = sorted(list(dict.fromkeys([p for p in (lookups.get("projekte") or []) if p] + [p for p in
+                                                                                                      df.get("Projekt",
+                                                                                                             pd.Series(
+                                                                                                                 dtype=str)).dropna().astype(
+                                                                                                          str).tolist()
+                                                                                                      if p])))
         y_default, m_default = _project_defaults(df)
         with rep_col1:
-            r_year = st.number_input("Jahr", min_value=2000, max_value=2100, value=int(y_default), step=1, key="rep_year")
+            r_year = st.number_input("Jahr", min_value=2000, max_value=2100, value=int(y_default), step=1,
+                                     key="rep_year")
         with rep_col2:
-            r_month = st.selectbox("Monat", options=list(range(1, 13)), index=max(0, min(11, int(m_default)-1)), key="rep_month")
+            r_month = st.selectbox("Monat", options=list(range(1, 13)), index=max(0, min(11, int(m_default) - 1)),
+                                   key="rep_month")
         with rep_col3:
-            # Prefer ABS if available, otherwise first project
             default_project = "ABS" if "ABS" in rep_projects else (rep_projects[0] if rep_projects else "")
-            r_project = st.selectbox("Projekt", options=rep_projects if rep_projects else [""], index=(rep_projects.index(default_project) if default_project in rep_projects else 0), key="rep_project")
+            r_project = st.selectbox("Projekt", options=rep_projects if rep_projects else [""], index=(
+                rep_projects.index(default_project) if default_project in rep_projects else 0), key="rep_project")
         with rep_col4:
             include_abgerechnet = st.checkbox("abgerechnete einschließen", value=False)
 
@@ -2791,131 +2861,122 @@ def main() -> None:
         m4.metric("Gesamt", f"{sums['gesamt']:.2f} h")
 
         if len(report_df) > REPORT_ROWS_PER_PAGE:
-            st.info(f"Es werden automatisch mehrere Formularseiten erzeugt: {len(report_df)} Positionen = {math.ceil(len(report_df)/REPORT_ROWS_PER_PAGE)} Seiten à {REPORT_ROWS_PER_PAGE} Positionen.")
+            st.info(
+                f"Es werden automatisch mehrere Formularseiten erzeugt: {len(report_df)} Positionen = {math.ceil(len(report_df) / REPORT_ROWS_PER_PAGE)} Seiten à {REPORT_ROWS_PER_PAGE} Positionen.")
 
         st.markdown("### Original-Einsatzbericht (Excel-Layout)")
-        st.caption("Verwendet Microsoft Excel (pywin32) und befüllt das Original-Formular direkt aus der App-Logik (robust, ohne fragile Excel-FILTER-Abhängigkeit). Bei mehr als 19 Positionen werden automatisch mehrere Seiten/PDFs/Excel-Kopien erzeugt.")
+        st.caption(
+            "Unter Windows nutzt die App Microsofts COM-System für den originalgetreuen PDF-Export. "
+            "Unter macOS nutzt sie eine universelle Fallback-Methode in Kombination mit AppleScript."
+        )
+
         export_dir = data.path.parent / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+
         base_export_name = f"Einsatzbericht_{r_project}_{int(r_year)}-{int(r_month):02d}"
         default_pdf_name = f"{base_export_name}.pdf"
         default_xlsx_name = f"{base_export_name}.xlsx"
 
+        # Dynamischer Key: Wenn sich Projekt/Datum ändern, baut sich das Textfeld komplett mit dem neuen Wert auf!
         pdf_rel_or_abs = st.text_input(
             "PDF-Ausgabepfad",
             value=str((export_dir / default_pdf_name)),
-            help="Relativer oder absoluter Pfad. Bei relativem Pfad wird vom aktuellen Startordner ausgegangen.",
-            key="orig_pdf_path",
+            help="Relativer oder absoluter Pfad. (Aktualisiert sich automatisch bei Projekt-/Datumswechsel)",
+            key=f"pdf_path_{r_project}_{r_year}_{r_month}",
         )
 
         xlsx_rel_or_abs = st.text_input(
-            "Excel-Kopie-Ausgabepfad (Original-Layout)",
+            "Excel-Kopie-Ausgabepfad",
             value=str((export_dir / default_xlsx_name)),
-            help="Speichert eine vorbereitete Kopie der Excel mit befülltem Original-Einsatzbericht. Bei mehreren Seiten werden _01, _02, ... angehängt.",
-            key="orig_xlsx_copy_path",
+            help="Speichert eine vorbereitete Kopie der Excel.",
+            key=f"xlsx_path_{r_project}_{r_year}_{r_month}",
         )
 
         b1, b2, b3, b4 = st.columns(4)
 
         with b1:
             if st.button("Original in Excel öffnen", key="open_original_excel"):
-                ok, msg = _excel_original_report_action(
-                    data.path,
-                    int(r_year),
-                    int(r_month),
-                    r_project,
-                    action="open",
-                    report_df=report_df,
+                ok, msg, _ = _excel_original_report_action(
+                    data.path, int(r_year), int(r_month), r_project, action="open", report_df=report_df
                 )
                 (st.success if ok else st.error)(msg)
 
         with b2:
-            if st.button("Original als PDF (Excel)", key="export_original_pdf"):
+            if st.button("Als PDF generieren", key="export_original_pdf"):
                 pdf_target = Path(pdf_rel_or_abs).expanduser()
                 if not pdf_target.is_absolute():
                     pdf_target = (Path.cwd() / pdf_target).resolve()
-                ok, msg = _excel_original_report_action(
-                    data.path,
-                    int(r_year),
-                    int(r_month),
-                    r_project,
-                    action="pdf",
-                    pdf_output_path=pdf_target,
-                    report_df=report_df,
+
+                ok, msg, exported_files = _excel_original_report_action(
+                    data.path, int(r_year), int(r_month), r_project, action="pdf", pdf_output_path=pdf_target,
+                    report_df=report_df
                 )
                 if ok:
                     st.success(msg)
-                    try:
-                        page_count = max(1, math.ceil(len(report_df) / REPORT_ROWS_PER_PAGE)) if report_df is not None else 1
-                        if page_count == 1 and pdf_target.exists():
-                            st.download_button(
-                                "Exportierte PDF herunterladen",
-                                data=Path(pdf_target).read_bytes(),
-                                file_name=pdf_target.name,
-                                mime="application/pdf",
-                                key="download_exported_pdf",
-                            )
-                        elif page_count > 1:
-                            st.caption("Mehrere PDFs wurden erzeugt und im Exportordner durchnummeriert abgelegt (z. B. _01, _02, ...).")
-                    except Exception:
-                        pass
+                    st.session_state["pdf_files_ready"] = exported_files
                 else:
                     st.error(msg)
 
+            # Download-Button außerhalb der if-Abfrage rendern
+            if st.session_state.get("pdf_files_ready"):
+                for p in st.session_state["pdf_files_ready"]:
+                    if Path(p).exists():
+                        st.download_button(
+                            label=f"PDF Downloaden: {Path(p).name}",
+                            data=Path(p).read_bytes(),
+                            file_name=Path(p).name,
+                            mime="application/pdf",
+                            key=f"dl_pdf_btn_{Path(p).name}"
+                        )
+
         with b3:
-            if st.button("Original als Excel-Kopie", key="export_original_xlsx_copy"):
+            if st.button("Als Excel-Kopie generieren", key="export_original_xlsx_copy"):
                 xlsx_target = Path(xlsx_rel_or_abs).expanduser()
                 if not xlsx_target.is_absolute():
                     xlsx_target = (Path.cwd() / xlsx_target).resolve()
-                ok, msg = _excel_original_report_action(
-                    data.path,
-                    int(r_year),
-                    int(r_month),
-                    r_project,
-                    action="xlsx",
-                    xlsx_output_path=xlsx_target,
-                    report_df=report_df,
+
+                ok, msg, exported_files = _excel_original_report_action(
+                    data.path, int(r_year), int(r_month), r_project, action="xlsx", xlsx_output_path=xlsx_target,
+                    report_df=report_df
                 )
                 if ok:
                     st.success(msg)
-                    try:
-                        page_count = max(1, math.ceil(len(report_df) / REPORT_ROWS_PER_PAGE)) if report_df is not None else 1
-                        if page_count == 1 and xlsx_target.exists():
-                            st.download_button(
-                                "Exportierte Excel-Kopie herunterladen",
-                                data=Path(xlsx_target).read_bytes(),
-                                file_name=xlsx_target.name,
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key="download_exported_original_xlsx_copy",
-                            )
-                        elif page_count > 1:
-                            st.caption("Mehrere Excel-Kopien wurden erzeugt und im Exportordner durchnummeriert abgelegt (z. B. _01, _02, ...).")
-                    except Exception:
-                        pass
+                    st.session_state["xlsx_files_ready"] = exported_files
                 else:
                     st.error(msg)
 
+            # Download-Button außerhalb der if-Abfrage rendern
+            if st.session_state.get("xlsx_files_ready"):
+                for p in st.session_state["xlsx_files_ready"]:
+                    if Path(p).exists():
+                        st.download_button(
+                            label=f"Excel Downloaden: {Path(p).name}",
+                            data=Path(p).read_bytes(),
+                            file_name=Path(p).name,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key=f"dl_xlsx_btn_{Path(p).name}"
+                        )
+
         with b4:
-            if st.button("Original direkt drucken (Excel)", key="print_original_excel"):
-                ok, msg = _excel_original_report_action(
-                    data.path,
-                    int(r_year),
-                    int(r_month),
-                    r_project,
-                    action="print",
-                    report_df=report_df,
+            if st.button("Original direkt drucken", key="print_original_excel"):
+                ok, msg, _ = _excel_original_report_action(
+                    data.path, int(r_year), int(r_month), r_project, action="print", report_df=report_df
                 )
                 (st.success if ok else st.error)(msg)
+
         if report_df.empty:
             st.warning("Keine Einträge für diesen Einsatzbericht gefunden.")
-            st.caption("Tipp: 'abgerechnete einschließen' aktivieren, falls die Beispiel-Datei nur bereits markierte Einträge enthält.")
+            st.caption(
+                "Tipp: 'abgerechnete einschließen' aktivieren, falls die Beispiel-Datei nur bereits markierte Einträge enthält.")
         else:
             st.dataframe(report_df.drop(columns=["_excel_row"]), use_container_width=True, height=360)
             csv_bytes = report_df.drop(columns=["_excel_row"]).to_csv(index=False).encode("utf-8-sig")
             st.download_button(
-                "CSV exportieren",
+                "Tabelle als CSV exportieren",
                 data=csv_bytes,
                 file_name=f"Einsatzbericht_{r_project}_{r_year}-{int(r_month):02d}.csv",
                 mime="text/csv",
+                key="dl_csv_export"
             )
             with st.expander("Treffer als abgerechnet markieren"):
                 st.caption("Schreibt 'ja' in Spalte 'Abgerechnet' für die aktuell im Report enthaltenen Tätigkeiten.")
@@ -2934,6 +2995,7 @@ def main() -> None:
                         st.rerun()
                     else:
                         st.error(msg)
+
     with tab3:
         st.subheader("Stammdaten / Debug")
         st.write(f"**Datei:** `{data.path}`")
@@ -2945,7 +3007,8 @@ def main() -> None:
         c2.write("**Tätigkeitstypen**")
         c2.dataframe(pd.DataFrame({"Typ": lookups.get("taetigkeit_typen", [])}), use_container_width=True, height=200)
         c3.write("**Relevante Kodierungen (aktiv)**")
-        c3.dataframe(pd.DataFrame({"Kodierung": lookups.get("relevante_kodierungen", [])}), use_container_width=True, height=200)
+        c3.dataframe(pd.DataFrame({"Kodierung": lookups.get("relevante_kodierungen", [])}), use_container_width=True,
+                     height=200)
 
         st.markdown("---")
         st.markdown("### Relevante Kodierungen pflegen")
@@ -2964,6 +3027,7 @@ def main() -> None:
                     ok_inner, msg_inner = _set_relevante_kodierungen(wb, selected_relevante)
                     if not ok_inner:
                         raise ValueError(msg_inner)
+
                 ok, msg = _save_workbook(data.path, _mutator_relevante)
                 if ok:
                     st.success(msg)
@@ -3006,11 +3070,13 @@ def main() -> None:
                 p_name = st.text_input("Projekt (Kürzel/Name)", value=_safe_str(proj_defaults.get("Projekt")))
                 p_kunde = st.text_input("Kunde", value=_safe_str(proj_defaults.get("Kunde")))
                 p_ansp = st.text_input("Ansprechpartner", value=_safe_str(proj_defaults.get("Ansprechpartner")))
-                p_addr_std = st.text_input("Projektadresse Standard", value=_safe_str(proj_defaults.get("Projektadresse Standard")))
+                p_addr_std = st.text_input("Projektadresse Standard",
+                                           value=_safe_str(proj_defaults.get("Projektadresse Standard")))
             with pc2:
                 p_str = st.text_input("Straße", value=_safe_str(proj_defaults.get("Straße")))
                 p_ort = st.text_input("Ort", value=_safe_str(proj_defaults.get("Ort")))
-                p_addr_alt = st.text_input("Projektadresse Alternativ", value=_safe_str(proj_defaults.get("Projektadresse Alternativ")))
+                p_addr_alt = st.text_input("Projektadresse Alternativ",
+                                           value=_safe_str(proj_defaults.get("Projektadresse Alternativ")))
                 rename_taet = st.checkbox(
                     "Bei Projekt-Umbenennung auch Tätigkeiten aktualisieren",
                     value=False,
@@ -3057,8 +3123,10 @@ def main() -> None:
             km = lookups.get("kodierung_map_eb", {})
             km_df = pd.DataFrame([{"Aufgabe": k, "Kodierung EB": v} for k, v in km.items()])
             st.dataframe(km_df, use_container_width=True, height=300)
+
     with tab4:
         _render_visualisierung_tab(df, lookups, data.path, data.milestones_df)
+
 
 if __name__ == "__main__":
     main()
