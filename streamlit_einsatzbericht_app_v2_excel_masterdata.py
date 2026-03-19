@@ -1549,19 +1549,42 @@ def _read_einsatzbericht_xlsx(path: Path) -> Tuple[Dict[str, Any], pd.DataFrame]
         beginn = _to_time(b)
         ende = _to_time(e)
 
-        pause_min = 0
-        if c_pause:
-            pause = _to_time(ws.cell(r, c_pause).value)
-            pause_min = _time_to_minutes(pause)
-
+        # Lese Zeit (h) zuerst, da wir sie zur Korrektur der Pause verwenden koennen
         zeit_h = None
         if c_zeit:
             v = ws.cell(r, c_zeit).value
             try:
-                zeit_h = None if _is_blank(v) else float(v)
+                zeit_h = None if _is_blank(v) else float(str(v).strip().replace(',', '.'))
             except Exception:
                 zeit_h = None
 
+        pause_min = 0
+        if c_pause:
+            p_val = ws.cell(r, c_pause).value
+            if not _is_blank(p_val):
+                if isinstance(p_val, str):
+                    s_val = p_val.strip().replace(',', '.')
+                    try:
+                        p_float = float(s_val)
+                        pause_min = int(round(p_float * 60))
+                    except ValueError:
+                        pause_min = _time_to_minutes(_to_time(p_val))
+                elif isinstance(p_val, (int, float)):
+                    pause_min = int(round(p_val * 60))
+                else:
+                    pause_min = _time_to_minutes(_to_time(p_val))
+
+        # Kreuz-Check mit Zeit (h): Umgeht Excels absurde Uhrzeit-Formatierung
+        if beginn is not None and ende is not None and zeit_h is not None:
+            total_duration_hours = _compute_hours_decimal(beginn, ende, 0)
+            if total_duration_hours is not None:
+                inferred_pause_hours = total_duration_hours - zeit_h
+                inferred_pause_min = int(round(inferred_pause_hours * 60))
+                # Nur verwenden, wenn die errechnete Pause Sinn macht (zwischen 0 und 12 Stunden)
+                if 0 <= inferred_pause_min < 720:
+                    pause_min = inferred_pause_min
+
+        # Fallback falls Zeit (h) leer ist
         if zeit_h is None and beginn is not None and ende is not None:
             zeit_h = _compute_hours_decimal(beginn, ende, pause_min)
 
@@ -2752,7 +2775,7 @@ def main() -> None:
                                     idx = all_aufgaben.index(kod_eb.lower())
                                     aufgabe = (lookups.get("kodierung_aufgaben") or [])[idx]
                                 else:
-                                    info = (info + f"  [EB:{kod_eb}]").strip()
+                                    aufgabe = kod_eb
 
                             rec = {
                                 "Datum": datum,
@@ -2791,7 +2814,7 @@ def main() -> None:
                         "Typ": r["Tätigkeit"],
                         "Kodierung (Aufgabe)": r["Kodierung"],
                         "Info": _safe_str(r["Info"])[:80],
-                    } for r in all_records[:50]])
+                    } for r in all_records])
                     st.dataframe(preview, use_container_width=True, height=260)
 
                     if st.button("Import durchführen (in Tätigkeiten schreiben)", key="commit_report_import"):
