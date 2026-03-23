@@ -226,7 +226,7 @@ def _load_lookups(wb: openpyxl.Workbook) -> Dict[str, Any]:
 
     lookups["taetigkeit_typen"] = _read_list_column(h, 3)
     if not lookups["taetigkeit_typen"]:
-        lookups["taetigkeit_typen"] = ["F", "R", "I", "K"]
+        lookups["taetigkeit_typen"] = ["F", "R", "I", "S", "K"]
 
     lookups["interne_projekte"] = _read_list_column(h, 5)
     lookups["projekte"] = _read_list_column(h, 7)
@@ -2449,7 +2449,7 @@ def main() -> None:
             f_include_abg = st.checkbox("abgerechnete zeigen", value=True)
 
         projekte_opts = projekte_available if projekte_available else [""]
-        typen_opts = list(dict.fromkeys(lookups.get("taetigkeit_typen") or ["F", "R", "I", "K"]))
+        typen_opts = list(dict.fromkeys(lookups.get("taetigkeit_typen") or ["F", "R", "I", "S", "K"]))
         ja_nein_opts = list(dict.fromkeys(lookups.get("ja_nein") or ["ja", "nein"]))
 
         kod_opts = list(dict.fromkeys(
@@ -2785,7 +2785,7 @@ def main() -> None:
                         file_name = getattr(uf, "name", f"report_{i}.xlsx")
 
                         # Die erlaubten Tätigkeiten als Tuple (hashbar für Cache) an die Lesefunktion übergeben!
-                        allowed_arts_tuple = tuple(lookups.get("taetigkeit_typen") or ["F", "R", "I", "K"])
+                        allowed_arts_tuple = tuple(lookups.get("taetigkeit_typen") or ["F", "R", "I", "S", "K"])
                         meta, lines = _parse_and_store_uploaded_report(file_name, uf.getvalue(), allowed_arts_tuple)
 
                         st.write("Import-Zeilen erkannt:", len(lines))
