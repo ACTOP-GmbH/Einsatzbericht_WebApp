@@ -802,9 +802,9 @@ def _excel_original_report_action_fallback(
 
                 script = f'''
                 tell application "Microsoft Excel"
-                    set wb to open POSIX file "{tmp_file.resolve()}"
-                    save wb in POSIX file "{out_path.resolve()}" as PDF file format
-                    close wb saving no
+                    open (POSIX file "{tmp_file.resolve()}")
+                    save active workbook in (POSIX file "{out_path.resolve()}") as PDF file format
+                    close active workbook saving no
                 end tell
                 '''
                 subprocess.run(["osascript", "-e", script], check=True)
@@ -817,9 +817,9 @@ def _excel_original_report_action_fallback(
                 wb.save(tmp_file)
                 script = f'''
                 tell application "Microsoft Excel"
-                    set wb to open POSIX file "{tmp_file.resolve()}"
-                    print out active sheet
-                    close wb saving no
+                    open (POSIX file "{tmp_file.resolve()}")
+                    print active sheet
+                    close active workbook saving no
                 end tell
                 '''
                 subprocess.run(["osascript", "-e", script], check=True)
