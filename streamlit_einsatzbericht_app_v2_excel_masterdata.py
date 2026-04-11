@@ -24,6 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 APP_TITLE = "Einsatzbericht Manager (MVP)"
 TAETIGKEITEN_SHEET = "Tätigkeiten"
+TEAM_SHEET = "Team_Tätigkeiten"
 HILFS_SHEET = "Hilfstabelle"
 KODIERUNG_SHEET = "Kodierung Joyson"
 RELEVANTE_KODIERUNG_SHEET = "relevante Kodierung"
@@ -55,13 +56,17 @@ TAET_COLS = [
     "eingetragen",
 ]
 
+TEAM_COLS = ["Mitarbeiter"] + TAET_COLS
+
 KEY_COLS_FOR_EMPTY_CHECK = [1, 2, 3, 4, 9, 12, 13, 14]  # ignore formula columns F/G
+TEAM_KEY_COLS_FOR_EMPTY_CHECK = [2, 3, 4, 5, 10, 13, 14, 15]
 
 
 @dataclass
 class WorkbookData:
     path: Path
     taetigkeiten_df: pd.DataFrame
+    team_df: pd.DataFrame
     lookups: Dict[str, Any]
     milestones_df: pd.DataFrame
 
@@ -327,6 +332,58 @@ def _read_taetigkeiten_df(wb: openpyxl.Workbook) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     if df.empty:
         df = pd.DataFrame(columns=TAET_COLS + ["_excel_row", "Pause_Min", "Stunden_Anzeige"])
+        return df
+
+    sort_date = pd.to_datetime(df["Datum"], errors="coerce")
+    sort_start = df["Zeit von"].apply(lambda x: _time_to_minutes(x) if x else -1)
+    df = df.assign(_sort_date=sort_date, _sort_start=sort_start).sort_values(
+        ["_sort_date", "_sort_start", "_excel_row"], ascending=[False, False, False]
+    )
+    df = df.drop(columns=["_sort_date", "_sort_start"]).reset_index(drop=True)
+    return df
+
+
+def _read_team_df(wb: openpyxl.Workbook) -> pd.DataFrame:
+    if TEAM_SHEET not in wb.sheetnames:
+        return pd.DataFrame(columns=TEAM_COLS + ["_excel_row", "Pause_Min", "Stunden_Anzeige"])
+
+    ws = wb[TEAM_SHEET]
+    rows: List[Dict[str, Any]] = []
+
+    for r in range(2, ws.max_row + 1):
+        raw = [ws.cell(r, c).value for c in range(1, 16)]
+        is_empty = all(_is_blank(ws.cell(r, c).value) for c in TEAM_KEY_COLS_FOR_EMPTY_CHECK)
+        if is_empty:
+            continue
+
+        rec = dict(zip(TEAM_COLS, raw))
+        rec["_excel_row"] = r
+        rec["Datum"] = _to_date(rec.get("Datum"))
+        rec["Zeit von"] = _to_time(rec.get("Zeit von"))
+        rec["Zeit bis"] = _to_time(rec.get("Zeit bis"))
+        rec["Pause"] = _to_time(rec.get("Pause"))
+        rec["Pause_Min"] = _time_to_minutes(rec.get("Pause"))
+        rec["Mitarbeiter"] = _safe_str(rec.get("Mitarbeiter")).strip()
+
+        zahl = rec.get("Zahl")
+        if isinstance(zahl, (int, float)) and not (isinstance(zahl, float) and math.isnan(zahl)):
+            rec["Zahl"] = float(zahl)
+        else:
+            rec["Zahl"] = _compute_hours_decimal(rec.get("Zeit von"), rec.get("Zeit bis"), rec.get("Pause_Min", 0))
+
+        rec["Stunden_Anzeige"] = None
+        if rec.get("Zahl") is not None:
+            total_minutes = int(round(float(rec["Zahl"]) * 60))
+            rec["Stunden_Anzeige"] = f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+        rec["Abgerechnet"] = _normalize_yes_no(rec.get("Abgerechnet")) or _safe_str(rec.get("Abgerechnet"))
+        rec["eingetragen"] = _normalize_yes_no(rec.get("eingetragen")) or _safe_str(rec.get("eingetragen"))
+
+        rows.append(rec)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=TEAM_COLS + ["_excel_row", "Pause_Min", "Stunden_Anzeige"])
         return df
 
     sort_date = pd.to_datetime(df["Datum"], errors="coerce")
@@ -878,8 +935,10 @@ def load_workbook_data(path_str: str) -> WorkbookData:
     wb = openpyxl.load_workbook(path)
     lookups = _load_lookups(wb)
     taetigkeiten_df = _read_taetigkeiten_df(wb)
+    team_df = _read_team_df(wb)
     milestones_df = _read_milestones_df(wb)
-    return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, lookups=lookups, milestones_df=milestones_df)
+    return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, team_df=team_df, lookups=lookups,
+                        milestones_df=milestones_df)
 
 
 @st.cache_data(show_spinner=False)
@@ -999,9 +1058,9 @@ def _clear_milestone_row(ws, row_idx: int) -> None:
 
 # ------------------------- workbook writing -------------------------
 
-def _find_next_write_row(ws) -> int:
+def _find_next_write_row(ws, key_cols=KEY_COLS_FOR_EMPTY_CHECK) -> int:
     for r in range(2, ws.max_row + 2):
-        if all(_is_blank(ws.cell(r, c).value) for c in KEY_COLS_FOR_EMPTY_CHECK):
+        if all(_is_blank(ws.cell(r, c).value) for c in key_cols):
             return r
     return ws.max_row + 1
 
@@ -1033,11 +1092,10 @@ def _write_taetigkeit_row(ws, row_idx: int, record: Dict[str, Any]) -> None:
 
     zahl = record.get("Zahl")
     if zeit_von is None and zeit_bis is None and zahl is not None:
-        # Manuelle Dezimalzeit für Zeilen ohne Uhrzeiten (z.B. "Organisatorisches")
         try:
             z_float = float(zahl)
-            ws.cell(row_idx, 6).value = z_float / 24.0  # Stunden-Zelle in Excel
-            ws.cell(row_idx, 7).value = z_float  # Zahl-Zelle in Excel
+            ws.cell(row_idx, 6).value = z_float / 24.0
+            ws.cell(row_idx, 7).value = z_float
         except Exception:
             ws.cell(row_idx, 6).value = ""
             ws.cell(row_idx, 7).value = ""
@@ -1061,6 +1119,62 @@ def _write_taetigkeit_row(ws, row_idx: int, record: Dict[str, Any]) -> None:
 
 def _clear_taetigkeit_row(ws, row_idx: int) -> None:
     for c in range(1, 15):
+        ws.cell(row_idx, c).value = None
+
+
+def _ensure_team_sheet(wb: openpyxl.Workbook):
+    if TEAM_SHEET in wb.sheetnames:
+        return wb[TEAM_SHEET]
+    ws = wb.create_sheet(TEAM_SHEET)
+    for i, h in enumerate(TEAM_COLS, start=1):
+        ws.cell(1, i).value = h
+    return ws
+
+
+def _write_team_row(ws, row_idx: int, record: Dict[str, Any]) -> None:
+    ws.cell(row_idx, 1).value = _safe_str(record.get("Mitarbeiter")).strip() or "Unbekannt"
+    ws.cell(row_idx, 2).value = _to_date(record.get("Datum"))
+    ws.cell(row_idx, 3).value = _safe_str(record.get("Projekt")).strip() or None
+    ws.cell(row_idx, 4).value = _to_time(record.get("Zeit von"))
+    ws.cell(row_idx, 5).value = _to_time(record.get("Zeit bis"))
+
+    pause_min = int(record.get("Pause_Min") or 0)
+    ws.cell(row_idx, 6).value = _minutes_to_time(pause_min)
+
+    zahl = record.get("Zahl")
+    if record.get("Zeit von") is None and record.get("Zeit bis") is None and zahl is not None:
+        try:
+            z_float = float(zahl)
+            ws.cell(row_idx, 7).value = z_float / 24.0
+            ws.cell(row_idx, 8).value = z_float
+        except Exception:
+            ws.cell(row_idx, 7).value = ""
+            ws.cell(row_idx, 8).value = ""
+    else:
+        ws.cell(row_idx, 7).value = f'=IF(B{row_idx}="","",E{row_idx}-D{row_idx}-F{row_idx})'
+        ws.cell(row_idx, 8).value = f'=IF(B{row_idx}="","",G{row_idx}*24)'
+
+    try:
+        km_val = None if _is_blank(record.get("km")) else int(float(record.get("km")))
+    except Exception:
+        km_val = None
+
+    ws.cell(row_idx, 9).value = km_val
+    ws.cell(row_idx, 10).value = _safe_str(record.get("Tätigkeit")).strip() or None
+    ws.cell(row_idx, 11).value = _safe_str(record.get("Kodierung")).strip() or None
+    ws.cell(row_idx, 12).value = _safe_str(record.get("Interne Projekte")).strip() or None
+    ws.cell(row_idx, 13).value = _safe_str(record.get("Info")) or None
+    ws.cell(row_idx, 14).value = _safe_str(record.get("Abgerechnet")).strip() or None
+    ws.cell(row_idx, 15).value = _safe_str(record.get("eingetragen")).strip() or None
+
+    ws.cell(row_idx, 2).number_format = "DD.MM.YYYY"
+    for c in (4, 5, 6, 7):
+        ws.cell(row_idx, c).number_format = "hh:mm"
+    ws.cell(row_idx, 8).number_format = "0.00"
+
+
+def _clear_team_row(ws, row_idx: int) -> None:
+    for c in range(1, 16):
         ws.cell(row_idx, c).value = None
 
 
@@ -1327,7 +1441,7 @@ def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Opti
             options=[""] + (ja_nein if ja_nein else ["ja", "nein"]),
             index=([""] + (ja_nein if ja_nein else ["ja", "nein"])).index(
                 _safe_str(defaults.get("eingetragen"))) if _safe_str(defaults.get("eingetragen")) in (
-                        [""] + (ja_nein if ja_nein else ["ja", "nein"])) else 0,
+                    [""] + (ja_nein if ja_nein else ["ja", "nein"])) else 0,
             key=f"{prefix}_eing",
         )
 
@@ -1492,6 +1606,24 @@ def _read_project_from_sheet(ws) -> str:
     return ""
 
 
+def _read_name_from_sheet(ws) -> str:
+    # 1. Oftmals in C7 hinterlegt
+    c7 = _safe_str(ws["C7"].value).strip()
+
+    # 2. Sicherheitshalber dynamisch scannen
+    for r in range(1, 20):
+        for c in range(1, 10):
+            v = _safe_str(ws.cell(r, c).value).strip().lower()
+            if "berater" in v or "name" in v or "mitarbeiter" in v:
+                for offset in range(1, 4):
+                    val = _safe_str(ws.cell(r, c + offset).value).strip()
+                    if val and len(val) > 2:
+                        return val
+    if c7 and len(c7) > 2:
+        return c7
+    return ""
+
+
 def _find_header(ws, max_rows: int = 80, max_cols: int = 30) -> Tuple[Optional[int], Dict[str, int]]:
     required = {"datum", "beginn", "ende", "art"}
     for r in range(1, max_rows + 1):
@@ -1517,11 +1649,12 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
 
     header_row, col = _find_header(ws)
     if header_row is None:
-        meta = {"project": "", "year": None, "month": None, "source_path": str(path)}
+        meta = {"project": "", "year": None, "month": None, "source_path": str(path), "name": ""}
         return meta, pd.DataFrame(
             columns=["Datum", "Beginn", "Ende", "Pause_Min", "Zeit_h", "Art", "Kodierung_EB", "Leistungsbeschreibung"])
 
     project = _read_project_from_sheet(ws)
+    mitarbeiter_name = _read_name_from_sheet(ws)
 
     year = ws["K2"].value
     month = ws["K3"].value
@@ -1547,7 +1680,6 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
     start = header_row + 1
     last_seen_date = None
 
-    # Eiserne Regel: Gültige Stammdaten (case-insensitive für Abgleich)
     valid_arts = {str(t).strip().lower() for t in allowed_types if str(t).strip()}
 
     for r in range(start, start + 400):
@@ -1567,8 +1699,6 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
 
         art = _safe_str(art_val).strip()
 
-        # WICHTIGE FILTER-REGEL: Ohne Art ("F", "R", etc.), die exakt in den Stammdaten existiert, ist die Zeile ungültig.
-        # "Stunden" oder "Adham Aijou" fallen hier durchs Raster und werden ignoriert.
         if not art or art.lower() not in valid_arts:
             continue
 
@@ -1576,18 +1706,15 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
         if datum is not None:
             last_seen_date = datum
         elif last_seen_date is not None:
-            # Fallback für die "Organisatorisches" Zeile ohne Datum, erbt das letzte gelesene Datum
             datum = last_seen_date
 
         beginn = _to_time(b)
         ende = _to_time(e)
         text = _safe_str(t).strip()
 
-        # WICHTIGE FILTER-REGEL 2: Fehlen die Uhrzeiten (z.B. Organisatorisches), muss zwingend ein Text da sein.
         if beginn is None and ende is None and not text:
             continue
 
-        # Lese Zeit (h) - absolut robust gegenüber Excel Formatting
         zeit_h = None
         if not _is_blank(z_val):
             if isinstance(z_val, (int, float)):
@@ -1615,7 +1742,6 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
                     except ValueError:
                         pause_min = _time_to_minutes(_to_time(p_val))
 
-        # Kreuz-Check mit Zeit (h): Umgeht Excels absurde Uhrzeit-Formatierung
         if beginn is not None and ende is not None and zeit_h is not None:
             total_duration_hours = _compute_hours_decimal(beginn, ende, 0)
             if total_duration_hours is not None:
@@ -1624,11 +1750,9 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
                 if -5 <= inferred_pause_min < 720:
                     pause_min = max(0, inferred_pause_min)
 
-        # Sicherheits-Reset falls 0,75 als 18:00 Uhr (= 1080 Minuten) gedeutet wurde
         if pause_min >= 720:
             pause_min = 0
 
-        # Fallback falls Zeit (h) leer ist
         if zeit_h is None and beginn is not None and ende is not None:
             zeit_h = _compute_hours_decimal(beginn, ende, pause_min)
 
@@ -1656,6 +1780,7 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
         "project": project,
         "year": year,
         "month": month,
+        "name": mitarbeiter_name,
         "source_path": str(path),
     }
     return meta, df_lines
@@ -1676,7 +1801,7 @@ def _key_for_import(rec: Dict[str, Any]) -> tuple:
     return (d, zv, zb, pause, typ, info)
 
 
-def _existing_keys_for_master(df_master: pd.DataFrame) -> set:
+def _existing_keys_for_master(df_master: pd.DataFrame, team: bool = False) -> set:
     keys = set()
     if df_master is None or df_master.empty:
         return keys
@@ -1692,7 +1817,11 @@ def _existing_keys_for_master(df_master: pd.DataFrame) -> set:
             "Kodierung": r.get("Kodierung") or "",
             "Info": r.get("Info") or "",
         }
-        keys.add(_key_for_import(rec))
+        if team:
+            key_tuple = (_safe_str(r.get("Mitarbeiter")).strip(),) + _key_for_import(rec)
+            keys.add(key_tuple)
+        else:
+            keys.add(_key_for_import(rec))
     return keys
 
 
@@ -1713,7 +1842,7 @@ def _viz_base_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(
             columns=["Datum_dt", "Year", "Month", "YM", "YM_dt", "Projekt", "Tätigkeit", "Hours", "Abgerechnet", "km",
-                     "Kodierung", "Info"])
+                     "Kodierung", "Info", "Mitarbeiter"])
 
     x = df.copy()
     x["Datum_dt"] = pd.to_datetime(x["Datum"], errors="coerce")
@@ -1743,6 +1872,9 @@ def _viz_base_df(df: pd.DataFrame) -> pd.DataFrame:
         x["Kodierung"] = ""
     if "Info" not in x.columns:
         x["Info"] = ""
+    if "Mitarbeiter" not in x.columns:
+        x["Mitarbeiter"] = "Ich (Eigene)"
+    x["Mitarbeiter"] = x["Mitarbeiter"].fillna("Unbekannt")
 
     return x
 
@@ -1895,17 +2027,29 @@ def _render_chart_block(
     )
 
 
-def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_path: Path,
+def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups: Dict[str, Any], xlsx_path: Path,
                                milestones_df: pd.DataFrame) -> None:
-    st.subheader("Visualisierung / Controlling")
+    st.subheader("Visualisierung / Controlling (Inkl. Team-Daten)")
 
-    base = _viz_base_df(df)
+    # Combine my data and team data
+    my_df = df.copy()
+    my_df["Mitarbeiter"] = "Ich (Eigene)"
+    if not team_df.empty:
+        t_df = team_df.copy()
+        t_df["Mitarbeiter"] = t_df["Mitarbeiter"].fillna("Unbekannt")
+        combined_df = pd.concat([my_df, t_df], ignore_index=True)
+    else:
+        combined_df = my_df
+
+    base = _viz_base_df(combined_df)
     if base.empty:
         st.info("Keine Daten vorhanden.")
         return
 
     all_projects = sorted([p for p in base["Projekt"].unique().tolist() if p and p != "nan"])
     all_years = sorted(base["Year"].unique().tolist())
+    all_mitarbeiter = sorted([m for m in base["Mitarbeiter"].unique().tolist() if m and m != "nan"])
+
     min_y = min(all_years) if all_years else dt.date.today().year
     max_y = max(all_years) if all_years else dt.date.today().year
 
@@ -1922,6 +2066,12 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
     with c3:
         y_to = st.number_input("Jahr bis", min_value=2000, max_value=2100, value=int(max_y), step=1, key="viz_y_to")
     with c4:
+        sel_mitarbeiter = st.multiselect(
+            "Mitarbeiter",
+            options=all_mitarbeiter,
+            default=all_mitarbeiter,
+            help="Welche Personen sollen in die Auswertung/das Budget einfließen?"
+        )
         include_abg = st.checkbox("abgerechnete einschließen", value=True, key="viz_include_abg")
         include_internal = st.checkbox("interne Tätigkeiten (I) einschließen", value=True, key="viz_include_internal")
 
@@ -1929,6 +2079,8 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
     x = x[(x["Year"] >= int(y_from)) & (x["Year"] <= int(y_to))]
     if sel_projects:
         x = x[x["Projekt"].isin(sel_projects)]
+    if sel_mitarbeiter:
+        x = x[x["Mitarbeiter"].isin(sel_mitarbeiter)]
     if not include_abg:
         x = x[x["Abgerechnet"] != "ja"]
     if not include_internal:
@@ -2186,7 +2338,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
     rates = st.session_state.setdefault("viz_rates_by_project", {})
 
     st.markdown("### Budget / Stundensätze (optional)")
-    st.caption("Wenn du Budgets/Stundensätze pflegst, bekommst du Budgetverbrauch & Kostenabschätzung.")
+    st.caption("Alle gewählten Mitarbeiter (siehe Filter oben) fließen kumuliert in diesen Budgetverbrauch mit ein.")
 
     def _get_rate_map(p: str) -> Dict[str, float]:
         rm = rates.get(p) or {}
@@ -2194,6 +2346,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
             "default": float(rm.get("default", 0.0) or 0.0),
             "F": float(rm.get("F", 0.0) or 0.0),
             "R": float(rm.get("R", 0.0) or 0.0),
+            "S": float(rm.get("S", 0.0) or 0.0),
             "K": float(rm.get("K", 0.0) or 0.0),
             "I": float(rm.get("I", 0.0) or 0.0),
         }
@@ -2202,7 +2355,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
         p = sel_projects[0]
         rm = _get_rate_map(p)
 
-        cc1, cc2, cc3, cc4, cc5 = st.columns([1, 1, 1, 1, 1])
+        cc1, cc2, cc3, cc4, cc5, cc6 = st.columns([1, 1, 1, 1, 1, 1])
         with cc1:
             b = st.number_input("Budget (€)", min_value=0.0, value=float(budgets.get(p, 0.0) or 0.0), step=100.0,
                                 key=f"viz_budget_{p}")
@@ -2214,10 +2367,13 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
         with cc4:
             r_r = st.number_input("Rate R (€/h)", min_value=0.0, value=float(rm["R"]), step=1.0, key=f"viz_rate_R_{p}")
         with cc5:
+            r_s = st.number_input("Rate S (€/h)", min_value=0.0, value=float(rm["S"]), step=1.0, key=f"viz_rate_S_{p}")
+        with cc6:
             r_k = st.number_input("Rate K (€/h)", min_value=0.0, value=float(rm["K"]), step=1.0, key=f"viz_rate_K_{p}")
 
         budgets[p] = float(b or 0.0)
-        rates[p] = {"default": float(r_def), "F": float(r_f), "R": float(r_r), "K": float(r_k), "I": float(r_def)}
+        rates[p] = {"default": float(r_def), "F": float(r_f), "R": float(r_r), "S": float(r_s), "K": float(r_k),
+                    "I": float(r_def)}
     else:
         st.info("Für Budgetverbrauch wähle genau **ein** Projekt aus (dann kannst du Budget & Stundensätze pflegen).")
 
@@ -2225,12 +2381,13 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
     total_hours = float(sum(hours_by_type.values()) or 0.0)
     total_km = int(x["km"].sum())
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Stunden gesamt", f"{total_hours:.2f} h")
     m2.metric("F", f"{float(hours_by_type.get('F', 0.0)):.2f} h")
     m3.metric("R", f"{float(hours_by_type.get('R', 0.0)):.2f} h")
-    m4.metric("K", f"{float(hours_by_type.get('K', 0.0)):.2f} h")
-    m5.metric("km", f"{total_km}")
+    m4.metric("S", f"{float(hours_by_type.get('S', 0.0)):.2f} h")
+    m5.metric("K", f"{float(hours_by_type.get('K', 0.0)):.2f} h")
+    m6.metric("km", f"{total_km}")
 
     if len(sel_projects) == 1:
         p = sel_projects[0]
@@ -2246,7 +2403,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
             cost += float(h or 0.0) * _rate_for(t)
 
         budget = float(budgets.get(p, 0.0) or 0.0)
-        st.markdown("### Budgetstatus")
+        st.markdown("### Budgetstatus (Gesamtteam)")
         cst1, cst2, cst3 = st.columns(3)
         fmt = lambda v: f"{v:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
         cst1.metric("Kosten (Schätzung)", fmt(cost))
@@ -2266,6 +2423,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
     )
     proj_df = x.groupby("Projekt", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     type_df = x.groupby("Tätigkeit", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
+    mitarbeiter_df = x.groupby("Mitarbeiter", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
 
     _render_chart_block(
         title="Stundenverlauf (Monate)",
@@ -2281,11 +2439,11 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
         pie_ok=False,
     )
 
-    cA, cB = st.columns(2)
+    cA, cB, cC = st.columns(3)
 
     with cA:
         _render_chart_block(
-            title="Stunden nach Tätigkeit (F/R/K/I)",
+            title="Nach Tätigkeit",
             df=type_df,
             key_prefix="viz_type",
             default_kind="Pie",
@@ -2300,12 +2458,27 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
 
     with cB:
         _render_chart_block(
-            title="Stunden nach Projekt",
+            title="Nach Projekt",
             df=proj_df,
             key_prefix="viz_project",
             default_kind="Bar",
             allowed_kinds=["Bar", "Pie", "Donut"],
             x_field="Projekt",
+            y_field="Hours",
+            color_field=None,
+            x_type="nominal",
+            stacked_default=False,
+            pie_ok=True,
+        )
+
+    with cC:
+        _render_chart_block(
+            title="Nach Mitarbeiter",
+            df=mitarbeiter_df,
+            key_prefix="viz_mitarbeiter",
+            default_kind="Pie",
+            allowed_kinds=["Pie", "Donut", "Bar"],
+            x_field="Mitarbeiter",
             y_field="Hours",
             color_field=None,
             x_type="nominal",
@@ -2332,9 +2505,11 @@ def _render_visualisierung_tab(df: pd.DataFrame, lookups: Dict[str, Any], xlsx_p
 
     st.markdown("### Detail (optional)")
     with st.expander("Rohdaten anzeigen"):
-        show_cols = ["Datum_dt", "Projekt", "Tätigkeit", "Hours", "km", "Kodierung", "Info", "Abgerechnet"]
+        show_cols = ["Mitarbeiter", "Datum_dt", "Projekt", "Tätigkeit", "Hours", "km", "Kodierung", "Info",
+                     "Abgerechnet"]
         show_cols = [c for c in show_cols if c in x.columns]
-        st.dataframe(x[show_cols].sort_values("Datum_dt", ascending=False), use_container_width=True, height=420)
+        st.dataframe(x[show_cols].sort_values(["Datum_dt", "Mitarbeiter"], ascending=[False, True]),
+                     use_container_width=True, height=420)
 
 
 def main() -> None:
@@ -2422,9 +2597,11 @@ def main() -> None:
         st.stop()
 
     df = data.taetigkeiten_df.copy()
+    team_df = data.team_df.copy()
     lookups = data.lookups
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Tätigkeiten", "Einsatzbericht", "Stammdaten / Debug", "Visualisierung"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Tätigkeiten", "Einsatzbericht", "Stammdaten / Debug", "Visualisierung", "Team-Daten"])
 
     with tab1:
         st.subheader("Tätigkeiten erfassen und bearbeiten")
@@ -2645,7 +2822,7 @@ def main() -> None:
                         _clear_taetigkeit_row(ws, r)
                     for r, rec in updates:
                         _write_taetigkeit_row(ws, r, rec)
-                    row_idx = _find_next_write_row(ws)
+                    row_idx = _find_next_write_row(ws, key_cols=KEY_COLS_FOR_EMPTY_CHECK)
                     for rec in inserts:
                         _write_taetigkeit_row(ws, row_idx, rec)
                         row_idx += 1
@@ -2678,7 +2855,7 @@ def main() -> None:
             if submit_add:
                 def _mutator_add(wb):
                     ws = wb[TAETIGKEITEN_SHEET]
-                    row_idx = _find_next_write_row(ws)
+                    row_idx = _find_next_write_row(ws, key_cols=KEY_COLS_FOR_EMPTY_CHECK)
                     _write_taetigkeit_row(ws, row_idx, rec_add)
 
                 ok, msg = _save_workbook(data.path, _mutator_add)
@@ -2755,7 +2932,14 @@ def main() -> None:
         st.markdown("---")
         st.markdown("### Migration: Einsatzbericht importieren")
 
-        with st.expander("Einsatzbericht(e) (Excel-Layout) hochladen und in Tätigkeiten übernehmen"):
+        with st.expander("Einsatzbericht(e) (Excel-Layout) hochladen und importieren"):
+
+            import_mode = st.radio("Wohin sollen die Dateien importiert werden?", [
+                "In Meine Tätigkeiten (Mein Journal)",
+                "In Team-Tätigkeiten (Fürs Projekt-Controlling)"
+            ],
+                                   help="Wähle 'Team-Tätigkeiten', um die Berichte anderer Mitarbeiter strikt von deinen eigenen EBs zu trennen.")
+
             report_files = st.file_uploader(
                 "Einsatzbericht-Excel auswählen (.xlsx)",
                 type=["xlsx"],
@@ -2770,7 +2954,8 @@ def main() -> None:
 
             if report_files:
                 rev_kod_map = _build_reverse_kod_map_eb_to_aufgabe(lookups)
-                existing_keys = _existing_keys_for_master(df)
+                is_team_mode = "Team" in import_mode
+                existing_keys = _existing_keys_for_master(team_df if is_team_mode else df, team=is_team_mode)
 
                 all_records: List[Dict[str, Any]] = []
                 meta_list = []
@@ -2784,31 +2969,39 @@ def main() -> None:
                     try:
                         file_name = getattr(uf, "name", f"report_{i}.xlsx")
 
-                        # Die erlaubten Tätigkeiten als Tuple (hashbar für Cache) an die Lesefunktion übergeben!
                         allowed_arts_tuple = tuple(lookups.get("taetigkeit_typen") or ["F", "R", "I", "S", "K"])
                         meta, lines = _parse_and_store_uploaded_report(file_name, uf.getvalue(), allowed_arts_tuple)
 
-                        st.write("Import-Zeilen erkannt:", len(lines))
+                        st.write("---")
+                        st.write(f"**Datei {i}:** `{file_name}`")
+                        st.write(f"Zeilen erkannt: {len(lines)}")
                         meta_list.append(meta)
 
                         detected_project = meta.get("project") or ""
-                        st.write(
-                            f"""**Datei {i}:** `{file_name}`
-                        Projekt/Firma (aus Excel): `{detected_project or '-'}`
-                        Monat/Jahr: {meta.get('month')}/{meta.get('year')}"""
-                        )
+
+                        rc1, rc2 = st.columns(2)
+                        with rc1:
+                            st.write(f"Projekt/Firma (aus Excel): `{detected_project or '-'}`")
+                            st.write(f"Monat/Jahr: {meta.get('month')}/{meta.get('year')}")
 
                         guessed_proj = _guess_project(meta, file_name, lookups, target_projects)
                         default_target = guessed_proj if guessed_proj in target_projects else (
                             target_projects[0] if target_projects else ""
                         )
 
-                        target_project = st.selectbox(
-                            f"Ziel-Projekt für Datei {i}",
-                            options=target_projects if target_projects else [""],
-                            index=(target_projects.index(default_target) if default_target in target_projects else 0),
-                            key=f"import_report_target_{i}",
-                        )
+                        with rc2:
+                            target_project = st.selectbox(
+                                f"Ziel-Projekt festlegen",
+                                options=target_projects if target_projects else [""],
+                                index=(
+                                    target_projects.index(default_target) if default_target in target_projects else 0),
+                                key=f"import_report_target_{i}",
+                            )
+                            mitarbeiter_name = ""
+                            if is_team_mode:
+                                mitarbeiter_name = st.text_input(f"Mitarbeiter-Name festlegen",
+                                                                 value=meta.get("name", f"Kollege {i}"),
+                                                                 key=f"import_team_name_{i}")
 
                         if lines.empty:
                             st.info("Keine gültigen Tätigkeits-Zeilen im Einsatzbericht gefunden.")
@@ -2848,39 +3041,63 @@ def main() -> None:
                                 "eingetragen": "ja" if set_eingetragen else "",
                                 "Zahl": row.get("Zeit_h"),
                             }
+                            if is_team_mode:
+                                rec["Mitarbeiter"] = mitarbeiter_name
 
                             k = _key_for_import(rec)
-                            if k in existing_keys:
-                                continue
-                            existing_keys.add(k)
+                            if is_team_mode:
+                                key_tuple = (_safe_str(mitarbeiter_name).strip(),) + k
+                                if key_tuple in existing_keys:
+                                    continue
+                                existing_keys.add(key_tuple)
+                            else:
+                                if k in existing_keys:
+                                    continue
+                                existing_keys.add(k)
+
                             all_records.append(rec)
 
                     except Exception as e:
                         st.error(f"Fehler beim Lesen der Datei {i}: {e}")
 
-                st.metric("Neu zu importierende Zeilen", len(all_records))
+                st.write("---")
+                st.metric("Gesamt neu zu importierende Zeilen", len(all_records))
 
                 if all_records:
-                    preview = pd.DataFrame([{
-                        "Datum": _format_date(r["Datum"]),
-                        "Projekt": r["Projekt"],
-                        "Zeit von": _format_time(r["Zeit von"]),
-                        "Zeit bis": _format_time(r["Zeit bis"]),
-                        "Pause (Min)": r["Pause_Min"],
-                        "Zeit (h)": r.get("Zahl"),
-                        "Typ": r["Tätigkeit"],
-                        "Kodierung (Aufgabe)": r["Kodierung"],
-                        "Info": _safe_str(r["Info"])[:80],
-                    } for r in all_records])
+                    preview_data = []
+                    for r in all_records:
+                        d = {
+                            "Datum": _format_date(r["Datum"]),
+                            "Projekt": r["Projekt"],
+                            "Zeit von": _format_time(r["Zeit von"]),
+                            "Zeit bis": _format_time(r["Zeit bis"]),
+                            "Pause (Min)": r["Pause_Min"],
+                            "Zeit (h)": r.get("Zahl"),
+                            "Typ": r["Tätigkeit"],
+                            "Kodierung (Aufgabe)": r["Kodierung"],
+                            "Info": _safe_str(r["Info"])[:80],
+                        }
+                        if is_team_mode:
+                            d = {"Mitarbeiter": r.get("Mitarbeiter")} | d  # Prepend Mitarbeiter
+                        preview_data.append(d)
+
+                    preview = pd.DataFrame(preview_data)
                     st.dataframe(preview, use_container_width=True, height=260)
 
-                    if st.button("Import durchführen (in Tätigkeiten schreiben)", key="commit_report_import"):
+                    if st.button("Import durchführen (Schreiben)", key="commit_report_import"):
                         def _mutator_import_reports(wb):
-                            ws = wb[TAETIGKEITEN_SHEET]
-                            row_idx = _find_next_write_row(ws)
-                            for rec in all_records:
-                                _write_taetigkeit_row(ws, row_idx, rec)
-                                row_idx += 1
+                            if is_team_mode:
+                                ws = _ensure_team_sheet(wb)
+                                row_idx = _find_next_write_row(ws, key_cols=TEAM_KEY_COLS_FOR_EMPTY_CHECK)
+                                for rec in all_records:
+                                    _write_team_row(ws, row_idx, rec)
+                                    row_idx += 1
+                            else:
+                                ws = wb[TAETIGKEITEN_SHEET]
+                                row_idx = _find_next_write_row(ws, key_cols=KEY_COLS_FOR_EMPTY_CHECK)
+                                for rec in all_records:
+                                    _write_taetigkeit_row(ws, row_idx, rec)
+                                    row_idx += 1
 
                         ok, msg = _save_workbook(data.path, _mutator_import_reports)
                         if ok:
@@ -3205,7 +3422,48 @@ def main() -> None:
             st.dataframe(km_df, use_container_width=True, height=300)
 
     with tab4:
-        _render_visualisierung_tab(df, lookups, data.path, data.milestones_df)
+        _render_visualisierung_tab(df, team_df, lookups, data.path, data.milestones_df)
+
+    with tab5:
+        st.subheader("Team-Tätigkeiten (Fremddaten)")
+        st.write(
+            "Diese Daten stammen aus dem Import von Einsatzberichten anderer Mitarbeiter (Modus: 'In Team-Tätigkeiten'). Sie werden für das Budget-Controlling genutzt, aber von deinem eigenen Einsatzbericht (Tab: 'Einsatzbericht') völlig ignoriert.")
+
+        if team_df.empty:
+            st.info("Noch keine Team-Daten vorhanden.")
+        else:
+            show_cols = ["_excel_row", "Mitarbeiter", "Datum", "Projekt", "Zeit von", "Zeit bis", "Pause_Min", "Zahl",
+                         "Tätigkeit", "Kodierung", "Info", "Abgerechnet"]
+            disp_df = team_df[[c for c in show_cols if c in team_df.columns]].copy()
+            if "Datum" in disp_df.columns:
+                disp_df["Datum"] = disp_df["Datum"].apply(_format_date)
+            if "Zeit von" in disp_df.columns:
+                disp_df["Zeit von"] = disp_df["Zeit von"].apply(_format_time)
+            if "Zeit bis" in disp_df.columns:
+                disp_df["Zeit bis"] = disp_df["Zeit bis"].apply(_format_time)
+
+            st.dataframe(disp_df.sort_values(["Datum", "Mitarbeiter"], ascending=[False, True]),
+                         use_container_width=True, height=400)
+
+            with st.expander("Gefahr: Team-Daten komplett leeren"):
+                st.warning(
+                    "Löscht alle aktuell importierten Team-Tätigkeiten aus der Excel-Tabelle 'Team_Tätigkeiten'.")
+                if st.button("Alle Team-Daten verwerfen (Löschen)"):
+                    def _clear_all_team(wb):
+                        if TEAM_SHEET in wb.sheetnames:
+                            ws = wb[TEAM_SHEET]
+                            # Start ab Zeile 2 bis Ende
+                            for r in range(2, ws.max_row + 1):
+                                for c in range(1, 16):
+                                    ws.cell(r, c).value = None
+
+                    ok, msg = _save_workbook(data.path, _clear_all_team)
+                    if ok:
+                        st.success("Tabelle 'Team_Tätigkeiten' wurde erfolgreich geleert.")
+                        st.cache_data.clear()
+                        st.rerun()
+                    else:
+                        st.error(f"Fehler beim Löschen: {msg}")
 
 
 if __name__ == "__main__":
