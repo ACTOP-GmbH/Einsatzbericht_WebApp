@@ -1665,17 +1665,25 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
 
 def _key_for_import(rec: Dict[str, Any]) -> tuple:
     d = _format_date(rec.get("Datum"))
+    projekt = _safe_str(rec.get("Projekt")).strip()
     zv = _format_time(rec.get("Zeit von"))
     zb = _format_time(rec.get("Zeit bis"))
     info = _safe_str(rec.get("Info")).strip()
     typ = _safe_str(rec.get("Tätigkeit")).strip()
+    kod = _safe_str(rec.get("Kodierung")).strip()
     pause = int(rec.get("Pause_Min") or 0)
 
     if not zv and not zb:
-        zeit_h = rec.get("Zeit_h") or rec.get("Zeit (h)") or rec.get("Zahl") or ""
-        return (d, "<NO_TIME>", typ, str(zeit_h), info)
+        zeit_h = rec.get("Zeit_h") or rec.get("Zeit (h)") or rec.get("Zahl")
+        zeit_h_norm = ""
+        if zeit_h is not None and not _is_blank(zeit_h):
+            try:
+                zeit_h_norm = f"{float(zeit_h):.4f}"
+            except Exception:
+                zeit_h_norm = _safe_str(zeit_h).strip()
+        return (d, projekt, "<NO_TIME>", typ, kod, zeit_h_norm, info)
 
-    return (d, zv, zb, pause, typ, info)
+    return (d, projekt, zv, zb, pause, typ, kod, info)
 
 
 def _existing_keys_for_master(df_master: pd.DataFrame) -> set:
