@@ -1583,10 +1583,6 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
         ende = _to_time(e)
         text = _safe_str(t).strip()
 
-        # WICHTIGE FILTER-REGEL 2: Fehlen die Uhrzeiten (z.B. Organisatorisches), muss zwingend ein Text da sein.
-        if beginn is None and ende is None and not text:
-            continue
-
         # Lese Zeit (h) - absolut robust gegenüber Excel Formatting
         zeit_h = None
         if not _is_blank(z_val):
@@ -1599,6 +1595,12 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
                     zeit_h = float(str(z_val).strip().replace(',', '.'))
                 except Exception:
                     zeit_h = None
+
+        # WICHTIGE FILTER-REGEL 2:
+        # Fehlen Start/Ende (z.B. Organisatorisches), akzeptieren wir die Zeile
+        # nur mit Beschreibung ODER mit explizitem Zeitwert.
+        if beginn is None and ende is None and not text and zeit_h is None:
+            continue
 
         pause_min = 0
         if c_pause:
