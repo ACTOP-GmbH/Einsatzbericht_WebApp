@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import datetime as dt
 import math
 import os
@@ -1712,9 +1713,6 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
         ende = _to_time(e)
         text = _safe_str(t).strip()
 
-        if beginn is None and ende is None and not text:
-            continue
-
         zeit_h = None
         if not _is_blank(z_val):
             if isinstance(z_val, (int, float)):
@@ -1726,6 +1724,18 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
                     zeit_h = float(str(z_val).strip().replace(',', '.'))
                 except Exception:
                     zeit_h = None
+
+        kod_eb = _safe_str(ws.cell(r, c_kod).value).strip() if c_kod else ""
+
+        has_manual_content = False
+        if zeit_h is not None:
+            try:
+                has_manual_content = abs(float(zeit_h)) > 1e-9
+            except Exception:
+                has_manual_content = True
+
+        if beginn is None and ende is None and not text and not has_manual_content:
+            continue
 
         pause_min = 0
         if c_pause:
@@ -1756,8 +1766,6 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
         if zeit_h is None and beginn is not None and ende is not None:
             zeit_h = _compute_hours_decimal(beginn, ende, pause_min)
 
-        kod_eb = _safe_str(ws.cell(r, c_kod).value).strip() if c_kod else ""
-
         rows.append({
             "Datum": datum,
             "Beginn": beginn,
@@ -1767,6 +1775,7 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
             "Art": art,
             "Kodierung_EB": kod_eb,
             "Leistungsbeschreibung": text,
+            "_source_row": r,
         })
 
     df_lines = pd.DataFrame(rows)
@@ -1809,8 +1818,8 @@ def _key_for_import(rec: Dict[str, Any]) -> tuple:
     return (d, projekt, zv, zb, pause, typ, kod, info)
 
 
-def _existing_keys_for_master(df_master: pd.DataFrame, team: bool = False) -> set:
-    keys = set()
+def _existing_key_counts_for_master(df_master: pd.DataFrame, team: bool = False) -> Counter:
+    keys: Counter = Counter()
     if df_master is None or df_master.empty:
         return keys
     for _, r in df_master.iterrows():
@@ -1824,12 +1833,13 @@ def _existing_keys_for_master(df_master: pd.DataFrame, team: bool = False) -> se
             "Tätigkeit": r.get("Tätigkeit"),
             "Kodierung": r.get("Kodierung") or "",
             "Info": r.get("Info") or "",
+            "Zahl": r.get("Zahl"),
         }
         if team:
             key_tuple = (_safe_str(r.get("Mitarbeiter")).strip(),) + _key_for_import(rec)
-            keys.add(key_tuple)
+            keys[key_tuple] += 1
         else:
-            keys.add(_key_for_import(rec))
+            keys[_key_for_import(rec)] += 1
     return keys
 
 
@@ -1896,6 +1906,7 @@ def _vega_spec_for_chart(
         y_type: str = "quantitative",
         stacked: bool = False,
         donut: bool = False,
+        extra_tooltip_fields: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     kind = (kind or "").lower().strip()
 
@@ -1922,6 +1933,8 @@ def _vega_spec_for_chart(
             {"field": y_field, "type": "quantitative", "format": ".2f"},
         ],
     }
+    if extra_tooltip_fields:
+        enc["tooltip"].extend(extra_tooltip_fields)
 
     if color_field:
         enc["color"] = {"field": color_field, "type": "nominal"}
@@ -1933,6 +1946,8 @@ def _vega_spec_for_chart(
             {"field": color_field, "type": "nominal"},
             {"field": y_field, "type": "quantitative", "format": ".2f"},
         ]
+        if extra_tooltip_fields:
+            enc["tooltip"].extend(extra_tooltip_fields)
 
     mark_type = "bar"
     if kind in {"bar", "stacked bar"}:
@@ -1963,6 +1978,7 @@ def _render_chart_block(
         x_type: str = "ordinal",
         stacked_default: bool = False,
         pie_ok: bool = True,
+        extra_tooltip_fields: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     st.markdown(f"### {title}")
 
@@ -2004,6 +2020,7 @@ def _render_chart_block(
         x_type=x_type if not is_pie else "nominal",
         stacked=stacked,
         donut=(kind.lower() == "donut"),
+        extra_tooltip_fields=(extra_tooltip_fields if not is_pie else None),
     )
 
     spec_key = f"{key_prefix}_custom_spec"
@@ -2429,6 +2446,12 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
         .sum()
         .sort_values(["YM_dt", "Tätigkeit"])
     )
+    monthly_totals = (
+        x.groupby(["YM_dt", "YM"], as_index=False)["Hours"]
+        .sum()
+        .rename(columns={"Hours": "Total_Hours"})
+    )
+    monthly_long = monthly_long.merge(monthly_totals, on=["YM_dt", "YM"], how="left")
     proj_df = x.groupby("Projekt", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     type_df = x.groupby("Tätigkeit", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     mitarbeiter_df = x.groupby("Mitarbeiter", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
@@ -2445,6 +2468,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
         x_type="temporal",
         stacked_default=True,
         pie_ok=False,
+        extra_tooltip_fields=[{"field": "Total_Hours", "type": "quantitative", "title": "Gesamt", "format": ".2f"}],
     )
 
     cA, cB, cC = st.columns(3)
@@ -2963,7 +2987,10 @@ def main() -> None:
             if report_files:
                 rev_kod_map = _build_reverse_kod_map_eb_to_aufgabe(lookups)
                 is_team_mode = "Team" in import_mode
-                existing_keys = _existing_keys_for_master(team_df if is_team_mode else df, team=is_team_mode)
+                existing_key_counts = _existing_key_counts_for_master(team_df if is_team_mode else df,
+                                                                      team=is_team_mode)
+                matched_existing_counts = Counter()
+                seen_source_rows = set()
 
                 all_records: List[Dict[str, Any]] = []
                 meta_list = []
@@ -3055,13 +3082,23 @@ def main() -> None:
                             k = _key_for_import(rec)
                             if is_team_mode:
                                 key_tuple = (_safe_str(mitarbeiter_name).strip(),) + k
-                                if key_tuple in existing_keys:
+                                if matched_existing_counts[key_tuple] < existing_key_counts[key_tuple]:
+                                    matched_existing_counts[key_tuple] += 1
                                     continue
-                                existing_keys.add(key_tuple)
                             else:
-                                if k in existing_keys:
+                                if matched_existing_counts[k] < existing_key_counts[k]:
+                                    matched_existing_counts[k] += 1
                                     continue
-                                existing_keys.add(k)
+
+                            source_row_key = (
+                                _safe_str(file_name).strip(),
+                                int(row.get("_source_row") or 0),
+                                _safe_str(mitarbeiter_name).strip() if is_team_mode else "",
+                                target_project,
+                            )
+                            if source_row_key in seen_source_rows:
+                                continue
+                            seen_source_rows.add(source_row_key)
 
                             all_records.append(rec)
 
