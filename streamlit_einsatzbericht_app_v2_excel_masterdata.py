@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import datetime as dt
 import math
 import os
@@ -1817,8 +1818,8 @@ def _key_for_import(rec: Dict[str, Any]) -> tuple:
     return (d, projekt, zv, zb, pause, typ, kod, info)
 
 
-def _existing_keys_for_master(df_master: pd.DataFrame, team: bool = False) -> set:
-    keys = set()
+def _existing_key_counts_for_master(df_master: pd.DataFrame, team: bool = False) -> Counter:
+    keys: Counter = Counter()
     if df_master is None or df_master.empty:
         return keys
     for _, r in df_master.iterrows():
@@ -1835,9 +1836,9 @@ def _existing_keys_for_master(df_master: pd.DataFrame, team: bool = False) -> se
         }
         if team:
             key_tuple = (_safe_str(r.get("Mitarbeiter")).strip(),) + _key_for_import(rec)
-            keys.add(key_tuple)
+            keys[key_tuple] += 1
         else:
-            keys.add(_key_for_import(rec))
+            keys[_key_for_import(rec)] += 1
     return keys
 
 
@@ -2971,7 +2972,9 @@ def main() -> None:
             if report_files:
                 rev_kod_map = _build_reverse_kod_map_eb_to_aufgabe(lookups)
                 is_team_mode = "Team" in import_mode
-                existing_keys = _existing_keys_for_master(team_df if is_team_mode else df, team=is_team_mode)
+                existing_key_counts = _existing_key_counts_for_master(team_df if is_team_mode else df,
+                                                                      team=is_team_mode)
+                matched_existing_counts = Counter()
                 seen_source_rows = set()
 
                 all_records: List[Dict[str, Any]] = []
@@ -3064,10 +3067,12 @@ def main() -> None:
                             k = _key_for_import(rec)
                             if is_team_mode:
                                 key_tuple = (_safe_str(mitarbeiter_name).strip(),) + k
-                                if key_tuple in existing_keys:
+                                if matched_existing_counts[key_tuple] < existing_key_counts[key_tuple]:
+                                    matched_existing_counts[key_tuple] += 1
                                     continue
                             else:
-                                if k in existing_keys:
+                                if matched_existing_counts[k] < existing_key_counts[k]:
+                                    matched_existing_counts[k] += 1
                                     continue
 
                             source_row_key = (
