@@ -1833,6 +1833,7 @@ def _existing_key_counts_for_master(df_master: pd.DataFrame, team: bool = False)
             "Tätigkeit": r.get("Tätigkeit"),
             "Kodierung": r.get("Kodierung") or "",
             "Info": r.get("Info") or "",
+            "Zahl": r.get("Zahl"),
         }
         if team:
             key_tuple = (_safe_str(r.get("Mitarbeiter")).strip(),) + _key_for_import(rec)
@@ -1905,6 +1906,7 @@ def _vega_spec_for_chart(
         y_type: str = "quantitative",
         stacked: bool = False,
         donut: bool = False,
+        extra_tooltip_fields: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     kind = (kind or "").lower().strip()
 
@@ -1931,6 +1933,8 @@ def _vega_spec_for_chart(
             {"field": y_field, "type": "quantitative", "format": ".2f"},
         ],
     }
+    if extra_tooltip_fields:
+        enc["tooltip"].extend(extra_tooltip_fields)
 
     if color_field:
         enc["color"] = {"field": color_field, "type": "nominal"}
@@ -1942,6 +1946,8 @@ def _vega_spec_for_chart(
             {"field": color_field, "type": "nominal"},
             {"field": y_field, "type": "quantitative", "format": ".2f"},
         ]
+        if extra_tooltip_fields:
+            enc["tooltip"].extend(extra_tooltip_fields)
 
     mark_type = "bar"
     if kind in {"bar", "stacked bar"}:
@@ -1972,6 +1978,7 @@ def _render_chart_block(
         x_type: str = "ordinal",
         stacked_default: bool = False,
         pie_ok: bool = True,
+        extra_tooltip_fields: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     st.markdown(f"### {title}")
 
@@ -2013,6 +2020,7 @@ def _render_chart_block(
         x_type=x_type if not is_pie else "nominal",
         stacked=stacked,
         donut=(kind.lower() == "donut"),
+        extra_tooltip_fields=(extra_tooltip_fields if not is_pie else None),
     )
 
     spec_key = f"{key_prefix}_custom_spec"
@@ -2438,6 +2446,12 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
         .sum()
         .sort_values(["YM_dt", "Tätigkeit"])
     )
+    monthly_totals = (
+        x.groupby(["YM_dt", "YM"], as_index=False)["Hours"]
+        .sum()
+        .rename(columns={"Hours": "Total_Hours"})
+    )
+    monthly_long = monthly_long.merge(monthly_totals, on=["YM_dt", "YM"], how="left")
     proj_df = x.groupby("Projekt", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     type_df = x.groupby("Tätigkeit", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     mitarbeiter_df = x.groupby("Mitarbeiter", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
@@ -2454,6 +2468,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
         x_type="temporal",
         stacked_default=True,
         pie_ok=False,
+        extra_tooltip_fields=[{"field": "Total_Hours", "type": "quantitative", "title": "Gesamt", "format": ".2f"}],
     )
 
     cA, cB, cC = st.columns(3)
