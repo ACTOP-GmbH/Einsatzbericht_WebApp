@@ -1712,9 +1712,6 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
         ende = _to_time(e)
         text = _safe_str(t).strip()
 
-        if beginn is None and ende is None and not text:
-            continue
-
         zeit_h = None
         if not _is_blank(z_val):
             if isinstance(z_val, (int, float)):
@@ -1726,6 +1723,18 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
                     zeit_h = float(str(z_val).strip().replace(',', '.'))
                 except Exception:
                     zeit_h = None
+
+        kod_eb = _safe_str(ws.cell(r, c_kod).value).strip() if c_kod else ""
+
+        has_manual_content = False
+        if zeit_h is not None:
+            try:
+                has_manual_content = abs(float(zeit_h)) > 1e-9
+            except Exception:
+                has_manual_content = True
+
+        if beginn is None and ende is None and not text and not has_manual_content:
+            continue
 
         pause_min = 0
         if c_pause:
@@ -1756,8 +1765,6 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
         if zeit_h is None and beginn is not None and ende is not None:
             zeit_h = _compute_hours_decimal(beginn, ende, pause_min)
 
-        kod_eb = _safe_str(ws.cell(r, c_kod).value).strip() if c_kod else ""
-
         rows.append({
             "Datum": datum,
             "Beginn": beginn,
@@ -1767,6 +1774,7 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
             "Art": art,
             "Kodierung_EB": kod_eb,
             "Leistungsbeschreibung": text,
+            "_source_row": r,
         })
 
     df_lines = pd.DataFrame(rows)
@@ -2964,6 +2972,7 @@ def main() -> None:
                 rev_kod_map = _build_reverse_kod_map_eb_to_aufgabe(lookups)
                 is_team_mode = "Team" in import_mode
                 existing_keys = _existing_keys_for_master(team_df if is_team_mode else df, team=is_team_mode)
+                seen_source_rows = set()
 
                 all_records: List[Dict[str, Any]] = []
                 meta_list = []
@@ -3057,11 +3066,19 @@ def main() -> None:
                                 key_tuple = (_safe_str(mitarbeiter_name).strip(),) + k
                                 if key_tuple in existing_keys:
                                     continue
-                                existing_keys.add(key_tuple)
                             else:
                                 if k in existing_keys:
                                     continue
-                                existing_keys.add(k)
+
+                            source_row_key = (
+                                _safe_str(file_name).strip(),
+                                int(row.get("_source_row") or 0),
+                                _safe_str(mitarbeiter_name).strip() if is_team_mode else "",
+                                target_project,
+                            )
+                            if source_row_key in seen_source_rows:
+                                continue
+                            seen_source_rows.add(source_row_key)
 
                             all_records.append(rec)
 
