@@ -39,6 +39,12 @@ REPORT_ROWS_PER_PAGE = REPORT_DETAIL_END_ROW - REPORT_DETAIL_START_ROW + 1
 MILESTONES_SHEET = "Meilensteine"
 MILESTONE_COLS = ["Projekt", "Meilenstein", "Datum", "Status", "Fortschritt", "Kommentar"]
 MILESTONE_STATUSES = ["geplant", "in arbeit", "blockiert", "erledigt"]
+USER_RIGHTS_SHEET = "Benutzerrechte"
+PROJECT_ROLES_SHEET = "Projektrollen"
+USER_RIGHTS_COLS = ["Mitarbeiter", "Ansicht"]
+PROJECT_ROLE_COLS = ["Mitarbeiter", "Projekt", "Rolle"]
+VIEW_MODE_EMPLOYEE = "Mitarbeiter"
+VIEW_MODE_CONTROLLER = "Controller"
 
 TAET_COLS = [
     "Datum",
@@ -70,6 +76,8 @@ class WorkbookData:
     team_df: pd.DataFrame
     lookups: Dict[str, Any]
     milestones_df: pd.DataFrame
+    user_rights_df: pd.DataFrame
+    project_roles_df: pd.DataFrame
 
 
 # ------------------------- parsing helpers -------------------------
@@ -938,12 +946,15 @@ def load_workbook_data(path_str: str) -> WorkbookData:
     taetigkeiten_df = _read_taetigkeiten_df(wb)
     team_df = _read_team_df(wb)
     milestones_df = _read_milestones_df(wb)
+    user_rights_df = _read_user_rights_df(wb)
+    project_roles_df = _read_project_roles_df(wb)
     return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, team_df=team_df, lookups=lookups,
-                        milestones_df=milestones_df)
+                        milestones_df=milestones_df, user_rights_df=user_rights_df,
+                        project_roles_df=project_roles_df)
 
 
 @st.cache_data(show_spinner=False)
-def _cached_load_workbook_data(path_str: str, modified_time: float) -> WorkbookData:
+def _cached_load_workbook_data(path_str: str, modified_time: float, refresh_nonce: int) -> WorkbookData:
     return load_workbook_data(path_str)
 
 
@@ -1287,6 +1298,151 @@ def _save_workbook(path: Path, mutator) -> Tuple[bool, str]:
         return True, f"Gespeichert. Backup erstellt: {backup_path.name}"
     except Exception as e:
         return False, f"Fehler beim Speichern: {e}"
+
+
+def _normalize_view_mode(value: Any) -> str:
+    s = _safe_str(value).strip().lower()
+    if s == "controller":
+        return VIEW_MODE_CONTROLLER
+    return VIEW_MODE_EMPLOYEE
+
+
+def _ensure_table_sheet(wb: openpyxl.Workbook, sheet_name: str, headers: List[str]) -> openpyxl.worksheet.worksheet.Worksheet:
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+    else:
+        ws = wb.create_sheet(sheet_name)
+    for idx, header in enumerate(headers, start=1):
+        ws.cell(1, idx).value = header
+    return ws
+
+
+def _rewrite_table_sheet(ws, headers: List[str], rows: List[Dict[str, Any]]) -> None:
+    max_cols = max(len(headers), ws.max_column)
+    for r in range(2, ws.max_row + 1):
+        for c in range(1, max_cols + 1):
+            ws.cell(r, c).value = None
+
+    for idx, header in enumerate(headers, start=1):
+        ws.cell(1, idx).value = header
+
+    row_idx = 2
+    for row in rows:
+        for col_idx, header in enumerate(headers, start=1):
+            value = row.get(header)
+            if isinstance(value, str):
+                value = value.strip()
+            ws.cell(row_idx, col_idx).value = value or None
+        row_idx += 1
+
+
+def _read_user_rights_df(wb: openpyxl.Workbook) -> pd.DataFrame:
+    if USER_RIGHTS_SHEET not in wb.sheetnames:
+        return pd.DataFrame(columns=USER_RIGHTS_COLS)
+
+    ws = wb[USER_RIGHTS_SHEET]
+    rows: List[Dict[str, Any]] = []
+    for r in range(2, ws.max_row + 1):
+        mitarbeiter = _safe_str(ws.cell(r, 1).value).strip()
+        ansicht = _normalize_view_mode(ws.cell(r, 2).value)
+        if not mitarbeiter:
+            continue
+        rows.append({
+            "Mitarbeiter": mitarbeiter,
+            "Ansicht": ansicht,
+        })
+    return pd.DataFrame(rows, columns=USER_RIGHTS_COLS)
+
+
+def _read_project_roles_df(wb: openpyxl.Workbook) -> pd.DataFrame:
+    if PROJECT_ROLES_SHEET not in wb.sheetnames:
+        return pd.DataFrame(columns=PROJECT_ROLE_COLS)
+
+    ws = wb[PROJECT_ROLES_SHEET]
+    rows: List[Dict[str, Any]] = []
+    for r in range(2, ws.max_row + 1):
+        mitarbeiter = _safe_str(ws.cell(r, 1).value).strip()
+        projekt = _safe_str(ws.cell(r, 2).value).strip()
+        rolle = _safe_str(ws.cell(r, 3).value).strip()
+        if not mitarbeiter or not projekt:
+            continue
+        rows.append({
+            "Mitarbeiter": mitarbeiter,
+            "Projekt": projekt,
+            "Rolle": rolle,
+        })
+    return pd.DataFrame(rows, columns=PROJECT_ROLE_COLS)
+
+
+def _collect_known_users(
+        user_rights_df: pd.DataFrame,
+        project_roles_df: pd.DataFrame,
+        team_df: pd.DataFrame,
+        fallback_user: str,
+) -> List[str]:
+    names: List[str] = []
+
+    def _extend_from_df(source_df: pd.DataFrame, column: str) -> None:
+        if source_df is None or source_df.empty or column not in source_df.columns:
+            return
+        for value in source_df[column].dropna().astype(str).tolist():
+            cleaned = value.strip()
+            if cleaned:
+                names.append(cleaned)
+
+    _extend_from_df(user_rights_df, "Mitarbeiter")
+    _extend_from_df(project_roles_df, "Mitarbeiter")
+    _extend_from_df(team_df, "Mitarbeiter")
+
+    explicit_fallback = _safe_str(fallback_user).strip()
+    if explicit_fallback:
+        names.append(explicit_fallback)
+    elif not names:
+        names.append(_safe_str(os.getenv("USERNAME")).strip() or "Ich")
+
+    out: List[str] = []
+    seen = set()
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out
+
+
+def _user_is_controller(user_rights_df: pd.DataFrame, user_name: str) -> bool:
+    if user_rights_df is None or user_rights_df.empty:
+        return True
+    if "Mitarbeiter" not in user_rights_df.columns:
+        return False
+    target = _safe_str(user_name).strip()
+    if not target:
+        return False
+    matches = user_rights_df[user_rights_df["Mitarbeiter"].astype(str).str.strip() == target]
+    if matches.empty:
+        return False
+    ansicht = _normalize_view_mode(matches.iloc[0].get("Ansicht"))
+    return ansicht == VIEW_MODE_CONTROLLER
+
+
+def _assigned_projects_for_user(project_roles_df: pd.DataFrame, user_name: str) -> List[str]:
+    if project_roles_df is None or project_roles_df.empty or "Mitarbeiter" not in project_roles_df.columns:
+        return []
+    target = _safe_str(user_name).strip()
+    if not target:
+        return []
+    matches = project_roles_df[project_roles_df["Mitarbeiter"].astype(str).str.strip() == target]
+    projects = [
+        _safe_str(value).strip()
+        for value in matches.get("Projekt", pd.Series(dtype=str)).dropna().astype(str).tolist()
+        if _safe_str(value).strip()
+    ]
+    return list(dict.fromkeys(projects))
+
+
+def _refresh_after_workbook_change() -> None:
+    st.cache_data.clear()
+    st.session_state["_workbook_refresh_nonce"] = int(st.session_state.get("_workbook_refresh_nonce", 0) or 0) + 1
+    st.rerun()
 
 
 # ------------------------- reporting logic -------------------------
@@ -2052,14 +2208,22 @@ def _render_chart_block(
     )
 
 
-def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups: Dict[str, Any], xlsx_path: Path,
-                               milestones_df: pd.DataFrame) -> None:
-    st.subheader("Visualisierung / Controlling (Inkl. Team-Daten)")
+def _render_visualisierung_tab(
+        df: pd.DataFrame,
+        team_df: pd.DataFrame,
+        lookups: Dict[str, Any],
+        xlsx_path: Path,
+        milestones_df: pd.DataFrame,
+        active_user: str,
+        is_controller: bool,
+        project_roles_df: pd.DataFrame,
+) -> None:
+    st.subheader("Visualisierung / Controlling" if is_controller else "Visualisierung (Eigene Daten)")
 
-    # Combine my data and team data
     my_df = df.copy()
-    my_df["Mitarbeiter"] = "Ich (Eigene)"
-    if not team_df.empty:
+    own_label = _safe_str(active_user).strip() or "Ich"
+    my_df["Mitarbeiter"] = own_label
+    if is_controller and not team_df.empty:
         t_df = team_df.copy()
         t_df["Mitarbeiter"] = t_df["Mitarbeiter"].fillna("Unbekannt")
         combined_df = pd.concat([my_df, t_df], ignore_index=True)
@@ -2074,6 +2238,25 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
     all_projects = sorted([p for p in base["Projekt"].unique().tolist() if p and p != "nan"])
     all_years = sorted(base["Year"].unique().tolist())
     all_mitarbeiter = sorted([m for m in base["Mitarbeiter"].unique().tolist() if m and m != "nan"])
+    assigned_projects = _assigned_projects_for_user(project_roles_df, own_label)
+    own_projects = sorted(
+        [p for p in base[base["Mitarbeiter"] == own_label]["Projekt"].unique().tolist() if p and p != "nan"]
+    )
+
+    if is_controller:
+        project_options = all_projects
+        default_projects: List[str] = []
+        mitarbeiter_options = all_mitarbeiter
+        default_mitarbeiter: List[str] = []
+        project_help = "Leer = alle Projekte."
+        mitarbeiter_help = "Leer = alle Mitarbeiter."
+    else:
+        project_options = [p for p in assigned_projects if p in all_projects] or own_projects or all_projects
+        default_projects = project_options
+        mitarbeiter_options = [own_label] if own_label else []
+        default_mitarbeiter = mitarbeiter_options
+        project_help = "Mitarbeiteransicht: standardmäßig deine zugeordneten Projekte."
+        mitarbeiter_help = "Mitarbeiteransicht: nur dein Profil."
 
     min_y = min(all_years) if all_years else dt.date.today().year
     max_y = max(all_years) if all_years else dt.date.today().year
@@ -2082,9 +2265,10 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
     with c1:
         sel_projects = st.multiselect(
             "Projekte",
-            options=all_projects,
-            default=all_projects[:1] if all_projects else [],
-            help="Mehrere Projekte auswählen, um Vergleich/Portfolio zu sehen."
+            options=project_options,
+            default=default_projects,
+            key=f"viz_projects_{'controller' if is_controller else 'employee'}_{own_label}",
+            help=project_help,
         )
     with c2:
         y_from = st.number_input("Jahr von", min_value=2000, max_value=2100, value=int(min_y), step=1, key="viz_y_from")
@@ -2093,9 +2277,10 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
     with c4:
         sel_mitarbeiter = st.multiselect(
             "Mitarbeiter",
-            options=all_mitarbeiter,
-            default=all_mitarbeiter,
-            help="Welche Personen sollen in die Auswertung/das Budget einfließen?"
+            options=mitarbeiter_options,
+            default=default_mitarbeiter,
+            key=f"viz_mitarbeiter_{'controller' if is_controller else 'employee'}_{own_label}",
+            help=mitarbeiter_help,
         )
         include_abg = st.checkbox("abgerechnete einschließen", value=True, key="viz_include_abg")
         include_internal = st.checkbox("interne Tätigkeiten (I) einschließen", value=True, key="viz_include_internal")
@@ -2172,43 +2357,48 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
         if overall > 0:
             st.progress(min(max(overall / 100.0, 0.0), 1.0))
 
-        st.markdown("### Meilensteine pflegen")
-        st.caption("Die Tabelle wird im Excel-Sheet **'Meilensteine'** gespeichert.")
+        edited_ms = None
+        if is_controller:
+            st.markdown("### Meilensteine pflegen")
+            st.caption("Die Tabelle wird im Excel-Sheet **'Meilensteine'** gespeichert.")
 
-        editor_cols = ["_excel_row", "Datum", "Meilenstein", "Status", "Fortschritt", "Kommentar", "Löschen"]
-        ed = ms_proj.copy()
+            editor_cols = ["_excel_row", "Datum", "Meilenstein", "Status", "Fortschritt", "Kommentar", "Löschen"]
+            ed = ms_proj.copy()
 
-        for c in ["Datum", "Meilenstein", "Status", "Fortschritt", "Kommentar", "_excel_row"]:
-            if c not in ed.columns:
-                ed[c] = None
+            for c in ["Datum", "Meilenstein", "Status", "Fortschritt", "Kommentar", "_excel_row"]:
+                if c not in ed.columns:
+                    ed[c] = None
 
-        ed["Status"] = ed["Status"].apply(_normalize_milestone_status)
-        ed["Fortschritt"] = ed["Fortschritt"].apply(lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0))))
-        ed["Löschen"] = False
+            ed["Status"] = ed["Status"].apply(_normalize_milestone_status)
+            ed["Fortschritt"] = ed["Fortschritt"].apply(
+                lambda v: max(0.0, min(100.0, float(_to_float_or_none(v) or 0.0))))
+            ed["Löschen"] = False
 
-        data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
+            data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
 
-        edited_ms = data_editor_fn(
-            ed[editor_cols],
-            key=f"milestones_editor_{proj}",
-            use_container_width=True,
-            height=320,
-            num_rows="dynamic",
-            hide_index=True,
-            disabled=["_excel_row"],
-            column_config={
-                "_excel_row": st.column_config.NumberColumn("Excel-Zeile", help="Technische ID (nicht ändern)"),
-                "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
-                "Meilenstein": st.column_config.TextColumn("Meilenstein", width="large"),
-                "Status": st.column_config.SelectboxColumn("Status", options=MILESTONE_STATUSES),
-                "Fortschritt": st.column_config.NumberColumn("Fortschritt (%)", min_value=0.0, max_value=100.0,
-                                                             step=5.0),
-                "Kommentar": st.column_config.TextColumn("Kommentar", width="large"),
-                "Löschen": st.column_config.CheckboxColumn("Löschen"),
-            },
-        )
+            edited_ms = data_editor_fn(
+                ed[editor_cols],
+                key=f"milestones_editor_{proj}",
+                use_container_width=True,
+                height=320,
+                num_rows="dynamic",
+                hide_index=True,
+                disabled=["_excel_row"],
+                column_config={
+                    "_excel_row": st.column_config.NumberColumn("Excel-Zeile", help="Technische ID (nicht ändern)"),
+                    "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
+                    "Meilenstein": st.column_config.TextColumn("Meilenstein", width="large"),
+                    "Status": st.column_config.SelectboxColumn("Status", options=MILESTONE_STATUSES),
+                    "Fortschritt": st.column_config.NumberColumn("Fortschritt (%)", min_value=0.0, max_value=100.0,
+                                                                 step=5.0),
+                    "Kommentar": st.column_config.TextColumn("Kommentar", width="large"),
+                    "Löschen": st.column_config.CheckboxColumn("Löschen"),
+                },
+            )
+        else:
+            st.caption("Meilensteine sind nur im Controller-Modus bearbeitbar.")
 
-        if st.button("Meilensteine speichern", key=f"save_milestones_{proj}"):
+        if is_controller and edited_ms is not None and st.button("Meilensteine speichern", key=f"save_milestones_{proj}"):
             orig_by_row: Dict[int, Dict[str, Any]] = {}
             original_excel_rows = set()
             for _, r in ed.iterrows():
@@ -2296,8 +2486,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
             if ok:
                 st.success(
                     f"Meilensteine gespeichert. Updates: {len(updates)}, Neu: {len(inserts)}, Gelöscht: {len(deletes)}. {msg}")
-                st.cache_data.clear()
-                st.rerun()
+                _refresh_after_workbook_change()
             else:
                 st.error(msg)
 
@@ -2363,7 +2552,7 @@ def _render_visualisierung_tab(df: pd.DataFrame, team_df: pd.DataFrame, lookups:
     rates = st.session_state.setdefault("viz_rates_by_project", {})
 
     st.markdown("### Budget / Stundensätze (optional)")
-    st.caption("Alle gewählten Mitarbeiter (siehe Filter oben) fließen kumuliert in diesen Budgetverbrauch mit ein.")
+    st.caption("Leer gelassene Projekt-/Mitarbeiterfilter bedeuten: alle passenden Daten der aktuellen Ansicht.")
 
     def _get_rate_map(p: str) -> Dict[str, float]:
         rm = rates.get(p) or {}
@@ -2602,8 +2791,7 @@ def main() -> None:
                     imported_path = _store_uploaded_excel(uploaded_excel)
                     st.session_state["_pending_import_excel_path"] = str(imported_path)
                     st.session_state["excel_path"] = str(imported_path)
-                    st.cache_data.clear()
-                    st.rerun()
+                    _refresh_after_workbook_change()
                 except Exception as e:
                     st.error(f"Import fehlgeschlagen: {e}")
         st.session_state["excel_path"] = excel_path
@@ -2616,12 +2804,14 @@ def main() -> None:
 
     if reload_clicked:
         st.cache_data.clear()
+        st.session_state["_workbook_refresh_nonce"] = int(st.session_state.get("_workbook_refresh_nonce", 0) or 0) + 1
 
     try:
         resolved_path = _resolve_excel_path(excel_path)
         if resolved_path.exists():
             mtime = resolved_path.stat().st_mtime
-            data = _cached_load_workbook_data(str(resolved_path), mtime)
+            refresh_nonce = int(st.session_state.get("_workbook_refresh_nonce", 0) or 0)
+            data = _cached_load_workbook_data(str(resolved_path), mtime, refresh_nonce)
         else:
             data = load_workbook_data(excel_path)  # triggers FileNotFoundError cleanly
     except Exception as e:
@@ -2631,6 +2821,39 @@ def main() -> None:
     df = data.taetigkeiten_df.copy()
     team_df = data.team_df.copy()
     lookups = data.lookups
+    user_rights_df = data.user_rights_df.copy()
+    project_roles_df = data.project_roles_df.copy()
+
+    known_users = _collect_known_users(
+        user_rights_df=user_rights_df,
+        project_roles_df=project_roles_df,
+        team_df=team_df,
+        fallback_user=_safe_str(st.session_state.get("active_user_name", "")),
+    )
+    remembered_user = _safe_str(st.session_state.get("active_user_name", "")).strip()
+    default_user = remembered_user if remembered_user in known_users else (known_users[0] if known_users else "Ich")
+
+    with st.sidebar:
+        st.header("Ansicht")
+        active_user = st.selectbox(
+            "Aktiver Benutzer",
+            options=known_users,
+            index=(known_users.index(default_user) if default_user in known_users else 0),
+            key="active_user_name",
+            help="Steuert Standardfilter und Sichtbarkeit im Controller-/Mitarbeitermodus.",
+        )
+        can_use_controller = _user_is_controller(user_rights_df, active_user)
+        if can_use_controller:
+            view_mode = st.radio(
+                "Ansichtsmodus",
+                options=[VIEW_MODE_EMPLOYEE, VIEW_MODE_CONTROLLER],
+                index=1,
+                key="active_view_mode",
+            )
+        else:
+            view_mode = VIEW_MODE_EMPLOYEE
+            st.caption("Ansichtsmodus: Mitarbeiter")
+        is_controller_view = view_mode == VIEW_MODE_CONTROLLER
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["Tätigkeiten", "Einsatzbericht", "Stammdaten / Debug", "Visualisierung", "Team-Daten"])
@@ -2864,8 +3087,7 @@ def main() -> None:
                     st.success(
                         f"Gespeichert. Updates: {len(updates)}, Neu: {len(inserts)}, Gelöscht: {len(deletes)}. {msg}"
                     )
-                    st.cache_data.clear()
-                    st.rerun()
+                    _refresh_after_workbook_change()
                 else:
                     st.error(msg)
 
@@ -2893,8 +3115,7 @@ def main() -> None:
                 ok, msg = _save_workbook(data.path, _mutator_add)
                 if ok:
                     st.success(msg)
-                    st.cache_data.clear()
-                    st.rerun()
+                    _refresh_after_workbook_change()
                 else:
                     st.error(msg)
 
@@ -2923,8 +3144,7 @@ def main() -> None:
                     ok, msg = _save_workbook(data.path, _mutator_edit)
                     if ok:
                         st.success(f"Zeile {row_excel} aktualisiert. {msg}")
-                        st.cache_data.clear()
-                        st.rerun()
+                        _refresh_after_workbook_change()
                     else:
                         st.error(msg)
                 if delete_row:
@@ -2935,8 +3155,7 @@ def main() -> None:
                     ok, msg = _save_workbook(data.path, _mutator_delete)
                     if ok:
                         st.success(f"Zeile {row_excel} geleert. {msg}")
-                        st.cache_data.clear()
-                        st.rerun()
+                        _refresh_after_workbook_change()
                     else:
                         st.error(msg)
 
@@ -2954,8 +3173,7 @@ def main() -> None:
                 ok, msg = _save_workbook(data.path, _mutator_mark)
                 if ok:
                     st.success(f"{len(rows_to_mark)} Einträge markiert. {msg}")
-                    st.cache_data.clear()
-                    st.rerun()
+                    _refresh_after_workbook_change()
                 else:
                     st.error(msg)
         else:
@@ -3147,8 +3365,7 @@ def main() -> None:
                         ok, msg = _save_workbook(data.path, _mutator_import_reports)
                         if ok:
                             st.success(f"Import OK: {len(all_records)} Zeilen übernommen. {msg}")
-                            st.cache_data.clear()
-                            st.rerun()
+                            _refresh_after_workbook_change()
                         else:
                             st.error(msg)
 
@@ -3333,8 +3550,7 @@ def main() -> None:
                     ok, msg = _save_workbook(data.path, _mutator_mark_report)
                     if ok:
                         st.success(f"{len(rows_to_mark)} Einträge markiert. {msg}")
-                        st.cache_data.clear()
-                        st.rerun()
+                        _refresh_after_workbook_change()
                     else:
                         st.error(msg)
 
@@ -3373,8 +3589,7 @@ def main() -> None:
                 ok, msg = _save_workbook(data.path, _mutator_relevante)
                 if ok:
                     st.success(msg)
-                    st.cache_data.clear()
-                    st.rerun()
+                    _refresh_after_workbook_change()
                 else:
                     st.error(msg)
         else:
@@ -3452,8 +3667,7 @@ def main() -> None:
             ok, msg = _save_workbook(data.path, _mutator_proj)
             if ok:
                 st.success(msg)
-                st.cache_data.clear()
-                st.rerun()
+                _refresh_after_workbook_change()
             else:
                 st.error(msg)
 
@@ -3466,15 +3680,149 @@ def main() -> None:
             km_df = pd.DataFrame([{"Aufgabe": k, "Kodierung EB": v} for k, v in km.items()])
             st.dataframe(km_df, use_container_width=True, height=300)
 
+        st.markdown("---")
+        st.markdown("### Benutzer / Projektrollen")
+        if is_controller_view:
+            controller_data_editor = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
+
+            rights_editor_df = user_rights_df.copy()
+            if rights_editor_df.empty:
+                rights_editor_df = pd.DataFrame(columns=USER_RIGHTS_COLS)
+            for c in USER_RIGHTS_COLS:
+                if c not in rights_editor_df.columns:
+                    rights_editor_df[c] = ""
+            rights_editor_df["Löschen"] = False
+
+            edited_rights_df = controller_data_editor(
+                rights_editor_df[USER_RIGHTS_COLS + ["Löschen"]],
+                key="user_rights_editor",
+                use_container_width=True,
+                height=240,
+                num_rows="dynamic",
+                hide_index=True,
+                column_config={
+                    "Mitarbeiter": st.column_config.TextColumn("Mitarbeiter", width="medium"),
+                    "Ansicht": st.column_config.SelectboxColumn(
+                        "Ansicht",
+                        options=[VIEW_MODE_EMPLOYEE, VIEW_MODE_CONTROLLER],
+                    ),
+                    "Löschen": st.column_config.CheckboxColumn("Löschen"),
+                },
+            )
+
+            if st.button("Benutzerrechte speichern", key="save_user_rights"):
+                rights_rows: List[Dict[str, Any]] = []
+                seen_users = set()
+                for _, r in edited_rights_df.iterrows():
+                    if bool(r.get("Löschen", False)):
+                        continue
+                    mitarbeiter = _safe_str(r.get("Mitarbeiter")).strip()
+                    if not mitarbeiter or mitarbeiter in seen_users:
+                        continue
+                    seen_users.add(mitarbeiter)
+                    rights_rows.append({
+                        "Mitarbeiter": mitarbeiter,
+                        "Ansicht": _normalize_view_mode(r.get("Ansicht")),
+                    })
+
+                if rights_rows and not any(r["Ansicht"] == VIEW_MODE_CONTROLLER for r in rights_rows):
+                    st.error("Mindestens ein Benutzer muss im Controller-Modus bleiben.")
+                else:
+                    def _mutator_user_rights(wb):
+                        ws = _ensure_table_sheet(wb, USER_RIGHTS_SHEET, USER_RIGHTS_COLS)
+                        _rewrite_table_sheet(ws, USER_RIGHTS_COLS, rights_rows)
+
+                    ok, msg = _save_workbook(data.path, _mutator_user_rights)
+                    if ok:
+                        st.success(f"Benutzerrechte gespeichert. {msg}")
+                        _refresh_after_workbook_change()
+                    else:
+                        st.error(msg)
+
+            st.markdown("#### Projektzuordnung / Rolle")
+            role_editor_df = project_roles_df.copy()
+            if role_editor_df.empty:
+                role_editor_df = pd.DataFrame(columns=PROJECT_ROLE_COLS)
+            for c in PROJECT_ROLE_COLS:
+                if c not in role_editor_df.columns:
+                    role_editor_df[c] = ""
+            role_editor_df["Löschen"] = False
+
+            role_project_options = sorted(list(dict.fromkeys(
+                [p for p in (lookups.get("projekte") or []) if p] +
+                [p for p in role_editor_df.get("Projekt", pd.Series(dtype=str)).dropna().astype(str).tolist() if p]
+            )))
+
+            edited_roles_df = controller_data_editor(
+                role_editor_df[PROJECT_ROLE_COLS + ["Löschen"]],
+                key="project_roles_editor",
+                use_container_width=True,
+                height=280,
+                num_rows="dynamic",
+                hide_index=True,
+                column_config={
+                    "Mitarbeiter": st.column_config.TextColumn("Mitarbeiter", width="medium"),
+                    "Projekt": st.column_config.SelectboxColumn("Projekt", options=role_project_options or [""]),
+                    "Rolle": st.column_config.TextColumn("Rolle", width="medium"),
+                    "Löschen": st.column_config.CheckboxColumn("Löschen"),
+                },
+            )
+
+            if st.button("Projektrollen speichern", key="save_project_roles"):
+                role_rows: List[Dict[str, Any]] = []
+                seen_roles = set()
+                for _, r in edited_roles_df.iterrows():
+                    if bool(r.get("Löschen", False)):
+                        continue
+                    mitarbeiter = _safe_str(r.get("Mitarbeiter")).strip()
+                    projekt = _safe_str(r.get("Projekt")).strip()
+                    rolle = _safe_str(r.get("Rolle")).strip()
+                    dedupe_key = (mitarbeiter, projekt, rolle)
+                    if not mitarbeiter or not projekt or dedupe_key in seen_roles:
+                        continue
+                    seen_roles.add(dedupe_key)
+                    role_rows.append({
+                        "Mitarbeiter": mitarbeiter,
+                        "Projekt": projekt,
+                        "Rolle": rolle,
+                    })
+
+                def _mutator_project_roles(wb):
+                    ws = _ensure_table_sheet(wb, PROJECT_ROLES_SHEET, PROJECT_ROLE_COLS)
+                    _rewrite_table_sheet(ws, PROJECT_ROLE_COLS, role_rows)
+
+                ok, msg = _save_workbook(data.path, _mutator_project_roles)
+                if ok:
+                    st.success(f"Projektrollen gespeichert. {msg}")
+                    _refresh_after_workbook_change()
+                else:
+                    st.error(msg)
+        else:
+            st.info("Benutzerrechte und Projektrollen sind nur im Controller-Modus bearbeitbar.")
+
     with tab4:
-        _render_visualisierung_tab(df, team_df, lookups, data.path, data.milestones_df)
+        _render_visualisierung_tab(
+            df,
+            team_df,
+            lookups,
+            data.path,
+            data.milestones_df,
+            active_user=active_user,
+            is_controller=is_controller_view,
+            project_roles_df=project_roles_df,
+        )
 
     with tab5:
         st.subheader("Team-Tätigkeiten (Fremddaten)")
-        st.write(
-            "Diese Daten stammen aus dem Import von Einsatzberichten anderer Mitarbeiter (Modus: 'In Team-Tätigkeiten'). Sie werden für das Budget-Controlling genutzt, aber von deinem eigenen Einsatzbericht (Tab: 'Einsatzbericht') völlig ignoriert.")
+        if not is_controller_view:
+            st.info("Team-Daten sind nur im Controller-Modus sichtbar.")
+        else:
+            st.write(
+                "Diese Daten stammen aus dem Import von Einsatzberichten anderer Mitarbeiter (Modus: 'In Team-Tätigkeiten'). Sie werden für das Budget-Controlling genutzt, aber von deinem eigenen Einsatzbericht (Tab: 'Einsatzbericht') völlig ignoriert.")
 
-        if team_df.empty:
+        if not is_controller_view:
+            pass
+        elif team_df.empty:
             st.info("Noch keine Team-Daten vorhanden.")
         else:
             show_cols = ["_excel_row", "Mitarbeiter", "Datum", "Projekt", "Zeit von", "Zeit bis", "Pause_Min", "Zahl",
@@ -3505,8 +3853,7 @@ def main() -> None:
                     ok, msg = _save_workbook(data.path, _clear_all_team)
                     if ok:
                         st.success("Tabelle 'Team_Tätigkeiten' wurde erfolgreich geleert.")
-                        st.cache_data.clear()
-                        st.rerun()
+                        _refresh_after_workbook_change()
                     else:
                         st.error(f"Fehler beim Löschen: {msg}")
 
