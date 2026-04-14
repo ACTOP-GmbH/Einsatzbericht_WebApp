@@ -2847,7 +2847,7 @@ def main() -> None:
             view_mode = st.radio(
                 "Ansichtsmodus",
                 options=[VIEW_MODE_EMPLOYEE, VIEW_MODE_CONTROLLER],
-                index=1,
+                index=0,
                 key="active_view_mode",
             )
         else:
