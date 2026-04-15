@@ -4,7 +4,6 @@ from collections import Counter
 import datetime as dt
 import math
 import os
-import shutil
 import sys
 import subprocess
 import tempfile
@@ -45,6 +44,9 @@ USER_RIGHTS_COLS = ["Mitarbeiter", "Ansicht"]
 PROJECT_ROLE_COLS = ["Mitarbeiter", "Projekt", "Rolle"]
 VIEW_MODE_EMPLOYEE = "Mitarbeiter"
 VIEW_MODE_CONTROLLER = "Controller"
+PROJECT_USES_CODING_COL = 15
+PROJECT_USES_CODING_HEADER = "Kodierung verwenden"
+DEFAULT_PROJECT_USES_CODING = "ja"
 
 TAET_COLS = [
     "Datum",
@@ -259,6 +261,8 @@ def _load_lookups(wb: openpyxl.Workbook) -> Dict[str, Any]:
             "Ansprechpartner": h.cell(r, 11).value,
             "Projektadresse Standard": h.cell(r, 12).value,
             "Projektadresse Alternativ": h.cell(r, 13).value,
+            "Kodierung verwenden": _normalize_yes_no(h.cell(r, PROJECT_USES_CODING_COL).value)
+            or DEFAULT_PROJECT_USES_CODING,
         }
     lookups["projekt_infos"] = projekt_infos
 
@@ -449,6 +453,20 @@ def _resolve_excel_path(path_str: str) -> Path:
         if c.exists():
             return c.resolve()
     return (Path(__file__).resolve().parent / "data" / "Tätigkeiten_Überblick.xlsx").resolve()
+
+
+def _is_valid_app_workbook(path: Path) -> bool:
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return False
+    try:
+        return {HILFS_SHEET, TAETIGKEITEN_SHEET}.issubset(set(wb.sheetnames))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
 
 
 def _store_uploaded_excel(uploaded_file) -> Path:
@@ -943,8 +961,8 @@ def load_workbook_data(path_str: str) -> WorkbookData:
         raise FileNotFoundError(f"Datei nicht gefunden: {path}")
     wb = openpyxl.load_workbook(path)
     lookups = _load_lookups(wb)
-    taetigkeiten_df = _read_taetigkeiten_df(wb)
-    team_df = _read_team_df(wb)
+    taetigkeiten_df = _apply_project_coding_policy(_read_taetigkeiten_df(wb), lookups)
+    team_df = _apply_project_coding_policy(_read_team_df(wb), lookups)
     milestones_df = _read_milestones_df(wb)
     user_rights_df = _read_user_rights_df(wb)
     project_roles_df = _read_project_roles_df(wb)
@@ -1245,6 +1263,10 @@ def _upsert_project_stammdaten(
     ws.cell(row_idx, 12).value = _safe_str(project_data.get("Projektadresse Standard")).strip() or None
     ws.cell(row_idx, 13).value = _safe_str(project_data.get("Projektadresse Alternativ")).strip() or None
     ws.cell(row_idx, 14).value = f'=H{row_idx}&","&" "&I{row_idx}&","&" "&J{row_idx}'
+    ws.cell(1, PROJECT_USES_CODING_COL).value = PROJECT_USES_CODING_HEADER
+    ws.cell(row_idx, PROJECT_USES_CODING_COL).value = (
+        _normalize_yes_no(project_data.get("Kodierung verwenden")) or DEFAULT_PROJECT_USES_CODING
+    )
 
     renamed_count = 0
     if rename_taetigkeiten and orig and orig != new_project and TAETIGKEITEN_SHEET in wb.sheetnames:
@@ -1283,10 +1305,8 @@ def _set_relevante_kodierungen(wb: openpyxl.Workbook, selected_aufgaben: List[st
 
 
 def _save_workbook(path: Path, mutator) -> Tuple[bool, str]:
+    wb: Optional[openpyxl.Workbook] = None
     try:
-        backup_path = path.with_suffix(path.suffix + f".bak-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}")
-        shutil.copy2(path, backup_path)
-
         wb = openpyxl.load_workbook(path)
         try:
             if hasattr(wb, "calculation") and wb.calculation is not None:
@@ -1295,9 +1315,15 @@ def _save_workbook(path: Path, mutator) -> Tuple[bool, str]:
             pass
         mutator(wb)
         wb.save(path)
-        return True, f"Gespeichert. Backup erstellt: {backup_path.name}"
+        return True, "Gespeichert."
     except Exception as e:
         return False, f"Fehler beim Speichern: {e}"
+    finally:
+        if wb is not None:
+            try:
+                wb.close()
+            except Exception:
+                pass
 
 
 def _normalize_view_mode(value: Any) -> str:
@@ -1439,6 +1465,24 @@ def _assigned_projects_for_user(project_roles_df: pd.DataFrame, user_name: str) 
     return list(dict.fromkeys(projects))
 
 
+def _project_uses_coding(lookups: Dict[str, Any], project_name: Any) -> bool:
+    project = _safe_str(project_name).strip()
+    if not project:
+        return True
+    info = (lookups.get("projekt_infos", {}) or {}).get(project, {})
+    return _normalize_yes_no(info.get("Kodierung verwenden")) != "nein"
+
+
+def _apply_project_coding_policy(df: pd.DataFrame, lookups: Dict[str, Any]) -> pd.DataFrame:
+    if df is None or df.empty or "Projekt" not in df.columns or "Kodierung" not in df.columns:
+        return df
+    x = df.copy()
+    no_coding_mask = x["Projekt"].apply(lambda value: not _project_uses_coding(lookups, value))
+    if bool(no_coding_mask.any()):
+        x.loc[no_coding_mask, "Kodierung"] = ""
+    return x
+
+
 def _refresh_after_workbook_change() -> None:
     st.cache_data.clear()
     st.session_state["_workbook_refresh_nonce"] = int(st.session_state.get("_workbook_refresh_nonce", 0) or 0) + 1
@@ -1465,6 +1509,8 @@ def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: i
         x = x[x["Abgerechnet"].fillna("").astype(str).str.strip().str.lower() != "ja"]
 
     x = x.copy()
+    if not _project_uses_coding(lookups, project):
+        x["Kodierung"] = ""
     x["Kodierung EB"] = x["Kodierung"].map(lookups.get("kodierung_map_eb", {}))
     x["Datum"] = x["Datum"].apply(_format_date)
     x["Beginn"] = x["Zeit von"].apply(_format_time)
@@ -1518,7 +1564,7 @@ def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Opti
     typen = list(dict.fromkeys([*(lookups.get("taetigkeit_typen") or []), _safe_str(defaults.get("Tätigkeit"))]))
     ja_nein = list(dict.fromkeys([*(lookups.get("ja_nein") or ["ja", "nein"]), _safe_str(defaults.get("Abgerechnet")),
                                   _safe_str(defaults.get("eingetragen"))]))
-    kod_options = list(
+    all_kod_options = list(
         dict.fromkeys(
             [""]
             + (lookups.get("relevante_kodierungen") or [])
@@ -1550,6 +1596,7 @@ def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Opti
                 defaults.get("Projekt")) in projekte else 0),
             key=f"{prefix}_projekt",
         )
+        uses_coding = _project_uses_coding(lookups, projekt)
     with col2:
         zeit_von = st.time_input("Zeit von", value=zv_default, key=f"{prefix}_zv")
         zeit_bis = st.time_input("Zeit bis", value=zb_default, key=f"{prefix}_zb")
@@ -1565,12 +1612,20 @@ def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Opti
                 defaults.get("Tätigkeit")) in typen else 0),
             key=f"{prefix}_typ",
         )
+        kod_key = f"{prefix}_kod"
+        if not uses_coding:
+            st.session_state[kod_key] = ""
+        elif kod_key in st.session_state and _safe_str(st.session_state.get(kod_key)).strip() not in all_kod_options:
+            st.session_state[kod_key] = ""
+        kod_options = all_kod_options if uses_coding else [""]
         kodierung = st.selectbox(
             "Kodierung (Aufgabe)",
             options=kod_options,
-            index=(kod_options.index(_safe_str(defaults.get("Kodierung"))) if _safe_str(
+            index=(kod_options.index(_safe_str(defaults.get("Kodierung"))) if uses_coding and _safe_str(
                 defaults.get("Kodierung")) in kod_options else 0),
-            key=f"{prefix}_kod",
+            key=kod_key,
+            disabled=(not uses_coding),
+            help="Wird automatisch deaktiviert, wenn das gewaehlte Projekt keine Kodierung verwendet.",
         )
 
     col5, col6, col7 = st.columns([2, 1, 1])
@@ -1617,7 +1672,7 @@ def _render_taetigkeit_form(prefix: str, lookups: Dict[str, Any], defaults: Opti
         "Pause_Min": int(pause_min),
         "km": int(km),
         "Tätigkeit": taet_typ,
-        "Kodierung": kodierung,
+        "Kodierung": (kodierung if uses_coding else ""),
         "Interne Projekte": interne,
         "Info": info,
         "Abgerechnet": abgerechnet,
@@ -2745,13 +2800,13 @@ def main() -> None:
     if remembered_path:
         try:
             remembered_resolved = _resolve_excel_path(remembered_path)
-            if remembered_resolved.exists():
+            if remembered_resolved.exists() and _is_valid_app_workbook(remembered_resolved):
                 default_path = remembered_path
         except Exception:
             default_path = ""
     if not default_path:
         for cand in _default_excel_candidates():
-            if cand.exists():
+            if cand.exists() and _is_valid_app_workbook(cand):
                 try:
                     script_dir = Path(__file__).resolve().parent
                     default_path = str(cand.resolve().relative_to(script_dir))
@@ -2768,7 +2823,7 @@ def main() -> None:
     if _safe_str(st.session_state.get("excel_path_input", "")).strip():
         try:
             _tmp_vis = _resolve_excel_path(_safe_str(st.session_state.get("excel_path_input", "")).strip())
-            if not _tmp_vis.exists():
+            if not _tmp_vis.exists() or not _is_valid_app_workbook(_tmp_vis):
                 st.session_state["excel_path_input"] = default_path
         except Exception:
             st.session_state["excel_path_input"] = default_path
@@ -2887,10 +2942,13 @@ def main() -> None:
         kod_opts = list(dict.fromkeys(
             [""] + (lookups.get("relevante_kodierungen") or []) + (lookups.get("kodierung_aufgaben") or [])
         ))
+        if f_project and not _project_uses_coding(lookups, f_project):
+            kod_opts = [""]
 
         interne_opts = list(dict.fromkeys([""] + (lookups.get("interne_projekte") or [])))
 
         filtered = _filtered_taetigkeiten(df, int(f_year), int(f_month), f_project, include_abgerechnet=f_include_abg)
+        st.caption("Bei Projekten mit 'Kodierung verwenden = nein' wird Kodierung automatisch leer gespeichert.")
         st.markdown("### Tätigkeiten (Inline bearbeiten)")
 
         if filtered.empty:
@@ -2915,6 +2973,12 @@ def main() -> None:
             ]
 
             editor_df = filtered.copy()
+            if "Kodierung" in editor_df.columns:
+                editor_df["Kodierung"] = editor_df.apply(
+                    lambda row: "" if not _project_uses_coding(lookups, row.get("Projekt")) else _safe_str(
+                        row.get("Kodierung")).strip(),
+                    axis=1,
+                )
 
             for c in editor_cols:
                 if c not in editor_df.columns:
@@ -3003,7 +3067,11 @@ def main() -> None:
                     "Zahl": r.get("Zahl"),
                     "km": km_val,
                     "Tätigkeit": _safe_str(r.get("Tätigkeit")).strip(),
-                    "Kodierung": _safe_str(r.get("Kodierung")).strip(),
+                    "Kodierung": (
+                        _safe_str(r.get("Kodierung")).strip()
+                        if _project_uses_coding(lookups, r.get("Projekt"))
+                        else ""
+                    ),
                     "Interne Projekte": _safe_str(r.get("Interne Projekte")).strip(),
                     "Info": _safe_str(r.get("Info")),
                     "Abgerechnet": _normalize_yes_no(r.get("Abgerechnet")) or _safe_str(r.get("Abgerechnet")).strip(),
@@ -3287,7 +3355,7 @@ def main() -> None:
                                 "Pause_Min": pause_min,
                                 "km": int(default_km),
                                 "Tätigkeit": art,
-                                "Kodierung": aufgabe or "",
+                                "Kodierung": (aufgabe or "") if _project_uses_coding(lookups, target_project) else "",
                                 "Interne Projekte": "",
                                 "Info": info,
                                 "Abgerechnet": "nein" if set_abgerechnet else "",
@@ -3615,6 +3683,7 @@ def main() -> None:
                 "Ansprechpartner": "",
                 "Projektadresse Standard": "",
                 "Projektadresse Alternativ": "",
+                "Kodierung verwenden": DEFAULT_PROJECT_USES_CODING,
             }
             original_project_name = ""
         else:
@@ -3634,6 +3703,12 @@ def main() -> None:
                 p_ort = st.text_input("Ort", value=_safe_str(proj_defaults.get("Ort")))
                 p_addr_alt = st.text_input("Projektadresse Alternativ",
                                            value=_safe_str(proj_defaults.get("Projektadresse Alternativ")))
+                p_uses_coding = st.selectbox(
+                    "Kodierung verwenden",
+                    options=["ja", "nein"],
+                    index=(0 if _normalize_yes_no(
+                        proj_defaults.get("Kodierung verwenden")) != "nein" else 1),
+                )
                 rename_taet = st.checkbox(
                     "Bei Projekt-Umbenennung auch Tätigkeiten aktualisieren",
                     value=False,
@@ -3652,6 +3727,7 @@ def main() -> None:
                 "Ansprechpartner": p_ansp,
                 "Projektadresse Standard": p_addr_std,
                 "Projektadresse Alternativ": p_addr_alt,
+                "Kodierung verwenden": p_uses_coding,
             }
 
             def _mutator_proj(wb):
