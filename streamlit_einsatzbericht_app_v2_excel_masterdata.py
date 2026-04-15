@@ -455,6 +455,20 @@ def _resolve_excel_path(path_str: str) -> Path:
     return (Path(__file__).resolve().parent / "data" / "Tätigkeiten_Überblick.xlsx").resolve()
 
 
+def _is_valid_app_workbook(path: Path) -> bool:
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception:
+        return False
+    try:
+        return {HILFS_SHEET, TAETIGKEITEN_SHEET}.issubset(set(wb.sheetnames))
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
 def _store_uploaded_excel(uploaded_file) -> Path:
     if uploaded_file is None:
         raise ValueError("Keine Datei hochgeladen.")
@@ -2786,13 +2800,13 @@ def main() -> None:
     if remembered_path:
         try:
             remembered_resolved = _resolve_excel_path(remembered_path)
-            if remembered_resolved.exists():
+            if remembered_resolved.exists() and _is_valid_app_workbook(remembered_resolved):
                 default_path = remembered_path
         except Exception:
             default_path = ""
     if not default_path:
         for cand in _default_excel_candidates():
-            if cand.exists():
+            if cand.exists() and _is_valid_app_workbook(cand):
                 try:
                     script_dir = Path(__file__).resolve().parent
                     default_path = str(cand.resolve().relative_to(script_dir))
@@ -2809,7 +2823,7 @@ def main() -> None:
     if _safe_str(st.session_state.get("excel_path_input", "")).strip():
         try:
             _tmp_vis = _resolve_excel_path(_safe_str(st.session_state.get("excel_path_input", "")).strip())
-            if not _tmp_vis.exists():
+            if not _tmp_vis.exists() or not _is_valid_app_workbook(_tmp_vis):
                 st.session_state["excel_path_input"] = default_path
         except Exception:
             st.session_state["excel_path_input"] = default_path
