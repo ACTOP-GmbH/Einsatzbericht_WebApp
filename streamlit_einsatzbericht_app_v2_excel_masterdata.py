@@ -2307,14 +2307,18 @@ def _render_visualisierung_tab(
         mitarbeiter_help = "Leer = alle Mitarbeiter."
     else:
         project_options = [p for p in assigned_projects if p in all_projects] or own_projects or all_projects
-        default_projects = project_options
+        default_projects = []
         mitarbeiter_options = [own_label] if own_label else []
         default_mitarbeiter = mitarbeiter_options
         project_help = "Mitarbeiteransicht: standardmäßig deine zugeordneten Projekte."
         mitarbeiter_help = "Mitarbeiteransicht: nur dein Profil."
+        project_help = "Mitarbeiteransicht: leer = alle in deiner Ansicht verfuegbaren Projekte."
 
     min_y = min(all_years) if all_years else dt.date.today().year
     max_y = max(all_years) if all_years else dt.date.today().year
+    project_select_key = f"viz_projects_v2_{'controller' if is_controller else 'employee'}_{own_label}"
+    if project_select_key not in st.session_state:
+        st.session_state[project_select_key] = default_projects
 
     c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
     with c1:
@@ -2322,7 +2326,7 @@ def _render_visualisierung_tab(
             "Projekte",
             options=project_options,
             default=default_projects,
-            key=f"viz_projects_{'controller' if is_controller else 'employee'}_{own_label}",
+            key=project_select_key,
             help=project_help,
         )
     with c2:
@@ -2340,20 +2344,43 @@ def _render_visualisierung_tab(
         include_abg = st.checkbox("abgerechnete einschließen", value=True, key="viz_include_abg")
         include_internal = st.checkbox("interne Tätigkeiten (I) einschließen", value=True, key="viz_include_internal")
 
-    x = base.copy()
-    x = x[(x["Year"] >= int(y_from)) & (x["Year"] <= int(y_to))]
+    x_scope = base.copy()
+    x_scope = x_scope[(x_scope["Year"] >= int(y_from)) & (x_scope["Year"] <= int(y_to))]
+    if sel_mitarbeiter:
+        x_scope = x_scope[x_scope["Mitarbeiter"].isin(sel_mitarbeiter)]
+    if False and (not include_abg):
+        x_scope = x_scope[x_scope["Abgerechnet"] != "ja"]
+        x_scope = x_scope[x_scope["TÃ¤tigkeit"] != "I"]
+    if not include_internal:
+        x_scope = x_scope[x_scope["Tätigkeit"] != "I"]
+    x = x_scope.copy()
     if sel_projects:
         x = x[x["Projekt"].isin(sel_projects)]
-    if sel_mitarbeiter:
-        x = x[x["Mitarbeiter"].isin(sel_mitarbeiter)]
-    if not include_abg:
-        x = x[x["Abgerechnet"] != "ja"]
     if not include_internal:
         x = x[x["Tätigkeit"] != "I"]
 
-    if x.empty:
+    x_scope = base.copy()
+    x_scope = x_scope[(x_scope["Year"] >= int(y_from)) & (x_scope["Year"] <= int(y_to))]
+    if sel_mitarbeiter:
+        x_scope = x_scope[x_scope["Mitarbeiter"].isin(sel_mitarbeiter)]
+    if not include_abg:
+        x_scope = x_scope[x_scope["Abgerechnet"] != "ja"]
+    if False and (not include_internal):
+        x_scope = x_scope[x_scope["Tätigkeit"] != "I"]
+    x = x_scope.copy()
+    if sel_projects:
+        x = x[x["Projekt"].isin(sel_projects)]
+
+    if not include_internal:
+        x_scope = x_scope[x_scope["Tätigkeit"] != "I"]
+        x = x[x["Tätigkeit"] != "I"]
+
+    if x_scope.empty:
         st.warning("Keine Daten für diese Auswahl.")
         return
+
+    if x.empty:
+        st.info("Keine Detaildaten für den aktuellen Projektfilter. Monatssummen über alle Projekte werden trotzdem angezeigt.")
 
     st.markdown("---")
     st.subheader("Zeitschiene / Meilensteine")
@@ -2685,6 +2712,15 @@ def _render_visualisierung_tab(
             st.progress(used_pct)
             st.caption(f"Budgetverbrauch: {used_pct * 100:.1f}%")
 
+    monthly_scope_totals = (
+        x_scope.groupby(["YM_dt", "YM"], as_index=False)
+        .agg(
+            Hours=("Hours", "sum"),
+            Projekte=("Projekt", "nunique"),
+            Einträge=("Hours", "size"),
+        )
+        .sort_values("YM_dt")
+    )
     monthly_long = (
         x.groupby(["YM_dt", "YM", "Tätigkeit"], as_index=False)["Hours"]
         .sum()
@@ -2696,13 +2732,93 @@ def _render_visualisierung_tab(
         .rename(columns={"Hours": "Total_Hours"})
     )
     monthly_long = monthly_long.merge(monthly_totals, on=["YM_dt", "YM"], how="left")
+    monthly_scope_totals["Year"] = monthly_scope_totals["YM_dt"].dt.year.astype(int)
+    if not monthly_long.empty:
+        monthly_long["Year"] = monthly_long["YM_dt"].dt.year.astype(int)
+    else:
+        monthly_long["Year"] = pd.Series(dtype=int)
+    monthly_year_options = ["Alle"] + [str(y) for y in sorted(monthly_scope_totals["Year"].unique().tolist())]
+    monthly_selected_year = st.selectbox(
+        "Jahr Monatsansicht",
+        options=monthly_year_options,
+        index=0,
+        key="viz_monthly_total_year",
+    )
+    if monthly_selected_year == "Alle":
+        monthly_scope_view = monthly_scope_totals.copy()
+        monthly_detail_view = monthly_long.copy()
+        avg_hours = float(monthly_scope_view["Hours"].sum() or 0.0) / max(1, len(monthly_scope_view))
+        avg_label = "Ø pro sichtbarem Monat"
+        avg_caption = "Berechnet ueber die aktuell sichtbaren Monate im gewaehlten Zeitraum."
+    else:
+        selected_year_int = int(monthly_selected_year)
+        monthly_scope_view = monthly_scope_totals[monthly_scope_totals["Year"] == selected_year_int].copy()
+        monthly_detail_view = monthly_long[monthly_long["Year"] == selected_year_int].copy()
+        avg_hours = float(monthly_scope_view["Hours"].sum() or 0.0) / 12.0
+        avg_label = "Ø pro Kalendermonat"
+        avg_caption = f"Berechnet als Jahresstunden / 12 fuer {selected_year_int}."
+    avg_label = "Durchschnitt / Monat" if monthly_selected_year == "Alle" else "Durchschnitt / Kalendermonat"
+    avg_secondary_caption = ""
+    if monthly_selected_year == "Alle":
+        avg_label = "Durchschnitt sichtbar"
+    else:
+        total_year_hours = float(monthly_scope_view["Hours"].sum() or 0.0)
+        if selected_year_int < today.year:
+            months_so_far = 12
+            avg_caption = f"Berechnet ueber das vollstaendige Jahr {selected_year_int} (12 Monate)."
+        elif selected_year_int == today.year:
+            months_so_far = int(today.month)
+            avg_caption = f"Berechnet bisher fuer {selected_year_int} bis einschliesslich Monat {months_so_far:02d}."
+        else:
+            observed_month = int(monthly_scope_view["YM_dt"].dt.month.max()) if not monthly_scope_view.empty else 1
+            months_so_far = max(1, observed_month)
+            avg_caption = f"Berechnet bis zum letzten vorhandenen Monat {months_so_far:02d}/{selected_year_int}."
+        avg_hours = total_year_hours / max(1, months_so_far)
+        avg_label = "Durchschnitt bisher"
+        avg_secondary_caption = f"Kalenderdurchschnitt (12 Monate): {total_year_hours / 12.0:.2f} h."
     proj_df = x.groupby("Projekt", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     type_df = x.groupby("Tätigkeit", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     mitarbeiter_df = x.groupby("Mitarbeiter", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
 
+    st.markdown("### Monatssumme (projektübergreifend)")
+    st.caption("Diese Ansicht ignoriert den Projektfilter und summiert die Stunden pro Monat über alle Projekte der aktuellen Auswahl.")
+    ms1, ms2, ms3, ms4 = st.columns(4)
+    ms1.metric("Jahr", monthly_selected_year)
+    ms2.metric("Stunden gesamt", f"{float(monthly_scope_view['Hours'].sum() or 0.0):.2f} h")
+    ms3.metric(avg_label, f"{avg_hours:.2f} h")
+    ms4.metric("Monate mit Eintraegen", f"{len(monthly_scope_view)}")
+    st.caption(avg_caption)
+    if avg_secondary_caption:
+        st.caption(avg_secondary_caption)
     _render_chart_block(
-        title="Stundenverlauf (Monate)",
-        df=monthly_long,
+        title="Monatssumme (alle Projekte)",
+        df=monthly_scope_view,
+        key_prefix="viz_monthly_total",
+        default_kind="Bar",
+        allowed_kinds=["Bar", "Line", "Area"],
+        x_field="YM_dt",
+        y_field="Hours",
+        color_field=None,
+        x_type="temporal",
+        stacked_default=False,
+        pie_ok=False,
+        extra_tooltip_fields=[
+            {"field": "Projekte", "type": "quantitative", "title": "Projekte", "format": ".0f"},
+            {"field": "Einträge", "type": "quantitative", "title": "Einträge", "format": ".0f"},
+        ],
+    )
+    with st.expander("Monatssummen als Tabelle"):
+        st.dataframe(
+            monthly_scope_view.rename(columns={"YM": "Monat", "Hours": "Stunden"})[
+                ["Monat", "Stunden", "Projekte", "Einträge"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    _render_chart_block(
+        title="Monatsdetail nach Tätigkeit",
+        df=monthly_detail_view,
         key_prefix="viz_monthly",
         default_kind="Stacked Bar",
         allowed_kinds=["Bar", "Line", "Area", "Stacked Bar", "Stacked Area"],
