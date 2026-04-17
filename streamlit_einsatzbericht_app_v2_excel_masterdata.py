@@ -2340,20 +2340,43 @@ def _render_visualisierung_tab(
         include_abg = st.checkbox("abgerechnete einschließen", value=True, key="viz_include_abg")
         include_internal = st.checkbox("interne Tätigkeiten (I) einschließen", value=True, key="viz_include_internal")
 
-    x = base.copy()
-    x = x[(x["Year"] >= int(y_from)) & (x["Year"] <= int(y_to))]
+    x_scope = base.copy()
+    x_scope = x_scope[(x_scope["Year"] >= int(y_from)) & (x_scope["Year"] <= int(y_to))]
+    if sel_mitarbeiter:
+        x_scope = x_scope[x_scope["Mitarbeiter"].isin(sel_mitarbeiter)]
+    if False and (not include_abg):
+        x_scope = x_scope[x_scope["Abgerechnet"] != "ja"]
+        x_scope = x_scope[x_scope["TÃ¤tigkeit"] != "I"]
+    if not include_internal:
+        x_scope = x_scope[x_scope["Tätigkeit"] != "I"]
+    x = x_scope.copy()
     if sel_projects:
         x = x[x["Projekt"].isin(sel_projects)]
-    if sel_mitarbeiter:
-        x = x[x["Mitarbeiter"].isin(sel_mitarbeiter)]
-    if not include_abg:
-        x = x[x["Abgerechnet"] != "ja"]
     if not include_internal:
         x = x[x["Tätigkeit"] != "I"]
 
-    if x.empty:
+    x_scope = base.copy()
+    x_scope = x_scope[(x_scope["Year"] >= int(y_from)) & (x_scope["Year"] <= int(y_to))]
+    if sel_mitarbeiter:
+        x_scope = x_scope[x_scope["Mitarbeiter"].isin(sel_mitarbeiter)]
+    if not include_abg:
+        x_scope = x_scope[x_scope["Abgerechnet"] != "ja"]
+    if False and (not include_internal):
+        x_scope = x_scope[x_scope["Tätigkeit"] != "I"]
+    x = x_scope.copy()
+    if sel_projects:
+        x = x[x["Projekt"].isin(sel_projects)]
+
+    if not include_internal:
+        x_scope = x_scope[x_scope["Tätigkeit"] != "I"]
+        x = x[x["Tätigkeit"] != "I"]
+
+    if x_scope.empty:
         st.warning("Keine Daten für diese Auswahl.")
         return
+
+    if x.empty:
+        st.info("Keine Detaildaten für den aktuellen Projektfilter. Monatssummen über alle Projekte werden trotzdem angezeigt.")
 
     st.markdown("---")
     st.subheader("Zeitschiene / Meilensteine")
@@ -2685,6 +2708,15 @@ def _render_visualisierung_tab(
             st.progress(used_pct)
             st.caption(f"Budgetverbrauch: {used_pct * 100:.1f}%")
 
+    monthly_scope_totals = (
+        x_scope.groupby(["YM_dt", "YM"], as_index=False)
+        .agg(
+            Hours=("Hours", "sum"),
+            Projekte=("Projekt", "nunique"),
+            Einträge=("Hours", "size"),
+        )
+        .sort_values("YM_dt")
+    )
     monthly_long = (
         x.groupby(["YM_dt", "YM", "Tätigkeit"], as_index=False)["Hours"]
         .sum()
@@ -2700,8 +2732,36 @@ def _render_visualisierung_tab(
     type_df = x.groupby("Tätigkeit", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     mitarbeiter_df = x.groupby("Mitarbeiter", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
 
+    st.markdown("### Monatssumme (projektübergreifend)")
+    st.caption("Diese Ansicht ignoriert den Projektfilter und summiert die Stunden pro Monat über alle Projekte der aktuellen Auswahl.")
     _render_chart_block(
-        title="Stundenverlauf (Monate)",
+        title="Monatssumme (alle Projekte)",
+        df=monthly_scope_totals,
+        key_prefix="viz_monthly_total",
+        default_kind="Bar",
+        allowed_kinds=["Bar", "Line", "Area"],
+        x_field="YM_dt",
+        y_field="Hours",
+        color_field=None,
+        x_type="temporal",
+        stacked_default=False,
+        pie_ok=False,
+        extra_tooltip_fields=[
+            {"field": "Projekte", "type": "quantitative", "title": "Projekte", "format": ".0f"},
+            {"field": "Einträge", "type": "quantitative", "title": "Einträge", "format": ".0f"},
+        ],
+    )
+    with st.expander("Monatssummen als Tabelle"):
+        st.dataframe(
+            monthly_scope_totals.rename(columns={"YM": "Monat", "Hours": "Stunden"})[
+                ["Monat", "Stunden", "Projekte", "Einträge"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    _render_chart_block(
+        title="Monatsdetail nach Tätigkeit",
         df=monthly_long,
         key_prefix="viz_monthly",
         default_kind="Stacked Bar",
