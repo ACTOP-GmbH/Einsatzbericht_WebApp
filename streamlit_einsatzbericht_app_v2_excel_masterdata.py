@@ -2754,6 +2754,24 @@ def _render_visualisierung_tab(
         avg_label = "Ø pro Kalendermonat"
         avg_caption = f"Berechnet als Jahresstunden / 12 fuer {selected_year_int}."
     avg_label = "Durchschnitt / Monat" if monthly_selected_year == "Alle" else "Durchschnitt / Kalendermonat"
+    avg_secondary_caption = ""
+    if monthly_selected_year == "Alle":
+        avg_label = "Durchschnitt sichtbar"
+    else:
+        total_year_hours = float(monthly_scope_view["Hours"].sum() or 0.0)
+        if selected_year_int < today.year:
+            months_so_far = 12
+            avg_caption = f"Berechnet ueber das vollstaendige Jahr {selected_year_int} (12 Monate)."
+        elif selected_year_int == today.year:
+            months_so_far = int(today.month)
+            avg_caption = f"Berechnet bisher fuer {selected_year_int} bis einschliesslich Monat {months_so_far:02d}."
+        else:
+            observed_month = int(monthly_scope_view["YM_dt"].dt.month.max()) if not monthly_scope_view.empty else 1
+            months_so_far = max(1, observed_month)
+            avg_caption = f"Berechnet bis zum letzten vorhandenen Monat {months_so_far:02d}/{selected_year_int}."
+        avg_hours = total_year_hours / max(1, months_so_far)
+        avg_label = "Durchschnitt bisher"
+        avg_secondary_caption = f"Kalenderdurchschnitt (12 Monate): {total_year_hours / 12.0:.2f} h."
     proj_df = x.groupby("Projekt", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     type_df = x.groupby("Tätigkeit", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
     mitarbeiter_df = x.groupby("Mitarbeiter", as_index=False)["Hours"].sum().sort_values("Hours", ascending=False)
@@ -2766,6 +2784,8 @@ def _render_visualisierung_tab(
     ms3.metric(avg_label, f"{avg_hours:.2f} h")
     ms4.metric("Monate mit Eintraegen", f"{len(monthly_scope_view)}")
     st.caption(avg_caption)
+    if avg_secondary_caption:
+        st.caption(avg_secondary_caption)
     _render_chart_block(
         title="Monatssumme (alle Projekte)",
         df=monthly_scope_view,
