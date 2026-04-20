@@ -1,0 +1,15 @@
+{
+  "app_name": "Einsatzbericht Manager",
+  "app_slug": "actop-einsatzbericht-manager",
+  "github_repo": "ACTOP-GmbH/Einsatzbericht_WebApp",
+  "version": "dev",
+  "main_script": "streamlit_einsatzbericht_app_v2_excel_masterdata.py",
+  "seed_workbook_relative_path": "data/Tätigkeiten_Überblick.xlsx",
+  "seed_workbook_name": "Tätigkeiten_Überblick.xlsx",
+  "release_asset_windows": "EinsatzberichtManager-windows.zip",
+  "release_asset_macos": "EinsatzberichtManager-macos.zip",
+  "launcher_relative_path_windows": "run_app.exe",
+  "launcher_relative_path_macos": "run_app",
+  "check_updates": true,
+  "update_interval_hours": 12
+}
