@@ -31,6 +31,31 @@ DEFAULT_MANIFEST: Dict[str, Any] = {
 }
 
 
+def configure_streamlit_runtime() -> None:
+    """Disable Streamlit first-run prompts and telemetry for desktop launches."""
+    os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    os.environ.setdefault("STREAMLIT_SERVER_SHOW_EMAIL_PROMPT", "false")
+    os.environ.setdefault("STREAMLIT_GLOBAL_DEVELOPMENT_MODE", "false")
+
+    try:
+        streamlit_dir = Path.home() / ".streamlit"
+        streamlit_dir.mkdir(parents=True, exist_ok=True)
+
+        credentials_path = streamlit_dir / "credentials.toml"
+        credentials_path.write_text('[general]\nemail = ""\n', encoding="utf-8")
+
+        config_path = streamlit_dir / "config.toml"
+        if not config_path.exists():
+            config_path.write_text(
+                "[browser]\ngatherUsageStats = false\n\n"
+                "[server]\nheadless = true\nshowEmailPrompt = false\n",
+                encoding="utf-8",
+            )
+    except Exception:
+        pass
+
+
 def _install_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -103,8 +128,17 @@ def prepare_runtime_environment(base_dir: Optional[Path] = None) -> Dict[str, Pa
 
     seed_source = _seed_workbook_source(resource_dir, manifest)
     seed_target = _seed_workbook_target(user_root, manifest)
-    if seed_source.exists() and not seed_target.exists():
-        shutil.copy2(seed_source, seed_target)
+    if seed_source.exists() and (not seed_target.exists() or seed_target.stat().st_size == 0):
+        temp_target = seed_target.with_suffix(seed_target.suffix + ".tmp")
+        try:
+            shutil.copy2(seed_source, temp_target)
+            temp_target.replace(seed_target)
+        finally:
+            try:
+                if temp_target.exists():
+                    temp_target.unlink()
+            except Exception:
+                pass
 
     os.environ["EINSATZBERICHT_USER_DATA_DIR"] = str(user_root)
     os.environ["EINSATZBERICHT_DEFAULT_EXCEL"] = str(seed_target)

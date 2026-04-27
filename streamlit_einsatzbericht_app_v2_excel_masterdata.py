@@ -10,6 +10,8 @@ import tempfile
 import json
 import re
 import hashlib
+import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -47,6 +49,7 @@ VIEW_MODE_CONTROLLER = "Controller"
 PROJECT_USES_CODING_COL = 15
 PROJECT_USES_CODING_HEADER = "Kodierung verwenden"
 DEFAULT_PROJECT_USES_CODING = "ja"
+WORKBOOK_LOAD_RETRY_EXCEPTIONS = (PermissionError, OSError, zipfile.BadZipFile)
 
 TAET_COLS = [
     "Datum",
@@ -408,7 +411,40 @@ def _read_team_df(wb: openpyxl.Workbook) -> pd.DataFrame:
     return df
 
 
+def _runtime_user_data_dir() -> Optional[Path]:
+    raw = os.environ.get("EINSATZBERICHT_USER_DATA_DIR", "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser().resolve()
+    except Exception:
+        return Path(raw).expanduser()
+
+
+def _runtime_default_excel_path() -> Optional[Path]:
+    raw = os.environ.get("EINSATZBERICHT_DEFAULT_EXCEL", "").strip()
+    if not raw:
+        return None
+    try:
+        return Path(raw).expanduser().resolve()
+    except Exception:
+        return Path(raw).expanduser()
+
+
+def _runtime_storage_dir(folder_name: str) -> Path:
+    user_data_dir = _runtime_user_data_dir()
+    if user_data_dir is not None:
+        target = user_data_dir / folder_name
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    target = Path(__file__).resolve().parent / folder_name
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def _default_excel_candidates() -> List[Path]:
+    user_data_dir = _runtime_user_data_dir()
+    default_excel = _runtime_default_excel_path()
     script_dir = Path(__file__).resolve().parent
     cwd = Path.cwd()
     names = [
@@ -416,6 +452,11 @@ def _default_excel_candidates() -> List[Path]:
         "__Tätigkeiten_Überblick - Kopie.xlsx",
     ]
     cands: List[Path] = []
+    if default_excel is not None:
+        cands.append(default_excel)
+    if user_data_dir is not None:
+        cands.append(user_data_dir / "data" / "Tätigkeiten_Überblick.xlsx")
+        cands.append(user_data_dir / "data" / "Taetigkeiten_Ueberblick.xlsx")
     for base in [script_dir, script_dir / "data", cwd, cwd / "data"]:
         for n in names:
             cands.append(base / n)
@@ -449,6 +490,9 @@ def _resolve_excel_path(path_str: str) -> Path:
             if c.exists():
                 return c.resolve()
         return p.resolve()
+    env_default = _runtime_default_excel_path()
+    if env_default is not None and env_default.exists():
+        return env_default
     for c in _default_excel_candidates():
         if c.exists():
             return c.resolve()
@@ -457,7 +501,7 @@ def _resolve_excel_path(path_str: str) -> Path:
 
 def _is_valid_app_workbook(path: Path) -> bool:
     try:
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        wb = _load_workbook_with_retry(path, read_only=True, data_only=True)
     except Exception:
         return False
     try:
@@ -467,6 +511,21 @@ def _is_valid_app_workbook(path: Path) -> bool:
             wb.close()
         except Exception:
             pass
+
+
+def _load_workbook_with_retry(path: Path, *, attempts: int = 8, delay_seconds: float = 0.35, **kwargs):
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return openpyxl.load_workbook(path, **kwargs)
+        except WORKBOOK_LOAD_RETRY_EXCEPTIONS as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            time.sleep(delay_seconds)
+    if last_error is not None:
+        raise last_error
+    return openpyxl.load_workbook(path, **kwargs)
 
 
 def _store_uploaded_excel(uploaded_file) -> Path:
@@ -479,9 +538,7 @@ def _store_uploaded_excel(uploaded_file) -> Path:
     if suffix != ".xlsx":
         raise ValueError("Bitte eine .xlsx-Datei hochladen.")
 
-    script_dir = Path(__file__).resolve().parent
-    imports_dir = script_dir / "imports"
-    imports_dir.mkdir(parents=True, exist_ok=True)
+    imports_dir = _runtime_storage_dir("imports")
 
     ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     stem = Path(original_name).stem
@@ -959,7 +1016,7 @@ def load_workbook_data(path_str: str) -> WorkbookData:
     path = _resolve_excel_path(path_str)
     if not path.exists():
         raise FileNotFoundError(f"Datei nicht gefunden: {path}")
-    wb = openpyxl.load_workbook(path)
+    wb = _load_workbook_with_retry(path)
     lookups = _load_lookups(wb)
     taetigkeiten_df = _apply_project_coding_policy(_read_taetigkeiten_df(wb), lookups)
     team_df = _apply_project_coding_policy(_read_team_df(wb), lookups)
@@ -1724,9 +1781,7 @@ def _existing_keys(df: pd.DataFrame) -> set:
 def _parse_and_store_uploaded_report(file_name: str, file_bytes: bytes, allowed_types: Tuple[str, ...]) -> Tuple[
     Dict[str, Any], pd.DataFrame]:
     h = hashlib.md5(file_bytes).hexdigest()[:8]
-    script_dir = Path(__file__).resolve().parent
-    reports_dir = script_dir / "imports_reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir = _runtime_storage_dir("imports_reports")
 
     stem = Path(file_name).stem
     target = reports_dir / f"{stem}_{h}.xlsx"
@@ -2006,6 +2061,38 @@ def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dic
     return meta, df_lines
 
 
+def _normalize_import_key_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", _safe_str(value)).strip().casefold()
+
+
+def _pause_minutes_for_import(rec: Dict[str, Any]) -> int:
+    raw = rec.get("Pause_Min")
+    try:
+        if raw is None or _is_blank(raw) or pd.isna(raw):
+            return _time_to_minutes(rec.get("Pause"))
+    except Exception:
+        pass
+    try:
+        return int(raw or 0)
+    except Exception:
+        return _time_to_minutes(raw)
+
+
+def _hours_key_for_import(rec: Dict[str, Any]) -> str:
+    zeit_h = None
+    for key in ("Zeit_h", "Zeit (h)", "Zahl"):
+        value = rec.get(key)
+        if value is not None and not _is_blank(value):
+            zeit_h = value
+            break
+    if zeit_h is None or _is_blank(zeit_h):
+        return ""
+    try:
+        return f"{float(zeit_h):.4f}"
+    except Exception:
+        return _safe_str(zeit_h).strip()
+
+
 def _key_for_import(rec: Dict[str, Any]) -> tuple:
     d = _format_date(rec.get("Datum"))
     projekt = _safe_str(rec.get("Projekt")).strip()
@@ -2014,19 +2101,69 @@ def _key_for_import(rec: Dict[str, Any]) -> tuple:
     info = _safe_str(rec.get("Info")).strip()
     typ = _safe_str(rec.get("Tätigkeit")).strip()
     kod = _safe_str(rec.get("Kodierung")).strip()
-    pause = int(rec.get("Pause_Min") or 0)
+    pause = _pause_minutes_for_import(rec)
 
     if not zv and not zb:
-        zeit_h = rec.get("Zeit_h") or rec.get("Zeit (h)") or rec.get("Zahl")
-        zeit_h_norm = ""
-        if zeit_h is not None and not _is_blank(zeit_h):
-            try:
-                zeit_h_norm = f"{float(zeit_h):.4f}"
-            except Exception:
-                zeit_h_norm = _safe_str(zeit_h).strip()
-        return (d, projekt, "<NO_TIME>", typ, kod, zeit_h_norm, info)
+        return (d, projekt, "<NO_TIME>", typ, kod, _hours_key_for_import(rec), info)
 
     return (d, projekt, zv, zb, pause, typ, kod, info)
+
+
+def _no_time_key_for_import(rec: Dict[str, Any]) -> Optional[tuple]:
+    d = _format_date(rec.get("Datum"))
+    projekt = _normalize_import_key_text(rec.get("Projekt"))
+    zv = _format_time(rec.get("Zeit von"))
+    zb = _format_time(rec.get("Zeit bis"))
+    if not d or not projekt or zv or zb:
+        return None
+    return (
+        d,
+        projekt,
+        _normalize_import_key_text(rec.get("Tätigkeit")),
+        _hours_key_for_import(rec),
+        _normalize_import_key_text(rec.get("Info")),
+    )
+
+
+def _no_time_group_key_for_import(rec: Dict[str, Any]) -> Optional[tuple]:
+    d = _format_date(rec.get("Datum"))
+    projekt = _normalize_import_key_text(rec.get("Projekt"))
+    zv = _format_time(rec.get("Zeit von"))
+    zb = _format_time(rec.get("Zeit bis"))
+    if not d or not projekt or zv or zb:
+        return None
+    return (
+        d,
+        projekt,
+        _normalize_import_key_text(rec.get("Tätigkeit")),
+    )
+
+
+def _time_slot_key_for_import(rec: Dict[str, Any]) -> Optional[tuple]:
+    d = _format_date(rec.get("Datum"))
+    projekt = _normalize_import_key_text(rec.get("Projekt"))
+    zv = _format_time(rec.get("Zeit von"))
+    zb = _format_time(rec.get("Zeit bis"))
+    if not d or not projekt or not zv or not zb:
+        return None
+    return (d, projekt, zv, zb, _pause_minutes_for_import(rec))
+
+
+def _master_row_import_record(r: pd.Series) -> Dict[str, Any]:
+    return {
+        "Datum": r.get("Datum"),
+        "Projekt": r.get("Projekt"),
+        "Zeit von": r.get("Zeit von"),
+        "Zeit bis": r.get("Zeit bis"),
+        "Pause_Min": r.get("Pause_Min"),
+        "Pause": r.get("Pause"),
+        "km": r.get("km") or 0,
+        "Tätigkeit": r.get("Tätigkeit"),
+        "Kodierung": r.get("Kodierung") or "",
+        "Info": r.get("Info") or "",
+        "Zahl": r.get("Zahl"),
+        "_excel_row": r.get("_excel_row"),
+    }
 
 
 def _existing_key_counts_for_master(df_master: pd.DataFrame, team: bool = False) -> Counter:
@@ -2034,24 +2171,74 @@ def _existing_key_counts_for_master(df_master: pd.DataFrame, team: bool = False)
     if df_master is None or df_master.empty:
         return keys
     for _, r in df_master.iterrows():
-        rec = {
-            "Datum": r.get("Datum"),
-            "Projekt": r.get("Projekt"),
-            "Zeit von": r.get("Zeit von"),
-            "Zeit bis": r.get("Zeit bis"),
-            "Pause_Min": int(r.get("Pause_Min") or _time_to_minutes(r.get("Pause")) or 0),
-            "km": r.get("km") or 0,
-            "Tätigkeit": r.get("Tätigkeit"),
-            "Kodierung": r.get("Kodierung") or "",
-            "Info": r.get("Info") or "",
-            "Zahl": r.get("Zahl"),
-        }
+        rec = _master_row_import_record(r)
         if team:
             key_tuple = (_safe_str(r.get("Mitarbeiter")).strip(),) + _key_for_import(rec)
             keys[key_tuple] += 1
         else:
             keys[_key_for_import(rec)] += 1
     return keys
+
+
+def _existing_time_slot_key_counts_for_master(df_master: pd.DataFrame, team: bool = False) -> Counter:
+    keys: Counter = Counter()
+    if df_master is None or df_master.empty:
+        return keys
+    for _, r in df_master.iterrows():
+        slot_key = _time_slot_key_for_import(_master_row_import_record(r))
+        if slot_key is None:
+            continue
+        if team:
+            key_tuple = (_safe_str(r.get("Mitarbeiter")).strip(),) + slot_key
+            keys[key_tuple] += 1
+        else:
+            keys[slot_key] += 1
+    return keys
+
+
+def _existing_no_time_key_counts_for_master(df_master: pd.DataFrame, team: bool = False) -> Counter:
+    keys: Counter = Counter()
+    if df_master is None or df_master.empty:
+        return keys
+    for _, r in df_master.iterrows():
+        no_time_key = _no_time_key_for_import(_master_row_import_record(r))
+        if no_time_key is None:
+            continue
+        if team:
+            key_tuple = (_safe_str(r.get("Mitarbeiter")).strip(),) + no_time_key
+            keys[key_tuple] += 1
+        else:
+            keys[no_time_key] += 1
+    return keys
+
+
+def _existing_no_time_candidates_for_master(df_master: pd.DataFrame, team: bool = False) -> Dict[tuple, List[Dict[str, Any]]]:
+    candidates: Dict[tuple, List[Dict[str, Any]]] = {}
+    if df_master is None or df_master.empty:
+        return candidates
+    for _, r in df_master.iterrows():
+        rec = _master_row_import_record(r)
+        group_key = _no_time_group_key_for_import(rec)
+        if group_key is None:
+            continue
+        if team:
+            rec["Mitarbeiter"] = _safe_str(r.get("Mitarbeiter")).strip()
+            group_key = (_safe_str(r.get("Mitarbeiter")).strip(),) + group_key
+        candidates.setdefault(group_key, []).append(rec)
+    return candidates
+
+
+def _import_record_label(rec: Dict[str, Any]) -> str:
+    parts = [
+        _format_date(rec.get("Datum")) or "-",
+        _safe_str(rec.get("Projekt")).strip() or "-",
+        _safe_str(rec.get("Tätigkeit")).strip() or "-",
+        f"{_hours_key_for_import(rec) or '-'} h",
+    ]
+    info = _normalize_import_key_text(rec.get("Info"))
+    if info:
+        parts.append(info[:90])
+    return " | ".join(parts)
 
 
 # ------------------------- Streamlit UI -------------------------
@@ -3391,10 +3578,26 @@ def main() -> None:
                 is_team_mode = "Team" in import_mode
                 existing_key_counts = _existing_key_counts_for_master(team_df if is_team_mode else df,
                                                                       team=is_team_mode)
+                existing_time_slot_key_counts = _existing_time_slot_key_counts_for_master(
+                    team_df if is_team_mode else df,
+                    team=is_team_mode,
+                )
+                existing_no_time_key_counts = _existing_no_time_key_counts_for_master(
+                    team_df if is_team_mode else df,
+                    team=is_team_mode,
+                )
+                existing_no_time_candidates = _existing_no_time_candidates_for_master(
+                    team_df if is_team_mode else df,
+                    team=is_team_mode,
+                )
                 matched_existing_counts = Counter()
+                matched_existing_time_slot_counts = Counter()
+                matched_existing_no_time_counts = Counter()
+                seen_new_time_slot_counts = Counter()
                 seen_source_rows = set()
 
                 all_records: List[Dict[str, Any]] = []
+                conflict_records: List[Dict[str, Any]] = []
                 meta_list = []
 
                 target_projects = sorted(list(dict.fromkeys(
@@ -3482,15 +3685,94 @@ def main() -> None:
                                 rec["Mitarbeiter"] = mitarbeiter_name
 
                             k = _key_for_import(rec)
+                            no_time_key = _no_time_key_for_import(rec)
+                            no_time_group_key = _no_time_group_key_for_import(rec)
+                            time_slot_key = _time_slot_key_for_import(rec)
+
+                            if no_time_key is not None and no_time_group_key is not None:
+                                conflict_group_key = (
+                                    (_safe_str(mitarbeiter_name).strip(),) + no_time_group_key
+                                    if is_team_mode
+                                    else no_time_group_key
+                                )
+                                exact_conflict_key = (
+                                    (_safe_str(mitarbeiter_name).strip(),) + no_time_key
+                                    if is_team_mode
+                                    else no_time_key
+                                )
+                                candidates = existing_no_time_candidates.get(conflict_group_key, [])
+                                exact_existing_count = existing_no_time_key_counts[exact_conflict_key]
+                                if candidates:
+                                    conflict_records.append(
+                                        {
+                                            "record": rec,
+                                            "candidates": candidates,
+                                            "exact_existing_count": exact_existing_count,
+                                            "source_file": file_name,
+                                            "source_row": int(row.get("_source_row") or 0),
+                                        }
+                                    )
+                                    continue
+
                             if is_team_mode:
                                 key_tuple = (_safe_str(mitarbeiter_name).strip(),) + k
                                 if matched_existing_counts[key_tuple] < existing_key_counts[key_tuple]:
                                     matched_existing_counts[key_tuple] += 1
+                                    if time_slot_key is not None:
+                                        matched_existing_time_slot_counts[
+                                            (_safe_str(mitarbeiter_name).strip(),) + time_slot_key
+                                        ] += 1
+                                    if no_time_key is not None:
+                                        matched_existing_no_time_counts[
+                                            (_safe_str(mitarbeiter_name).strip(),) + no_time_key
+                                        ] += 1
                                     continue
+                                if no_time_key is not None:
+                                    no_time_key_tuple = (_safe_str(mitarbeiter_name).strip(),) + no_time_key
+                                    if (
+                                        matched_existing_no_time_counts[no_time_key_tuple]
+                                        < existing_no_time_key_counts[no_time_key_tuple]
+                                    ):
+                                        matched_existing_no_time_counts[no_time_key_tuple] += 1
+                                        continue
+                                if time_slot_key is not None:
+                                    time_slot_key_tuple = (_safe_str(mitarbeiter_name).strip(),) + time_slot_key
+                                    if (
+                                        matched_existing_time_slot_counts[time_slot_key_tuple]
+                                        < existing_time_slot_key_counts[time_slot_key_tuple]
+                                    ):
+                                        matched_existing_time_slot_counts[time_slot_key_tuple] += 1
+                                        continue
                             else:
                                 if matched_existing_counts[k] < existing_key_counts[k]:
                                     matched_existing_counts[k] += 1
+                                    if time_slot_key is not None:
+                                        matched_existing_time_slot_counts[time_slot_key] += 1
+                                    if no_time_key is not None:
+                                        matched_existing_no_time_counts[no_time_key] += 1
                                     continue
+                                if no_time_key is not None and (
+                                    matched_existing_no_time_counts[no_time_key]
+                                    < existing_no_time_key_counts[no_time_key]
+                                ):
+                                    matched_existing_no_time_counts[no_time_key] += 1
+                                    continue
+                                if time_slot_key is not None and (
+                                    matched_existing_time_slot_counts[time_slot_key]
+                                    < existing_time_slot_key_counts[time_slot_key]
+                                ):
+                                    matched_existing_time_slot_counts[time_slot_key] += 1
+                                    continue
+
+                            if time_slot_key is not None:
+                                pending_time_slot_key = (
+                                    (_safe_str(mitarbeiter_name).strip(),) + time_slot_key
+                                    if is_team_mode
+                                    else time_slot_key
+                                )
+                                if seen_new_time_slot_counts[pending_time_slot_key] > 0:
+                                    continue
+                                seen_new_time_slot_counts[pending_time_slot_key] += 1
 
                             source_row_key = (
                                 _safe_str(file_name).strip(),
@@ -3508,12 +3790,101 @@ def main() -> None:
                         st.error(f"Fehler beim Lesen der Datei {i}: {e}")
 
                 st.write("---")
-                st.metric("Gesamt neu zu importierende Zeilen", len(all_records))
+                metric_cols = st.columns(3)
+                metric_cols[0].metric("Automatisch neu", len(all_records))
+                metric_cols[1].metric("Organisatorische Konflikte", len(conflict_records))
 
-                if all_records:
+                selected_records = list(all_records)
+                replacements: List[Dict[str, Any]] = []
+
+                if conflict_records:
+                    st.warning(
+                        "Organisatorische Positionen ohne Uhrzeit haben mögliche vorhandene Gegenstücke. "
+                        "Bitte pro Zeile entscheiden, ob sie übersprungen, neu hinzugefügt oder ersetzt werden soll."
+                    )
+                    for idx, conflict in enumerate(conflict_records, start=1):
+                        rec = conflict["record"]
+                        candidates = conflict["candidates"]
+                        source_file = _safe_str(conflict.get("source_file")).strip()
+                        source_row = int(conflict.get("source_row") or 0)
+                        exact_count = int(conflict.get("exact_existing_count") or 0)
+                        with st.expander(
+                            f"Konflikt {idx}: {_import_record_label(rec)}",
+                            expanded=(idx <= 3),
+                        ):
+                            if source_file:
+                                st.caption(f"Quelle: {source_file}, Zeile {source_row or '-'}")
+                            if exact_count:
+                                st.info(
+                                    f"Es existieren bereits {exact_count} organisatorische Position(en) "
+                                    "mit gleicher Beschreibung und gleicher Stundenzahl."
+                                )
+                            else:
+                                st.info(
+                                    "Es existieren organisatorische Position(en) am gleichen Tag im gleichen Projekt. "
+                                    "Das kann eine aktualisierte Position sein."
+                                )
+
+                            candidate_rows = []
+                            candidate_by_row: Dict[int, Dict[str, Any]] = {}
+                            for cand in candidates:
+                                row_id = int(cand.get("_excel_row") or 0)
+                                if row_id:
+                                    candidate_by_row[row_id] = cand
+                                candidate_rows.append(
+                                    {
+                                        "Excel-Zeile": row_id or "",
+                                        "Datum": _format_date(cand.get("Datum")),
+                                        "Projekt": cand.get("Projekt"),
+                                        "Zeit (h)": cand.get("Zahl"),
+                                        "Typ": cand.get("Tätigkeit"),
+                                        "Kodierung": cand.get("Kodierung"),
+                                        "Info": _safe_str(cand.get("Info"))[:120],
+                                    }
+                                )
+                            st.dataframe(pd.DataFrame(candidate_rows), use_container_width=True, height=160)
+
+                            action = st.radio(
+                                "Aktion",
+                                options=["Überspringen", "Neu hinzufügen", "Bestehende Zeile ersetzen"],
+                                index=0,
+                                horizontal=True,
+                                key=f"import_no_time_conflict_action_{idx}",
+                            )
+
+                            if action == "Neu hinzufügen":
+                                selected_records.append(rec)
+                            elif action == "Bestehende Zeile ersetzen":
+                                replace_rows = list(candidate_by_row.keys())
+                                if replace_rows:
+                                    replace_row = st.selectbox(
+                                        "Welche bestehende Zeile ersetzen?",
+                                        options=replace_rows,
+                                        format_func=lambda row_id, rows=candidate_by_row: _import_record_label(
+                                            rows[row_id]
+                                        ),
+                                        key=f"import_no_time_conflict_replace_row_{idx}",
+                                    )
+                                    replacements.append({"row": int(replace_row), "record": rec})
+                                else:
+                                    st.error("Keine ersetzbare Excel-Zeile gefunden.")
+
+                metric_cols[2].metric("Ausgewählt zum Schreiben", len(selected_records) + len(replacements))
+
+                duplicate_replace_rows = [
+                    row for row, count in Counter([item["row"] for item in replacements]).items() if count > 1
+                ]
+                if duplicate_replace_rows:
+                    st.error(
+                        "Mehrere Konflikte sollen dieselbe Excel-Zeile ersetzen. "
+                        f"Bitte Auswahl korrigieren: {duplicate_replace_rows}"
+                    )
+
+                if selected_records or replacements:
                     preview_data = []
-                    for r in all_records:
+                    for r in selected_records:
                         d = {
+                            "Aktion": "Neu hinzufügen",
                             "Datum": _format_date(r["Datum"]),
                             "Projekt": r["Projekt"],
                             "Zeit von": _format_time(r["Zeit von"]),
@@ -3525,30 +3896,60 @@ def main() -> None:
                             "Info": _safe_str(r["Info"])[:80],
                         }
                         if is_team_mode:
-                            d = {"Mitarbeiter": r.get("Mitarbeiter")} | d  # Prepend Mitarbeiter
+                            d = {"Mitarbeiter": r.get("Mitarbeiter")} | d
+                        preview_data.append(d)
+                    for item in replacements:
+                        r = item["record"]
+                        d = {
+                            "Aktion": f"Ersetzt Zeile {item['row']}",
+                            "Datum": _format_date(r["Datum"]),
+                            "Projekt": r["Projekt"],
+                            "Zeit von": _format_time(r["Zeit von"]),
+                            "Zeit bis": _format_time(r["Zeit bis"]),
+                            "Pause (Min)": r["Pause_Min"],
+                            "Zeit (h)": r.get("Zahl"),
+                            "Typ": r["Tätigkeit"],
+                            "Kodierung (Aufgabe)": r["Kodierung"],
+                            "Info": _safe_str(r["Info"])[:80],
+                        }
+                        if is_team_mode:
+                            d = {"Mitarbeiter": r.get("Mitarbeiter")} | d
                         preview_data.append(d)
 
                     preview = pd.DataFrame(preview_data)
                     st.dataframe(preview, use_container_width=True, height=260)
 
-                    if st.button("Import durchführen (Schreiben)", key="commit_report_import"):
+                if selected_records or replacements or conflict_records:
+                    disable_import = (not selected_records and not replacements) or bool(duplicate_replace_rows)
+                    if st.button(
+                        "Import durchführen (Schreiben)",
+                        key="commit_report_import",
+                        disabled=disable_import,
+                    ):
                         def _mutator_import_reports(wb):
                             if is_team_mode:
                                 ws = _ensure_team_sheet(wb)
+                                for item in replacements:
+                                    _write_team_row(ws, int(item["row"]), item["record"])
                                 row_idx = _find_next_write_row(ws, key_cols=TEAM_KEY_COLS_FOR_EMPTY_CHECK)
-                                for rec in all_records:
+                                for rec in selected_records:
                                     _write_team_row(ws, row_idx, rec)
                                     row_idx += 1
                             else:
                                 ws = wb[TAETIGKEITEN_SHEET]
+                                for item in replacements:
+                                    _write_taetigkeit_row(ws, int(item["row"]), item["record"])
                                 row_idx = _find_next_write_row(ws, key_cols=KEY_COLS_FOR_EMPTY_CHECK)
-                                for rec in all_records:
+                                for rec in selected_records:
                                     _write_taetigkeit_row(ws, row_idx, rec)
                                     row_idx += 1
 
                         ok, msg = _save_workbook(data.path, _mutator_import_reports)
                         if ok:
-                            st.success(f"Import OK: {len(all_records)} Zeilen übernommen. {msg}")
+                            st.success(
+                                f"Import OK: {len(selected_records)} neu hinzugefügt, "
+                                f"{len(replacements)} ersetzt. {msg}"
+                            )
                             _refresh_after_workbook_change()
                         else:
                             st.error(msg)
