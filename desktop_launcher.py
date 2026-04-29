@@ -45,18 +45,48 @@ def _find_available_port(preferred: int = 8501, attempts: int = 20) -> int:
     raise RuntimeError("Kein freier lokaler Port fuer die App gefunden.")
 
 
+def _server_ready(port: int, timeout: float = 1.0) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/_stcore/health", timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _open_existing_instance(runtime: dict, preferred: int = 8501, attempts: int = 20) -> bool:
+    port_file = runtime["user_root"] / "logs" / "server_port.txt"
+    ports = []
+    if port_file.exists():
+        try:
+            ports.append(int(port_file.read_text(encoding="utf-8").strip()))
+        except Exception:
+            pass
+    ports.extend(range(preferred, preferred + attempts))
+    for port in dict.fromkeys(ports):
+        if _server_ready(int(port)):
+            webbrowser.open(f"http://127.0.0.1:{int(port)}")
+            return True
+    return False
+
+
+def _remember_port(runtime: dict, port: int) -> None:
+    try:
+        port_file = runtime["user_root"] / "logs" / "server_port.txt"
+        port_file.parent.mkdir(parents=True, exist_ok=True)
+        port_file.write_text(str(port), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _open_browser_when_ready(port: int, timeout_seconds: int = 45) -> None:
-    health_url = f"http://127.0.0.1:{port}/_stcore/health"
     browser_url = f"http://127.0.0.1:{port}"
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
-        try:
-            with urllib.request.urlopen(health_url, timeout=2):
-                webbrowser.open(browser_url)
-                return
-        except Exception:
-            time.sleep(0.5)
+        if _server_ready(port, timeout=2):
+            webbrowser.open(browser_url)
+            return
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":
@@ -64,12 +94,15 @@ if __name__ == "__main__":
         current_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
         os.chdir(current_dir)
 
-        prepare_runtime_environment()
+        runtime = prepare_runtime_environment()
         _apply_streamlit_options()
         if maybe_check_for_updates():
             sys.exit(0)
+        if _open_existing_instance(runtime):
+            sys.exit(0)
 
         port = _find_available_port()
+        _remember_port(runtime, port)
         threading.Thread(target=_open_browser_when_ready, args=(port,), daemon=True).start()
 
         sys.argv = [

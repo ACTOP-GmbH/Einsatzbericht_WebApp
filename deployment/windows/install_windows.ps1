@@ -242,9 +242,9 @@ $venvPython = Join-Path $installDir ".venv\Scripts\python.exe"
 $sourceLauncher = Join-Path $installDir "run_app.py"
 $stdoutPath = Join-Path $installDir "launch_stdout.log"
 $stderrPath = Join-Path $installDir "launch_stderr.log"
+$installRoot = Split-Path -Parent $installDir
+$portFile = Join-Path $installRoot "logs\server_port.txt"
 $port = 8501
-$healthUrl = "http://127.0.0.1:$port/_stcore/health"
-$browserUrl = "http://127.0.0.1:$port"
 
 $env:STREAMLIT_BROWSER_GATHER_USAGE_STATS = "false"
 $env:STREAMLIT_SERVER_HEADLESS = "true"
@@ -259,8 +259,9 @@ if (-not (Test-Path -LiteralPath (Join-Path $streamlitDir "config.toml"))) {
 }
 
 function Test-ServerReady {
-    param([string]$Url)
+    param([int]$Port)
     try {
+        $Url = "http://127.0.0.1:$Port/_stcore/health"
         Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2 | Out-Null
         return $true
     } catch {
@@ -268,8 +269,25 @@ function Test-ServerReady {
     }
 }
 
-if (Test-ServerReady -Url $healthUrl) {
-    Start-Process $browserUrl | Out-Null
+function Open-ExistingInstance {
+    $ports = @()
+    if (Test-Path -LiteralPath $portFile) {
+        try {
+            $ports += [int](Get-Content -LiteralPath $portFile -Raw)
+        } catch {
+        }
+    }
+    $ports += 8501..8520
+    foreach ($candidate in ($ports | Select-Object -Unique)) {
+        if (Test-ServerReady -Port $candidate) {
+            Start-Process "http://127.0.0.1:$candidate" | Out-Null
+            return $true
+        }
+    }
+    return $false
+}
+
+if (Open-ExistingInstance) {
     exit 0
 }
 
@@ -284,8 +302,7 @@ if (Test-Path -LiteralPath $launcherPath) {
 
 $deadline = (Get-Date).AddSeconds(45)
 while ((Get-Date) -lt $deadline) {
-    if (Test-ServerReady -Url $healthUrl) {
-        Start-Process $browserUrl | Out-Null
+    if (Open-ExistingInstance) {
         exit 0
     }
     Start-Sleep -Milliseconds 500

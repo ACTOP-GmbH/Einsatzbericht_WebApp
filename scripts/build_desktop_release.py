@@ -200,6 +200,12 @@ def build_release(platform_name: str, version: str, payload_dir: Path, output_di
 
     readme = staging_dir / "README_INSTALL.txt"
     starter_name = "install.bat" if platform_name == "windows" else _installer_name(platform_name)
+    bundled_runtime = (payload_dir / "run_app.exe").exists()
+    dependency_note = (
+        "6. Im gebuendelten Tester-ZIP sind die benoetigten Python-Pakete bereits enthalten."
+        if bundled_runtime
+        else "6. Dieses Source-Installer-ZIP erstellt beim Installieren eine lokale Python-Umgebung und installiert die benoetigten Pakete."
+    )
     readme.write_text(
         "\n".join(
             [
@@ -212,7 +218,7 @@ def build_release(platform_name: str, version: str, payload_dir: Path, output_di
                 "3. Die App kopiert sich in dein Benutzerprofil und legt eine Startverknuepfung an.",
                 "4. Updates werden beim Start ueber GitHub Releases geprueft.",
                 "5. Die mitgelieferte Excel-Datei ist eine leere Startvorlage ohne Nutzerdaten.",
-                "6. Im gebuendelten Tester-ZIP sind die benoetigten Python-Pakete bereits enthalten.",
+                dependency_note,
                 "",
                 "Hinweis:",
                 "Wenn das Repository privat bleibt, muessen die Release-ZIPs oeffentlich oder ueber einen anderen Download-Kanal erreichbar sein.",

@@ -1530,6 +1530,21 @@ def _project_uses_coding(lookups: Dict[str, Any], project_name: Any) -> bool:
     return _normalize_yes_no(info.get("Kodierung verwenden")) != "nein"
 
 
+def _coding_required_errors(records: List[Dict[str, Any]], lookups: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+    for idx, rec in enumerate(records, start=1):
+        project = _safe_str(rec.get("Projekt")).strip()
+        if not project or not _project_uses_coding(lookups, project):
+            continue
+        if _safe_str(rec.get("Kodierung")).strip():
+            continue
+        d = _format_date(rec.get("Datum")) or "-"
+        info = _safe_str(rec.get("Info")).strip()
+        suffix = f" ({info[:60]})" if info else ""
+        errors.append(f"Eintrag {idx}: Projekt '{project}' erfordert eine Kodierung. Datum: {d}{suffix}")
+    return errors
+
+
 def _apply_project_coding_policy(df: pd.DataFrame, lookups: Dict[str, Any]) -> pd.DataFrame:
     if df is None or df.empty or "Projekt" not in df.columns or "Kodierung" not in df.columns:
         return df
@@ -2654,7 +2669,7 @@ def _render_visualisierung_tab(
                 hide_index=True,
                 disabled=["_excel_row"],
                 column_config={
-                    "_excel_row": st.column_config.NumberColumn("Excel-Zeile", help="Technische ID (nicht ändern)"),
+                    "_excel_row": st.column_config.NumberColumn("ID", help="Technische ID (nicht ändern)"),
                     "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
                     "Meilenstein": st.column_config.TextColumn("Meilenstein", width="large"),
                     "Status": st.column_config.SelectboxColumn("Status", options=MILESTONE_STATUSES),
@@ -3136,22 +3151,7 @@ def main() -> None:
     with st.sidebar:
         st.header("Datei")
         excel_path = st.text_input("Pfad zur Excel-Datei", key="excel_path_input")
-        uploaded_excel = st.file_uploader(
-            "Excel-Datei importieren (.xlsx)",
-            type=["xlsx"],
-            key="excel_upload_file",
-            help="Lädt eine Excel-Datei hoch und speichert sie als lokale Arbeitskopie (für Bearbeitung + Excel-Druck/PDF).",
-        )
-
-        if uploaded_excel is not None:
-            if st.button("Upload als Arbeitskopie übernehmen", key="import_uploaded_excel_btn"):
-                try:
-                    imported_path = _store_uploaded_excel(uploaded_excel)
-                    st.session_state["_pending_import_excel_path"] = str(imported_path)
-                    st.session_state["excel_path"] = str(imported_path)
-                    _refresh_after_workbook_change()
-                except Exception as e:
-                    st.error(f"Import fehlgeschlagen: {e}")
+        st.caption("Importe laufen im Tab 'Tätigkeiten' über den Bereich 'Einsatzberichte importieren'.")
         st.session_state["excel_path"] = excel_path
         reload_clicked = st.button("Neu laden")
         st.info(
@@ -3234,7 +3234,12 @@ def main() -> None:
             f_month = st.selectbox("Monat-Filter", options=list(range(1, 13)),
                                    index=max(0, min(11, int(m_default) - 1)))
         with filt_cols[2]:
-            f_project = st.selectbox("Projekt-Filter", options=[""] + projekte_available, index=0)
+            f_project = st.selectbox(
+                "Projekt-Filter",
+                options=[""] + projekte_available,
+                index=0,
+                format_func=lambda value: "Zum Filtern, Projekt auswählen" if value == "" else value,
+            )
         with filt_cols[3]:
             f_include_abg = st.checkbox("abgerechnete zeigen", value=True)
 
@@ -3245,8 +3250,6 @@ def main() -> None:
         kod_opts = list(dict.fromkeys(
             [""] + (lookups.get("relevante_kodierungen") or []) + (lookups.get("kodierung_aufgaben") or [])
         ))
-        if f_project and not _project_uses_coding(lookups, f_project):
-            kod_opts = [""]
 
         interne_opts = list(dict.fromkeys([""] + (lookups.get("interne_projekte") or [])))
 
@@ -3256,7 +3259,8 @@ def main() -> None:
 
         if filtered.empty:
             st.info("Keine Tätigkeiten für den aktuellen Filter gefunden.")
-        else:
+        show_inline_editor = True
+        if show_inline_editor:
             editor_cols = [
                 "_excel_row",
                 "Datum",
@@ -3316,10 +3320,11 @@ def main() -> None:
                 height=420,
                 num_rows="dynamic",
                 hide_index=True,
+                column_order=[c for c in editor_cols + ["Löschen"] if c != "_excel_row"],
                 disabled=["_excel_row", "Dauer"],
                 column_config={
-                    "_excel_row": st.column_config.NumberColumn("Excel-Zeile",
-                                                                help="Technische Zeilen-ID (nicht ändern)"),
+                    "_excel_row": st.column_config.NumberColumn("ID",
+                                                                help="Technische ID (nicht ändern)"),
                     "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
                     "Projekt": st.column_config.SelectboxColumn("Projekt", options=projekte_opts),
                     "Zeit von": st.column_config.TimeColumn("Zeit von", format="HH:mm"),
@@ -3343,9 +3348,8 @@ def main() -> None:
             )
 
             st.caption(
-                "✔ Du kannst direkt in der Tabelle editieren. "
-                "➕ Neue Zeilen unten hinzufügen. "
-                "🗑️ Zum Löschen Checkbox 'Löschen' setzen und speichern."
+                "Du kannst direkt in der Tabelle editieren. Neue Zeilen unten hinzufügen. "
+                "Zum Löschen Checkbox 'Löschen' setzen und speichern."
             )
 
             def _editor_row_to_record(r: pd.Series) -> Dict[str, Any]:
@@ -3438,6 +3442,14 @@ def main() -> None:
                     if old_rec is None or _key_for_import(new_rec) != _key_for_import(old_rec):
                         updates.append((row_excel, new_rec))
 
+                coding_errors = _coding_required_errors(
+                    inserts + [rec for _, rec in updates],
+                    lookups,
+                )
+                if coding_errors:
+                    st.error("Kodierung fehlt:\n\n" + "\n".join(coding_errors[:10]))
+                    st.stop()
+
                 for r_id in original_excel_rows:
                     if r_id not in kept_excel_rows and r_id not in deletes:
                         deletes.append(r_id)
@@ -3463,72 +3475,7 @@ def main() -> None:
                     st.error(msg)
 
         st.markdown("---")
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.markdown("### Neue Tätigkeit anlegen")
-            with st.form("add_form", clear_on_submit=False):
-                defaults_add = {
-                    "Datum": dt.date.today(),
-                    "Projekt": f_project or (projekte_available[0] if projekte_available else ""),
-                    "Tätigkeit": "F" if "F" in (lookups.get("taetigkeit_typen") or []) else
-                    (lookups.get("taetigkeit_typen") or [""])[0],
-                    "Abgerechnet": "nein" if "nein" in (lookups.get("ja_nein") or []) else "",
-                }
-                rec_add = _render_taetigkeit_form("add", lookups, defaults=defaults_add)
-                submit_add = st.form_submit_button("Eintrag speichern")
-            if submit_add:
-                def _mutator_add(wb):
-                    ws = wb[TAETIGKEITEN_SHEET]
-                    row_idx = _find_next_write_row(ws, key_cols=KEY_COLS_FOR_EMPTY_CHECK)
-                    _write_taetigkeit_row(ws, row_idx, rec_add)
-
-                ok, msg = _save_workbook(data.path, _mutator_add)
-                if ok:
-                    st.success(msg)
-                    _refresh_after_workbook_change()
-                else:
-                    st.error(msg)
-
-        with c2:
-            st.markdown("### Bestehenden Eintrag bearbeiten")
-            if filtered.empty:
-                st.info("Zum Bearbeiten zuerst oben einen Filter mit Treffern wählen.")
-            else:
-                options = filtered.to_dict(orient="records")
-                labels = [_display_row_label(pd.Series(o)) for o in options]
-                idx = st.selectbox("Eintrag auswählen", options=list(range(len(options))),
-                                   format_func=lambda i: labels[i], key="edit_row_selector")
-                selected = options[int(idx)]
-
-                with st.form("edit_form", clear_on_submit=False):
-                    rec_edit = _render_taetigkeit_form("edit", lookups, defaults=selected)
-                    save_edit = st.form_submit_button("Änderungen speichern")
-                    delete_row = st.form_submit_button("Zeile leeren (vorsichtig)")
-
-                row_excel = int(selected["_excel_row"])
-                if save_edit:
-                    def _mutator_edit(wb):
-                        ws = wb[TAETIGKEITEN_SHEET]
-                        _write_taetigkeit_row(ws, row_excel, rec_edit)
-
-                    ok, msg = _save_workbook(data.path, _mutator_edit)
-                    if ok:
-                        st.success(f"Zeile {row_excel} aktualisiert. {msg}")
-                        _refresh_after_workbook_change()
-                    else:
-                        st.error(msg)
-                if delete_row:
-                    def _mutator_delete(wb):
-                        ws = wb[TAETIGKEITEN_SHEET]
-                        _clear_taetigkeit_row(ws, row_excel)
-
-                    ok, msg = _save_workbook(data.path, _mutator_delete)
-                    if ok:
-                        st.success(f"Zeile {row_excel} geleert. {msg}")
-                        _refresh_after_workbook_change()
-                    else:
-                        st.error(msg)
+        st.caption("Neue Tätigkeiten und Änderungen bitte direkt in der Tabelle oben erfassen.")
 
         st.markdown("---")
         st.markdown("### Schnellaktion")
@@ -3551,31 +3498,70 @@ def main() -> None:
             st.caption("Keine Treffer für Schnellaktion.")
 
         st.markdown("---")
-        st.markdown("### Migration: Einsatzbericht importieren")
+        st.markdown("### Einsatzberichte importieren")
 
-        with st.expander("Einsatzbericht(e) (Excel-Layout) hochladen und importieren"):
+        with st.expander("Dateien hochladen und importieren"):
 
-            import_mode = st.radio("Wohin sollen die Dateien importiert werden?", [
-                "In Meine Tätigkeiten (Mein Journal)",
-                "In Team-Tätigkeiten (Fürs Projekt-Controlling)"
-            ],
-                                   help="Wähle 'Team-Tätigkeiten', um die Berichte anderer Mitarbeiter strikt von deinen eigenen EBs zu trennen.")
-
-            report_files = st.file_uploader(
-                "Einsatzbericht-Excel auswählen (.xlsx)",
-                type=["xlsx"],
-                accept_multiple_files=True,
-                key="upload_reports",
+            import_mode = st.radio(
+                "Was soll importiert werden?",
+                [
+                    "Einsatzbericht(e) in Meine Tätigkeiten",
+                    "Einsatzbericht(e) in Team-Tätigkeiten",
+                    "Master-Arbeitsdatei ersetzen",
+                ],
+                help=(
+                    "Normale Einsatzberichte erzeugen neue Tätigkeitszeilen. "
+                    "Die Master-Arbeitsdatei ersetzt die komplette lokale Arbeitsdatei."
+                ),
             )
 
-            default_km = st.number_input("km (Default für importierte Zeilen)", min_value=0, value=0, step=1,
-                                         key="import_km_default")
-            set_eingetragen = st.checkbox("eingetragen automatisch = ja", value=True, key="import_set_eingetragen")
-            set_abgerechnet = st.checkbox("abgerechnet automatisch = nein", value=True, key="import_set_abgerechnet")
-
-            if report_files:
-                rev_kod_map = _build_reverse_kod_map_eb_to_aufgabe(lookups)
+            if import_mode == "Master-Arbeitsdatei ersetzen":
+                st.warning(
+                    "Nur verwenden, wenn du eine komplette Arbeitsdatei mit den Blättern "
+                    f"'{TAETIGKEITEN_SHEET}' und '{HILFS_SHEET}' übernehmen willst. "
+                    "Normale Einsatzberichte bitte mit einer der Einsatzbericht-Optionen importieren."
+                )
+                uploaded_master = st.file_uploader(
+                    "Master-Arbeitsdatei auswählen (.xlsx)",
+                    type=["xlsx"],
+                    key="upload_master_workbook",
+                )
+                if uploaded_master is not None:
+                    if st.button("Master-Arbeitsdatei übernehmen", key="import_uploaded_master_btn"):
+                        try:
+                            imported_path = _store_uploaded_excel(uploaded_master)
+                            if not _is_valid_app_workbook(imported_path):
+                                try:
+                                    imported_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                st.error(
+                                    "Diese Datei ist keine gültige Master-Arbeitsdatei. "
+                                    f"Erwartet werden mindestens die Blätter '{TAETIGKEITEN_SHEET}' und '{HILFS_SHEET}'."
+                                )
+                            else:
+                                st.session_state["_pending_import_excel_path"] = str(imported_path)
+                                st.session_state["excel_path"] = str(imported_path)
+                                _refresh_after_workbook_change()
+                        except Exception as e:
+                            st.error(f"Import fehlgeschlagen: {e}")
+            else:
                 is_team_mode = "Team" in import_mode
+
+                report_files = st.file_uploader(
+                    "Einsatzbericht-Excel auswählen (.xlsx)",
+                    type=["xlsx"],
+                    accept_multiple_files=True,
+                    key="upload_reports",
+                )
+
+                default_km = st.number_input("km (Default für importierte Zeilen)", min_value=0, value=0, step=1,
+                                             key="import_km_default")
+                set_eingetragen = st.checkbox("eingetragen automatisch = ja", value=True, key="import_set_eingetragen")
+                set_abgerechnet = st.checkbox("abgerechnet automatisch = nein", value=True, key="import_set_abgerechnet")
+
+            if import_mode != "Master-Arbeitsdatei ersetzen" and report_files:
+                rev_kod_map = _build_reverse_kod_map_eb_to_aufgabe(lookups)
                 existing_key_counts = _existing_key_counts_for_master(team_df if is_team_mode else df,
                                                                       team=is_team_mode)
                 existing_time_slot_key_counts = _existing_time_slot_key_counts_for_master(
@@ -3833,7 +3819,7 @@ def main() -> None:
                                     candidate_by_row[row_id] = cand
                                 candidate_rows.append(
                                     {
-                                        "Excel-Zeile": row_id or "",
+                                        "Bestehender Eintrag": f"Eintrag {row_id}" if row_id else "",
                                         "Datum": _format_date(cand.get("Datum")),
                                         "Projekt": cand.get("Projekt"),
                                         "Zeit (h)": cand.get("Zahl"),
@@ -3867,7 +3853,7 @@ def main() -> None:
                                     )
                                     replacements.append({"row": int(replace_row), "record": rec})
                                 else:
-                                    st.error("Keine ersetzbare Excel-Zeile gefunden.")
+                                    st.error("Kein ersetzbarer bestehender Eintrag gefunden.")
 
                 metric_cols[2].metric("Ausgewählt zum Schreiben", len(selected_records) + len(replacements))
 
@@ -3876,9 +3862,15 @@ def main() -> None:
                 ]
                 if duplicate_replace_rows:
                     st.error(
-                        "Mehrere Konflikte sollen dieselbe Excel-Zeile ersetzen. "
+                        "Mehrere Konflikte sollen denselben bestehenden Eintrag ersetzen. "
                         f"Bitte Auswahl korrigieren: {duplicate_replace_rows}"
                     )
+                import_coding_errors = _coding_required_errors(
+                    selected_records + [item["record"] for item in replacements],
+                    lookups,
+                )
+                if import_coding_errors:
+                    st.error("Kodierung fehlt:\n\n" + "\n".join(import_coding_errors[:10]))
 
                 if selected_records or replacements:
                     preview_data = []
@@ -3920,7 +3912,11 @@ def main() -> None:
                     st.dataframe(preview, use_container_width=True, height=260)
 
                 if selected_records or replacements or conflict_records:
-                    disable_import = (not selected_records and not replacements) or bool(duplicate_replace_rows)
+                    disable_import = (
+                        (not selected_records and not replacements)
+                        or bool(duplicate_replace_rows)
+                        or bool(import_coding_errors)
+                    )
                     if st.button(
                         "Import durchführen (Schreiben)",
                         key="commit_report_import",
@@ -3980,6 +3976,14 @@ def main() -> None:
 
         report_df = _build_report(df, lookups, int(r_year), int(r_month), r_project, include_abgerechnet)
         sums = _summaries_from_report(report_df)
+        ytd_df = pd.concat(
+            [
+                _build_report(df, lookups, int(r_year), month, r_project, include_abgerechnet)
+                for month in range(1, int(r_month) + 1)
+            ],
+            ignore_index=True,
+        ) if int(r_month) >= 1 else pd.DataFrame()
+        ytd_sums = _summaries_from_report(ytd_df)
 
         info = lookups.get("projekt_infos", {}).get(r_project, {})
         p1, p2 = st.columns(2)
@@ -4003,6 +4007,23 @@ def main() -> None:
         m2.metric("Reisezeit (R)", f"{sums['R']:.2f} h")
         m3.metric("Kulanz (K)", f"{sums['K']:.2f} h")
         m4.metric("Gesamt", f"{sums['gesamt']:.2f} h")
+
+        st.markdown("#### Kumuliert im Jahr (YTD)")
+        y1, y2, y3, y4 = st.columns(4)
+        y1.metric("YTD Beratung (F)", f"{ytd_sums['F']:.2f} h")
+        y2.metric("YTD Reisezeit (R)", f"{ytd_sums['R']:.2f} h")
+        y3.metric("YTD Kulanz (K)", f"{ytd_sums['K']:.2f} h")
+        y4.metric("YTD Gesamt", f"{ytd_sums['gesamt']:.2f} h")
+        if not ytd_df.empty:
+            ytd_monthly = (
+                ytd_df.assign(Monat=ytd_df["Datum"].apply(lambda value: _to_date(value).month if _to_date(value) else None))
+                .dropna(subset=["Monat"])
+                .groupby("Monat", as_index=False)["Zahl"]
+                .sum()
+                .rename(columns={"Zahl": "Stunden"})
+            )
+            ytd_monthly["Monat"] = ytd_monthly["Monat"].astype(int).map(lambda month: f"{month:02d}/{int(r_year)}")
+            st.dataframe(ytd_monthly, use_container_width=True, height=180)
 
         if len(report_df) > REPORT_ROWS_PER_PAGE:
             st.info(
