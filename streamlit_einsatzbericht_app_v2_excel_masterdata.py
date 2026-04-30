@@ -3291,6 +3291,22 @@ def main() -> None:
                 if c not in editor_df.columns:
                     editor_df[c] = None
 
+            if editor_df.empty:
+                default_type = "F" if "F" in typen_opts else (typen_opts[0] if typen_opts else "")
+                placeholder = {c: None for c in editor_cols}
+                placeholder.update(
+                    {
+                        "Datum": dt.date(int(f_year), int(f_month), 1),
+                        "Projekt": f_project or "",
+                        "Pause_Min": 0,
+                        "km": 0,
+                        "Tätigkeit": default_type,
+                        "Abgerechnet": "",
+                        "eingetragen": "",
+                    }
+                )
+                editor_df = pd.DataFrame([placeholder], columns=editor_cols)
+
             editor_df["Löschen"] = False
 
             data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
@@ -3386,15 +3402,19 @@ def main() -> None:
                 }
 
             def _is_editor_row_blank(r: pd.Series) -> bool:
+                zahl = r.get("Zahl")
+                has_hours = False
+                try:
+                    has_hours = zahl is not None and pd.notna(zahl) and float(zahl) > 0
+                except Exception:
+                    has_hours = False
                 return (
-                        _is_blank(r.get("Datum")) and
-                        _is_blank(r.get("Projekt")) and
                         _is_blank(r.get("Zeit von")) and
                         _is_blank(r.get("Zeit bis")) and
-                        _is_blank(r.get("Tätigkeit")) and
+                        not has_hours and
                         _is_blank(r.get("Info")) and
-                        _is_blank(r.get("Abgerechnet")) and
-                        _is_blank(r.get("eingetragen"))
+                        _is_blank(r.get("Interne Projekte")) and
+                        _is_blank(r.get("Kodierung"))
                 )
 
             if st.button("Tabellenänderungen speichern", key="save_inline_table"):
