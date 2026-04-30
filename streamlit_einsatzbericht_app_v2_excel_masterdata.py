@@ -4014,13 +4014,13 @@ def main() -> None:
         y2.metric("YTD Reisezeit (R)", f"{ytd_sums['R']:.2f} h")
         y3.metric("YTD Kulanz (K)", f"{ytd_sums['K']:.2f} h")
         y4.metric("YTD Gesamt", f"{ytd_sums['gesamt']:.2f} h")
-        if not ytd_df.empty:
+        if not ytd_df.empty and {"Datum", "Zeit (h)"}.issubset(ytd_df.columns):
             ytd_monthly = (
                 ytd_df.assign(Monat=ytd_df["Datum"].apply(lambda value: _to_date(value).month if _to_date(value) else None))
                 .dropna(subset=["Monat"])
-                .groupby("Monat", as_index=False)["Zahl"]
+                .groupby("Monat", as_index=False)["Zeit (h)"]
                 .sum()
-                .rename(columns={"Zahl": "Stunden"})
+                .rename(columns={"Zeit (h)": "Stunden"})
             )
             ytd_monthly["Monat"] = ytd_monthly["Monat"].astype(int).map(lambda month: f"{month:02d}/{int(r_year)}")
             st.dataframe(ytd_monthly, use_container_width=True, height=180)
