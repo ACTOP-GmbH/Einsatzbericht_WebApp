@@ -495,7 +495,30 @@ if [ ! -d "$PAYLOAD" ]; then
     PAYLOAD="$STAGE"
   fi
 fi
-ditto "$PAYLOAD" "$INSTALL_DIR"
+
+stop_installed_app() {{
+  if [ -n "$RELAUNCH" ]; then
+    pkill -f "$RELAUNCH" >/dev/null 2>&1 || true
+  fi
+  pkill -f "$INSTALL_DIR/run_app.py" >/dev/null 2>&1 || true
+  pkill -f "$INSTALL_DIR/.venv" >/dev/null 2>&1 || true
+}}
+
+copy_payload_with_retry() {{
+  attempt=1
+  while [ "$attempt" -le 12 ]; do
+    if ditto "$PAYLOAD" "$INSTALL_DIR"; then
+      return 0
+    fi
+    stop_installed_app
+    sleep 1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}}
+
+stop_installed_app
+copy_payload_with_retry
 python3 - <<PY >/dev/null 2>&1
 import json
 from pathlib import Path
