@@ -3291,6 +3291,22 @@ def main() -> None:
                 if c not in editor_df.columns:
                     editor_df[c] = None
 
+            if editor_df.empty:
+                default_type = "F" if "F" in typen_opts else (typen_opts[0] if typen_opts else "")
+                placeholder = {c: None for c in editor_cols}
+                placeholder.update(
+                    {
+                        "Datum": dt.date(int(f_year), int(f_month), 1),
+                        "Projekt": f_project or "",
+                        "Pause_Min": 0,
+                        "km": 0,
+                        "Tätigkeit": default_type,
+                        "Abgerechnet": "",
+                        "eingetragen": "",
+                    }
+                )
+                editor_df = pd.DataFrame([placeholder], columns=editor_cols)
+
             editor_df["Löschen"] = False
 
             data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
@@ -3386,15 +3402,19 @@ def main() -> None:
                 }
 
             def _is_editor_row_blank(r: pd.Series) -> bool:
+                zahl = r.get("Zahl")
+                has_hours = False
+                try:
+                    has_hours = zahl is not None and pd.notna(zahl) and float(zahl) > 0
+                except Exception:
+                    has_hours = False
                 return (
-                        _is_blank(r.get("Datum")) and
-                        _is_blank(r.get("Projekt")) and
                         _is_blank(r.get("Zeit von")) and
                         _is_blank(r.get("Zeit bis")) and
-                        _is_blank(r.get("Tätigkeit")) and
+                        not has_hours and
                         _is_blank(r.get("Info")) and
-                        _is_blank(r.get("Abgerechnet")) and
-                        _is_blank(r.get("eingetragen"))
+                        _is_blank(r.get("Interne Projekte")) and
+                        _is_blank(r.get("Kodierung"))
                 )
 
             if st.button("Tabellenänderungen speichern", key="save_inline_table"):
@@ -4014,13 +4034,13 @@ def main() -> None:
         y2.metric("YTD Reisezeit (R)", f"{ytd_sums['R']:.2f} h")
         y3.metric("YTD Kulanz (K)", f"{ytd_sums['K']:.2f} h")
         y4.metric("YTD Gesamt", f"{ytd_sums['gesamt']:.2f} h")
-        if not ytd_df.empty:
+        if not ytd_df.empty and {"Datum", "Zeit (h)"}.issubset(ytd_df.columns):
             ytd_monthly = (
                 ytd_df.assign(Monat=ytd_df["Datum"].apply(lambda value: _to_date(value).month if _to_date(value) else None))
                 .dropna(subset=["Monat"])
-                .groupby("Monat", as_index=False)["Zahl"]
+                .groupby("Monat", as_index=False)["Zeit (h)"]
                 .sum()
-                .rename(columns={"Zahl": "Stunden"})
+                .rename(columns={"Zeit (h)": "Stunden"})
             )
             ytd_monthly["Monat"] = ytd_monthly["Monat"].astype(int).map(lambda month: f"{month:02d}/{int(r_year)}")
             st.dataframe(ytd_monthly, use_container_width=True, height=180)
