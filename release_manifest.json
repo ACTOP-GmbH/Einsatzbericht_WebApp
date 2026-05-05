@@ -11,5 +11,6 @@
   "launcher_relative_path_windows": "run_app.exe",
   "launcher_relative_path_macos": "run_app",
   "check_updates": true,
-  "update_interval_hours": 12
+  "update_interval_hours": 12,
+  "runtime_update_check_interval_minutes": 30
 }

@@ -24,6 +24,13 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     st = None
 
+try:
+    from desktop_runtime import check_for_update_info, load_release_manifest, start_update_from_info
+except Exception:  # pragma: no cover
+    check_for_update_info = None
+    load_release_manifest = None
+    start_update_from_info = None
+
 APP_TITLE = "Einsatzbericht Manager (MVP)"
 TAETIGKEITEN_SHEET = "Tätigkeiten"
 TEAM_SHEET = "Team_Tätigkeiten"
@@ -1559,6 +1566,80 @@ def _refresh_after_workbook_change() -> None:
     st.cache_data.clear()
     st.session_state["_workbook_refresh_nonce"] = int(st.session_state.get("_workbook_refresh_nonce", 0) or 0) + 1
     st.rerun()
+
+
+def _runtime_update_check_interval_minutes() -> int:
+    if load_release_manifest is None:
+        return 30
+    try:
+        manifest = load_release_manifest()
+        return max(int(manifest.get("runtime_update_check_interval_minutes", 30) or 30), 1)
+    except Exception:
+        return 30
+
+
+def _runtime_update_fragment_interval() -> dt.timedelta:
+    return dt.timedelta(minutes=_runtime_update_check_interval_minutes())
+
+
+def _render_runtime_update_notice() -> None:
+    if check_for_update_info is None or start_update_from_info is None:
+        return
+
+    if st.session_state.get("_runtime_update_installing"):
+        st.warning("Update wird installiert. Die App wird gleich neu gestartet.")
+        st.stop()
+
+    update_info = st.session_state.get("_runtime_update_info")
+    if not update_info:
+        update_info = check_for_update_info()
+        if update_info.get("available"):
+            st.session_state["_runtime_update_info"] = update_info
+
+    if not update_info or not update_info.get("available"):
+        return
+
+    latest_version = _safe_str(update_info.get("latest_version")).strip()
+    if latest_version and st.session_state.get("_runtime_update_dismissed_version") == latest_version:
+        return
+
+    current_version = _safe_str(update_info.get("current_version")).strip()
+    changelog = _safe_str(update_info.get("changelog")).strip() or f"Neue Version: {latest_version}"
+
+    with st.container(border=True):
+        st.warning(
+            f"Update verfuegbar: {current_version or 'aktuelle Version'} -> {latest_version}. "
+            "Bitte installieren, sobald du deine aktuellen Eingaben gespeichert hast."
+        )
+        with st.expander("Changelog anzeigen", expanded=True):
+            st.markdown(changelog)
+
+        c_update, c_later = st.columns([1, 1])
+        with c_update:
+            if st.button("Update installieren und App neu starten", key=f"runtime_update_install_{latest_version}"):
+                ok, msg = start_update_from_info(update_info)
+                if ok:
+                    st.session_state["_runtime_update_installing"] = True
+                    st.success(msg)
+                    st.stop()
+                st.error(f"Update konnte nicht gestartet werden: {msg}")
+        with c_later:
+            if st.button("Fuer diese Sitzung ausblenden", key=f"runtime_update_dismiss_{latest_version}"):
+                st.session_state["_runtime_update_dismissed_version"] = latest_version
+                st.rerun()
+
+
+def _render_periodic_runtime_update_check() -> None:
+    fragment = getattr(st, "fragment", None)
+    if fragment is None:
+        _render_runtime_update_notice()
+        return
+
+    @fragment(run_every=_runtime_update_fragment_interval())
+    def _runtime_update_fragment() -> None:
+        _render_runtime_update_notice()
+
+    _runtime_update_fragment()
 
 
 # ------------------------- reporting logic -------------------------
@@ -3110,6 +3191,7 @@ def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     st.caption("Lokale Webapp für Tätigkeiten-Erfassung und Einsatzbericht-Auswertung (Excel-basiert, MVP)")
+    _render_periodic_runtime_update_check()
 
     remembered_path = _safe_str(st.session_state.get("excel_path", "")).strip()
     default_path = ""
