@@ -2519,8 +2519,6 @@ def _render_visualisierung_tab(
     min_y = min(all_years) if all_years else dt.date.today().year
     max_y = max(all_years) if all_years else dt.date.today().year
     project_select_key = f"viz_projects_v2_{'controller' if is_controller else 'employee'}_{own_label}"
-    if project_select_key not in st.session_state:
-        st.session_state[project_select_key] = default_projects
 
     c1, c2, c3, c4 = st.columns([2, 1, 1, 2])
     with c1:
