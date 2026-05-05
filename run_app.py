@@ -20,6 +20,9 @@ import streamlit.web.cli as stcli
 from streamlit import config as st_config
 
 
+LOCAL_HOST = "localhost"
+
+
 def _apply_streamlit_options() -> None:
     for option_name, value in {
         "global.developmentMode": False,
@@ -38,7 +41,7 @@ def _find_available_port(preferred: int = 8501, attempts: int = 20) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                sock.bind(("127.0.0.1", port))
+                sock.bind((LOCAL_HOST, port))
                 return port
             except OSError:
                 continue
@@ -47,7 +50,7 @@ def _find_available_port(preferred: int = 8501, attempts: int = 20) -> int:
 
 def _server_ready(port: int, timeout: float = 1.0) -> bool:
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/_stcore/health", timeout=timeout):
+        with urllib.request.urlopen(f"http://{LOCAL_HOST}:{port}/_stcore/health", timeout=timeout):
             return True
     except Exception:
         return False
@@ -64,7 +67,7 @@ def _open_existing_instance(runtime: dict, preferred: int = 8501, attempts: int 
     ports.extend(range(preferred, preferred + attempts))
     for port in dict.fromkeys(ports):
         if _server_ready(int(port)):
-            webbrowser.open(f"http://127.0.0.1:{int(port)}")
+            webbrowser.open(f"http://{LOCAL_HOST}:{int(port)}")
             return True
     return False
 
@@ -79,7 +82,7 @@ def _remember_port(runtime: dict, port: int) -> None:
 
 
 def _open_browser_when_ready(port: int, timeout_seconds: int = 45) -> None:
-    browser_url = f"http://127.0.0.1:{port}"
+    browser_url = f"http://{LOCAL_HOST}:{port}"
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
@@ -111,7 +114,7 @@ if __name__ == "__main__":
         str(app_script_path()),
         "--global.developmentMode=false",
         "--server.headless=true",
-        "--server.address=127.0.0.1",
+        f"--server.address={LOCAL_HOST}",
         f"--server.port={port}",
         "--server.showEmailPrompt=false",
         "--browser.gatherUsageStats=false",
