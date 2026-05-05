@@ -29,6 +29,7 @@ DEFAULT_MANIFEST: Dict[str, Any] = {
     "launcher_relative_path_macos": "run_app",
     "check_updates": True,
     "update_interval_hours": 12,
+    "runtime_update_check_interval_minutes": 30,
 }
 
 
@@ -171,9 +172,9 @@ def _save_update_state(user_root: Path, state: Dict[str, Any]) -> bool:
     return True
 
 
-def _mark_update_checked(user_root: Path, **extra: Any) -> None:
+def _mark_update_checked(user_root: Path, timestamp_key: str = "last_check_utc", **extra: Any) -> None:
     state = _load_update_state(user_root)
-    state["last_check_utc"] = dt.datetime.utcnow().isoformat()
+    state[timestamp_key] = dt.datetime.utcnow().isoformat()
     state.update(extra)
     _save_update_state(user_root, state)
 
@@ -186,19 +187,26 @@ def _mark_pending_update_changelog(user_root: Path, version: str, changelog: str
     _save_update_state(user_root, state)
 
 
-def _should_check_for_updates(user_root: Path, manifest: Dict[str, Any]) -> bool:
+def _should_check_for_updates(
+    user_root: Path,
+    manifest: Dict[str, Any],
+    *,
+    timestamp_key: str = "last_check_utc",
+    interval_minutes: Optional[int] = None,
+) -> bool:
     if not bool(manifest.get("check_updates", True)):
         return False
     state = _load_update_state(user_root)
-    interval_hours = int(manifest.get("update_interval_hours", 12) or 12)
-    last_check = str(state.get("last_check_utc") or "").strip()
+    if interval_minutes is None:
+        interval_minutes = int(float(manifest.get("update_interval_hours", 12) or 12) * 60)
+    last_check = str(state.get(timestamp_key) or "").strip()
     if not last_check:
         return True
     try:
         last_dt = dt.datetime.fromisoformat(last_check)
     except Exception:
         return True
-    return (dt.datetime.utcnow() - last_dt) >= dt.timedelta(hours=interval_hours)
+    return (dt.datetime.utcnow() - last_dt) >= dt.timedelta(minutes=max(int(interval_minutes), 1))
 
 
 def _fetch_latest_release(manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -562,23 +570,22 @@ def _launch_external_updater(base_dir: Path, zip_path: Path, manifest: Dict[str,
     subprocess.Popen(["/bin/sh", str(script_path)], close_fds=True)
 
 
-def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
-    resource_dir = base_dir or _resource_dir()
-    install_dir = _install_dir()
-    manifest = load_release_manifest(resource_dir)
-    current_version = str(manifest.get("version") or "").strip()
-    if not getattr(sys, "frozen", False) and (not current_version or current_version == "dev"):
-        return False
-    runtime = prepare_runtime_environment(resource_dir)
-    user_root = runtime["user_root"]
+def _runtime_update_interval_minutes(manifest: Dict[str, Any]) -> int:
+    try:
+        return max(int(manifest.get("runtime_update_check_interval_minutes", 30) or 30), 1)
+    except Exception:
+        return 30
 
-    if not _should_check_for_updates(user_root, manifest):
-        return False
 
+def _available_update_payload(
+    manifest: Dict[str, Any],
+    current_version: str,
+) -> Optional[Dict[str, str]]:
     update_url: Optional[str] = None
     latest_version = ""
     changelog = ""
     download_name = "update.zip"
+
     try:
         release = _fetch_latest_release(manifest)
     except Exception:
@@ -600,8 +607,7 @@ def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
         if latest_commit:
             latest_sha = str(latest_commit["sha"])
             if latest_sha.startswith(current_version):
-                _mark_update_checked(user_root, last_update_result="current", latest_version=latest_commit["short_sha"])
-                return False
+                return None
             archive_url = _source_archive_url(manifest, latest_sha)
             if archive_url:
                 update_url = archive_url
@@ -610,15 +616,74 @@ def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
                 changelog = str(latest_commit.get("message") or "").strip() or f"Neuer Commit: {latest_version}"
 
     if not update_url or not latest_version:
-        _mark_update_checked(user_root, last_update_result="no_update")
-        return False
+        return None
 
-    message = _shorten_dialog_text(
-        f"Version {latest_version} ist verfuegbar.\n\nChangelog:\n{changelog}\n\nJetzt aktualisieren?",
+    return {
+        "update_url": update_url,
+        "latest_version": latest_version,
+        "changelog": changelog,
+        "download_name": download_name,
+        "current_version": current_version,
+    }
+
+
+def check_for_update_info(base_dir: Optional[Path] = None, *, force: bool = False) -> Dict[str, Any]:
+    resource_dir = base_dir or _resource_dir()
+    manifest = load_release_manifest(resource_dir)
+    current_version = str(manifest.get("version") or "").strip()
+    if not getattr(sys, "frozen", False) and (not current_version or current_version == "dev"):
+        return {"available": False, "reason": "dev"}
+
+    runtime = prepare_runtime_environment(resource_dir)
+    user_root = runtime["user_root"]
+    interval_minutes = _runtime_update_interval_minutes(manifest)
+    timestamp_key = "last_runtime_check_utc"
+
+    if not force and not _should_check_for_updates(
+        user_root,
+        manifest,
+        timestamp_key=timestamp_key,
+        interval_minutes=interval_minutes,
+    ):
+        return {"available": False, "reason": "throttled"}
+
+    try:
+        payload = _available_update_payload(manifest, current_version)
+    except Exception as exc:
+        _mark_update_checked(
+            user_root,
+            timestamp_key=timestamp_key,
+            last_runtime_update_result="failed",
+            last_runtime_update_error=str(exc),
+        )
+        return {"available": False, "reason": "failed", "error": str(exc)}
+
+    if not payload:
+        _mark_update_checked(user_root, timestamp_key=timestamp_key, last_runtime_update_result="no_update")
+        return {"available": False, "reason": "no_update"}
+
+    _mark_update_checked(
+        user_root,
+        timestamp_key=timestamp_key,
+        last_runtime_update_result="available",
+        latest_version=payload["latest_version"],
     )
-    if not _ask_yes_no("Update verfuegbar", message):
-        _mark_update_checked(user_root, last_update_result="declined", latest_version=latest_version)
-        return False
+    return {"available": True, **payload}
+
+
+def start_update_from_info(update_info: Dict[str, Any], base_dir: Optional[Path] = None) -> tuple[bool, str]:
+    resource_dir = base_dir or _resource_dir()
+    install_dir = _install_dir()
+    manifest = load_release_manifest(resource_dir)
+    runtime = prepare_runtime_environment(resource_dir)
+    user_root = runtime["user_root"]
+
+    update_url = str(update_info.get("update_url") or "").strip()
+    latest_version = str(update_info.get("latest_version") or "").strip()
+    changelog = str(update_info.get("changelog") or "").strip()
+    download_name = str(update_info.get("download_name") or "update.zip").strip() or "update.zip"
+    if not update_url or not latest_version:
+        return False, "Update-Information ist unvollstaendig."
 
     try:
         zip_path = _download_update_zip(update_url, user_root, download_name)
@@ -627,6 +692,38 @@ def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
         _mark_update_checked(user_root, last_update_result="started", latest_version=latest_version)
     except Exception as exc:
         _mark_update_checked(user_root, last_update_result="failed", last_update_error=str(exc))
+        return False, str(exc)
+    return True, "Update wird installiert. Die App startet danach neu."
+
+
+def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
+    resource_dir = base_dir or _resource_dir()
+    manifest = load_release_manifest(resource_dir)
+    current_version = str(manifest.get("version") or "").strip()
+    if not getattr(sys, "frozen", False) and (not current_version or current_version == "dev"):
+        return False
+    runtime = prepare_runtime_environment(resource_dir)
+    user_root = runtime["user_root"]
+
+    if not _should_check_for_updates(user_root, manifest):
+        return False
+
+    update_info = _available_update_payload(manifest, current_version)
+    if not update_info:
+        _mark_update_checked(user_root, last_update_result="no_update")
+        return False
+
+    latest_version = update_info["latest_version"]
+    changelog = update_info["changelog"]
+    message = _shorten_dialog_text(
+        f"Version {latest_version} ist verfuegbar.\n\nChangelog:\n{changelog}\n\nJetzt aktualisieren?",
+    )
+    if not _ask_yes_no("Update verfuegbar", message):
+        _mark_update_checked(user_root, last_update_result="declined", latest_version=latest_version)
+        return False
+
+    ok, _message = start_update_from_info(update_info, resource_dir)
+    if not ok:
         return False
     return True
 
