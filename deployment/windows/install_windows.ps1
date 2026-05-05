@@ -244,6 +244,7 @@ $stdoutPath = Join-Path $installDir "launch_stdout.log"
 $stderrPath = Join-Path $installDir "launch_stderr.log"
 $installRoot = Split-Path -Parent $installDir
 $portFile = Join-Path $installRoot "logs\server_port.txt"
+$localHostName = "localhost"
 $port = 8501
 
 $env:STREAMLIT_BROWSER_GATHER_USAGE_STATS = "false"
@@ -261,7 +262,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $streamlitDir "config.toml"))) {
 function Test-ServerReady {
     param([int]$Port)
     try {
-        $Url = "http://127.0.0.1:$Port/_stcore/health"
+        $Url = "http://${localHostName}:$Port/_stcore/health"
         Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2 | Out-Null
         return $true
     } catch {
@@ -280,7 +281,7 @@ function Open-ExistingInstance {
     $ports += 8501..8520
     foreach ($candidate in ($ports | Select-Object -Unique)) {
         if (Test-ServerReady -Port $candidate) {
-            Start-Process "http://127.0.0.1:$candidate" | Out-Null
+            Start-Process "http://${localHostName}:$candidate" | Out-Null
             return $true
         }
     }
