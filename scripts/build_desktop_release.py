@@ -4,6 +4,7 @@ import argparse
 import json
 import shutil
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -70,6 +71,17 @@ def _installer_source(platform_name: str) -> Path:
     if platform_name == "windows":
         return ROOT / "deployment" / "windows" / "install_windows.ps1"
     return ROOT / "deployment" / "macos" / "install_macos.command"
+
+
+def _build_pyinstaller_payload() -> Path:
+    subprocess.check_call(
+        [sys.executable, "-m", "PyInstaller", "run_app.spec", "--noconfirm"],
+        cwd=ROOT,
+    )
+    launcher = DIST_DIR / "run_app.exe"
+    if not launcher.exists():
+        raise FileNotFoundError(f"PyInstaller finished, but launcher is missing: {launcher}")
+    return DIST_DIR
 
 
 def _windows_wrapper_source() -> Path:
@@ -206,6 +218,11 @@ def build_release(platform_name: str, version: str, payload_dir: Path, output_di
         if bundled_runtime
         else "6. Dieses Source-Installer-ZIP erstellt beim Installieren eine lokale Python-Umgebung und installiert die benoetigten Pakete."
     )
+    update_note = (
+        "7. Updates laden ein neues Release-ZIP mit bereits neu gebauter run_app.exe; auf Tester-PCs wird keine EXE kompiliert."
+        if bundled_runtime
+        else "7. Updates laden den aktuellen Source-Stand und aktualisieren die lokale Python-Umgebung."
+    )
     readme.write_text(
         "\n".join(
             [
@@ -219,6 +236,7 @@ def build_release(platform_name: str, version: str, payload_dir: Path, output_di
                 "4. Updates werden beim Start ueber GitHub Releases geprueft.",
                 "5. Die mitgelieferte Excel-Datei ist eine leere Startvorlage ohne Nutzerdaten.",
                 dependency_note,
+                update_note,
                 "",
                 "Hinweis:",
                 "Wenn das Repository privat bleibt, muessen die Release-ZIPs oeffentlich oder ueber einen anderen Download-Kanal erreichbar sein.",
@@ -243,12 +261,23 @@ def main() -> None:
     parser.add_argument("--version", default=_git_version())
     parser.add_argument("--payload-dir", default=str(DIST_DIR))
     parser.add_argument("--output-dir", default=str(ROOT / "release"))
+    parser.add_argument(
+        "--build-pyinstaller",
+        action="store_true",
+        help="Build dist/run_app with PyInstaller before creating the Windows release ZIP.",
+    )
     args = parser.parse_args()
+
+    payload_dir = Path(args.payload_dir).resolve()
+    if args.build_pyinstaller:
+        if args.platform != "windows":
+            raise ValueError("--build-pyinstaller is only supported for the Windows release ZIP.")
+        payload_dir = _build_pyinstaller_payload()
 
     zip_path = build_release(
         platform_name=args.platform,
         version=args.version,
-        payload_dir=Path(args.payload_dir).resolve(),
+        payload_dir=payload_dir,
         output_dir=Path(args.output_dir).resolve(),
     )
     print(f"Created release ZIP: {zip_path}")

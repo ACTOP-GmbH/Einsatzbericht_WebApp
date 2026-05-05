@@ -8,7 +8,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import textwrap
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -179,6 +178,14 @@ def _mark_update_checked(user_root: Path, **extra: Any) -> None:
     _save_update_state(user_root, state)
 
 
+def _mark_pending_update_changelog(user_root: Path, version: str, changelog: str) -> None:
+    state = _load_update_state(user_root)
+    state["pending_changelog_version"] = version
+    state["pending_changelog"] = changelog
+    state["pending_changelog_created_utc"] = dt.datetime.utcnow().isoformat()
+    _save_update_state(user_root, state)
+
+
 def _should_check_for_updates(user_root: Path, manifest: Dict[str, Any]) -> bool:
     if not bool(manifest.get("check_updates", True)):
         return False
@@ -265,6 +272,22 @@ def _ask_yes_no(title: str, message: str) -> bool:
         return False
 
 
+def _show_info(title: str, message: str) -> bool:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            messagebox.showinfo(title, message)
+            return True
+        finally:
+            root.destroy()
+    except Exception:
+        return False
+
+
 def _show_error(title: str, message: str) -> None:
     try:
         import tkinter as tk
@@ -308,6 +331,47 @@ def report_startup_failure(exc: BaseException) -> Optional[Path]:
     return log_path
 
 
+def _shorten_dialog_text(message: str, width: int = 3500) -> str:
+    if len(message) <= width:
+        return message
+    return message[: max(0, width - 8)].rstrip() + "\n...\n"
+
+
+def show_pending_update_changelog(base_dir: Optional[Path] = None) -> bool:
+    resource_dir = base_dir or _resource_dir()
+    manifest = load_release_manifest(resource_dir)
+    current_version = str(manifest.get("version") or "").strip()
+    if not current_version or current_version == "dev":
+        return False
+
+    user_root = _user_data_root(manifest)
+    state = _load_update_state(user_root)
+    pending_version = str(state.get("pending_changelog_version") or "").strip()
+    if pending_version != current_version:
+        return False
+
+    shown_versions = [str(value) for value in (state.get("shown_changelog_versions") or [])]
+    if current_version in shown_versions:
+        return False
+
+    changelog = str(state.get("pending_changelog") or "").strip()
+    if not changelog:
+        changelog = f"Version {current_version} wurde installiert."
+    message = _shorten_dialog_text(
+        f"Version {current_version} wurde installiert.\n\nChangelog:\n{changelog}"
+    )
+    if not _show_info("Update installiert", message):
+        return False
+
+    shown_versions.append(current_version)
+    state["shown_changelog_versions"] = sorted(set(shown_versions))
+    state.pop("pending_changelog_version", None)
+    state.pop("pending_changelog", None)
+    state.pop("pending_changelog_created_utc", None)
+    _save_update_state(user_root, state)
+    return True
+
+
 def _download_update_zip(url: str, user_root: Path, file_name: str = "update.zip") -> Path:
     downloads_dir = user_root / "downloads"
     downloads_dir.mkdir(parents=True, exist_ok=True)
@@ -336,6 +400,39 @@ $MainScriptName = {json.dumps(main_script)}
 $Stage = Join-Path $env:TEMP ("einsatzbericht_update_" + [guid]::NewGuid().ToString())
 New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 Expand-Archive -LiteralPath $ZipPath -DestinationPath $Stage -Force
+
+function Stop-InstalledApp {{
+    Get-Process -Name "run_app" -ErrorAction SilentlyContinue |
+        Where-Object {{ -not $_.Path -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) }} |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
+    foreach ($ProcessName in @("python.exe", "pythonw.exe")) {{
+        try {{
+            Get-CimInstance Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction SilentlyContinue |
+                Where-Object {{ $_.CommandLine -and $_.CommandLine.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }} |
+                ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}
+        }} catch {{
+        }}
+    }}
+}}
+
+function Copy-PayloadWithRetry {{
+    param([string]$PayloadPath)
+
+    for ($Attempt = 1; $Attempt -le 12; $Attempt++) {{
+        try {{
+            Copy-Item -Path (Join-Path $PayloadPath "*") -Destination $InstallDir -Recurse -Force -ErrorAction Stop
+            return
+        }} catch {{
+            if ($Attempt -eq 12) {{
+                throw
+            }}
+            Stop-InstalledApp
+            Start-Sleep -Seconds 1
+        }}
+    }}
+}}
+
 $Payload = Join-Path $Stage "app"
 if (-not (Test-Path -LiteralPath $Payload)) {{
     $Payload = Get-ChildItem -LiteralPath $Stage -Directory |
@@ -345,7 +442,8 @@ if (-not (Test-Path -LiteralPath $Payload)) {{
 if (-not $Payload) {{
     $Payload = $Stage
 }}
-Copy-Item -Path (Join-Path $Payload "*") -Destination $InstallDir -Recurse -Force
+Stop-InstalledApp
+Copy-PayloadWithRetry -PayloadPath $Payload
 $ManifestPath = Join-Path $InstallDir "release_manifest.json"
 if (Test-Path -LiteralPath $ManifestPath) {{
     try {{
@@ -471,7 +569,7 @@ def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
             body = str(release.get("body") or "").strip()
             changelog = body if body else f"Neue Version: {latest_version}"
 
-    if not update_url and _is_commit_version(current_version):
+    if not update_url and _is_commit_version(current_version) and not getattr(sys, "frozen", False):
         try:
             latest_commit = _fetch_latest_commit(manifest)
         except Exception:
@@ -492,10 +590,8 @@ def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
         _mark_update_checked(user_root, last_update_result="no_update")
         return False
 
-    message = textwrap.shorten(
+    message = _shorten_dialog_text(
         f"Version {latest_version} ist verfuegbar.\n\nChangelog:\n{changelog}\n\nJetzt aktualisieren?",
-        width=3500,
-        placeholder="\n...\n",
     )
     if not _ask_yes_no("Update verfuegbar", message):
         _mark_update_checked(user_root, last_update_result="declined", latest_version=latest_version)
@@ -503,6 +599,7 @@ def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
 
     try:
         zip_path = _download_update_zip(update_url, user_root, download_name)
+        _mark_pending_update_changelog(user_root, latest_version, changelog)
         _launch_external_updater(install_dir, zip_path, manifest, latest_version)
         _mark_update_checked(user_root, last_update_result="started", latest_version=latest_version)
     except Exception as exc:

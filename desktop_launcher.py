@@ -12,6 +12,7 @@ from desktop_runtime import (
     maybe_check_for_updates,
     prepare_runtime_environment,
     report_startup_failure,
+    show_pending_update_changelog,
 )
 
 configure_streamlit_runtime()
@@ -98,6 +99,7 @@ if __name__ == "__main__":
         _apply_streamlit_options()
         if maybe_check_for_updates():
             sys.exit(0)
+        show_pending_update_changelog()
         if _open_existing_instance(runtime):
             sys.exit(0)
 
