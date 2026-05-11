@@ -186,12 +186,14 @@ def run_bootstrap() -> int:
         splash.update("Laufende Instanz wird gesucht...")
         if _open_existing_instance(runtime):
             splash.close(delay_ms=500)
+            time.sleep(0.6)
             return 0
 
         splash.update("Streamlit wird gestartet...")
         child = _start_child(runtime)
         if _wait_for_child(runtime, child, splash):
             splash.close(delay_ms=1500)
+            time.sleep(1.6)
             return 0
 
         splash.close()
