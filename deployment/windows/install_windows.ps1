@@ -86,17 +86,57 @@ function Unblock-Tree {
     }
 }
 
-function Stop-InstalledApp {
-    Get-Process run_app -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+function Get-InstalledAppProcessIds {
+    $ids = New-Object "System.Collections.Generic.HashSet[int]"
 
-    try {
-        Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -and $_.CommandLine -like "*$installDir*" } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    } catch {
+    Get-Process run_app -ErrorAction SilentlyContinue | ForEach-Object {
+        if ((-not $_.Path) -or $_.Path.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void]$ids.Add([int]$_.Id)
+        }
     }
 
-    Start-Sleep -Milliseconds 500
+    foreach ($processName in @("python.exe", "pythonw.exe", "powershell.exe", "pwsh.exe")) {
+        try {
+            Get-CimInstance Win32_Process -Filter "Name = '$processName'" -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $cmd = [string]($_.CommandLine)
+                    $exe = [string]($_.ExecutablePath)
+                    ($cmd.IndexOf($installDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                    ($cmd.IndexOf($installRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                    ($exe -and $exe.StartsWith($installDir, [System.StringComparison]::OrdinalIgnoreCase))
+                } |
+                ForEach-Object { [void]$ids.Add([int]$_.ProcessId) }
+        } catch {
+        }
+    }
+
+    $result = @()
+    foreach ($id in $ids) {
+        $result += [int]$id
+    }
+    return $result
+}
+
+function Stop-InstalledApp {
+    $deadline = (Get-Date).AddSeconds(10)
+
+    do {
+        $processIds = @(Get-InstalledAppProcessIds | Where-Object { $_ -and $_ -ne $PID } | Select-Object -Unique)
+        if ($processIds.Count -eq 0) {
+            return
+        }
+
+        Show-InstallStatus "Laufende App-Prozesse werden beendet..."
+        foreach ($processId in $processIds) {
+            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 500
+    } while ((Get-Date) -lt $deadline)
+
+    $remaining = @(Get-InstalledAppProcessIds | Where-Object { $_ -and $_ -ne $PID } | Select-Object -Unique)
+    if ($remaining.Count -gt 0) {
+        throw "Die laufende App konnte nicht vollstaendig beendet werden. Bitte App-Fenster schliessen und install.bat erneut starten."
+    }
 }
 
 function Remove-InstallDirContentsWithRetry {
