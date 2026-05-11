@@ -1537,11 +1537,23 @@ def _project_uses_coding(lookups: Dict[str, Any], project_name: Any) -> bool:
     return _normalize_yes_no(info.get("Kodierung verwenden")) != "nein"
 
 
+def _is_organisatorisches_record(rec: Dict[str, Any]) -> bool:
+    fields = [
+        rec.get("Info"),
+        rec.get("Leistungsbeschreibung"),
+        rec.get("T?tigkeit"),
+        rec.get("Art"),
+    ]
+    return any("organisator" in _safe_str(value).casefold() for value in fields)
+
+
 def _coding_required_errors(records: List[Dict[str, Any]], lookups: Dict[str, Any]) -> List[str]:
     errors: List[str] = []
     for idx, rec in enumerate(records, start=1):
         project = _safe_str(rec.get("Projekt")).strip()
         if not project or not _project_uses_coding(lookups, project):
+            continue
+        if _is_organisatorisches_record(rec):
             continue
         if _safe_str(rec.get("Kodierung")).strip():
             continue
