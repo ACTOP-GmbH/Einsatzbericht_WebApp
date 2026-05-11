@@ -399,6 +399,8 @@ def _write_windows_updater_script(base_dir: Path, zip_path: Path, manifest: Dict
     main_script = str(manifest.get("main_script") or DEFAULT_MANIFEST["main_script"])
     script_path = Path(tempfile.gettempdir()) / "einsatzbericht_apply_update.ps1"
     payload = f"""
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "Continue"
 Start-Sleep -Seconds 2
 $ZipPath = {json.dumps(str(zip_path))}
 $InstallDir = {json.dumps(str(base_dir))}
@@ -406,21 +408,83 @@ $Relaunch = {json.dumps(str(relaunch_path))}
 $LatestVersion = {json.dumps(str(latest_version))}
 $MainScriptName = {json.dumps(main_script)}
 $Stage = Join-Path $env:TEMP ("einsatzbericht_update_" + [guid]::NewGuid().ToString())
-New-Item -ItemType Directory -Path $Stage -Force | Out-Null
-Expand-Archive -LiteralPath $ZipPath -DestinationPath $Stage -Force
+$script:UpdateActivity = "Einsatzbericht Manager Update"
+$script:UpdateStep = 0
+$script:UpdateTotalSteps = 7
+
+function Show-UpdateStep {{
+    param([string]$Status)
+
+    $script:UpdateStep += 1
+    $Percent = [Math]::Min([int](($script:UpdateStep / $script:UpdateTotalSteps) * 100), 99)
+    Write-Host ""
+    Write-Host "[$($script:UpdateStep)/$script:UpdateTotalSteps] $Status"
+    Write-Progress -Activity $script:UpdateActivity -Status $Status -PercentComplete $Percent
+}}
+
+function Complete-UpdateProgress {{
+    Write-Progress -Activity $script:UpdateActivity -Completed
+}}
 
 function Stop-InstalledApp {{
-    Get-Process -Name "run_app" -ErrorAction SilentlyContinue |
-        Where-Object {{ -not $_.Path -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) }} |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    $InstallRoot = Split-Path -Parent $InstallDir
+    $deadline = (Get-Date).AddSeconds(10)
 
-    foreach ($ProcessName in @("python.exe", "pythonw.exe")) {{
+    do {{
+        $processIds = New-Object "System.Collections.Generic.HashSet[int]"
+
+        Get-Process -Name "run_app" -ErrorAction SilentlyContinue | ForEach-Object {{
+            if ((-not $_.Path) -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {{
+                [void]$processIds.Add([int]$_.Id)
+            }}
+        }}
+
+        foreach ($ProcessName in @("python.exe", "pythonw.exe", "powershell.exe", "pwsh.exe")) {{
+            try {{
+                Get-CimInstance Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction SilentlyContinue |
+                    Where-Object {{
+                        $cmd = [string]($_.CommandLine)
+                        $exe = [string]($_.ExecutablePath)
+                        ($cmd.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                        ($cmd.IndexOf($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                        ($exe -and $exe.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase))
+                    }} |
+                    ForEach-Object {{ [void]$processIds.Add([int]$_.ProcessId) }}
+            }} catch {{
+            }}
+        }}
+
+        $ids = @()
+        foreach ($processId in $processIds) {{
+            if ($processId -and $processId -ne $PID) {{
+                $ids += [int]$processId
+            }}
+        }}
+        $ids = @($ids | Select-Object -Unique)
+        if ($ids.Count -eq 0) {{
+            return
+        }}
+        foreach ($processId in $ids) {{
+            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }}
+        Start-Sleep -Milliseconds 500
+    }} while ((Get-Date) -lt $deadline)
+
+    $remaining = @()
+    foreach ($ProcessName in @("run_app", "python", "pythonw", "powershell", "pwsh")) {{
         try {{
-            Get-CimInstance Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction SilentlyContinue |
-                Where-Object {{ $_.CommandLine -and $_.CommandLine.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }} |
-                ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}
+            $remaining += Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+                Where-Object {{
+                    $_.Id -ne $PID -and (
+                        ((-not $_.Path) -and $_.ProcessName -eq "run_app") -or
+                        ($_.Path -and $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase))
+                    )
+                }}
         }} catch {{
         }}
+    }}
+    if ($remaining.Count -gt 0) {{
+        throw "Die laufende App konnte nicht vollstaendig beendet werden."
     }}
 }}
 
@@ -429,7 +493,12 @@ function Copy-PayloadWithRetry {{
 
     for ($Attempt = 1; $Attempt -le 12; $Attempt++) {{
         try {{
-            Copy-Item -Path (Join-Path $PayloadPath "*") -Destination $InstallDir -Recurse -Force -ErrorAction Stop
+            $PreserveExistingAppData = Test-Path -LiteralPath (Join-Path $InstallDir "data")
+            $Items = Get-ChildItem -LiteralPath $PayloadPath -Force -ErrorAction Stop |
+                Where-Object {{ -not ($PreserveExistingAppData -and $_.Name -eq "data") }}
+            foreach ($Item in $Items) {{
+                Copy-Item -LiteralPath $Item.FullName -Destination $InstallDir -Recurse -Force -ErrorAction Stop
+            }}
             return
         }} catch {{
             if ($Attempt -eq 12) {{
@@ -441,39 +510,71 @@ function Copy-PayloadWithRetry {{
     }}
 }}
 
-$Payload = Join-Path $Stage "app"
-if (-not (Test-Path -LiteralPath $Payload)) {{
-    $Payload = Get-ChildItem -LiteralPath $Stage -Directory |
-        Where-Object {{ Test-Path -LiteralPath (Join-Path $_.FullName $MainScriptName) }} |
-        Select-Object -First 1 -ExpandProperty FullName
-}}
-if (-not $Payload) {{
-    $Payload = $Stage
-}}
-Stop-InstalledApp
-Copy-PayloadWithRetry -PayloadPath $Payload
-$ManifestPath = Join-Path $InstallDir "release_manifest.json"
-if (Test-Path -LiteralPath $ManifestPath) {{
-    try {{
-        $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
-        $Manifest.version = $LatestVersion
-        $Manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
-    }} catch {{
+try {{
+    Show-UpdateStep "Updatepaket wird entpackt"
+    New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+    Expand-Archive -LiteralPath $ZipPath -DestinationPath $Stage -Force
+
+    Show-UpdateStep "Updateinhalt wird geprueft"
+    $Payload = Join-Path $Stage "app"
+    if (-not (Test-Path -LiteralPath $Payload)) {{
+        $Payload = Get-ChildItem -LiteralPath $Stage -Directory |
+            Where-Object {{ Test-Path -LiteralPath (Join-Path $_.FullName $MainScriptName) }} |
+            Select-Object -First 1 -ExpandProperty FullName
     }}
-}}
-$RequirementsPath = Join-Path $InstallDir "requirements_einsatzbericht_app_v2_print.txt"
-$VenvPython = Join-Path $InstallDir ".venv\\Scripts\\python.exe"
-if ((Test-Path -LiteralPath $VenvPython) -and (Test-Path -LiteralPath $RequirementsPath)) {{
-    Start-Process -FilePath $VenvPython -ArgumentList "-m", "pip", "install", "-r", "`"$RequirementsPath`"" -Wait -WindowStyle Hidden
-}}
-$LaunchScript = Join-Path $InstallDir "launch_app.ps1"
-$SourceLauncher = Join-Path $InstallDir "run_app.py"
-if (Test-Path -LiteralPath $Relaunch) {{
-    Start-Process -FilePath $Relaunch
-}} elseif (Test-Path -LiteralPath $LaunchScript) {{
-    Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", "`"$LaunchScript`""
-}} elseif ((Test-Path -LiteralPath $VenvPython) -and (Test-Path -LiteralPath $SourceLauncher)) {{
-    Start-Process -FilePath $VenvPython -ArgumentList "`"$SourceLauncher`"" -WorkingDirectory $InstallDir -WindowStyle Hidden
+    if (-not $Payload) {{
+        $Payload = $Stage
+    }}
+
+    Show-UpdateStep "Laufende App wird beendet"
+    Stop-InstalledApp
+
+    Show-UpdateStep "Neue App-Dateien werden kopiert"
+    Copy-PayloadWithRetry -PayloadPath $Payload
+
+    Show-UpdateStep "Versionsinformationen werden aktualisiert"
+    $ManifestPath = Join-Path $InstallDir "release_manifest.json"
+    if (Test-Path -LiteralPath $ManifestPath) {{
+        try {{
+            $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+            $Manifest.version = $LatestVersion
+            $Manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+        }} catch {{
+        }}
+    }}
+
+    Show-UpdateStep "Abhaengigkeiten werden geprueft"
+    $RequirementsPath = Join-Path $InstallDir "requirements_einsatzbericht_app_v2_print.txt"
+    $VenvPython = Join-Path $InstallDir ".venv\\Scripts\\python.exe"
+    if ((Test-Path -LiteralPath $VenvPython) -and (Test-Path -LiteralPath $RequirementsPath)) {{
+        & $VenvPython -m pip install -r $RequirementsPath
+        if ($LASTEXITCODE -ne 0) {{
+            throw "Python-Abhaengigkeiten konnten nicht aktualisiert werden."
+        }}
+    }}
+
+    Show-UpdateStep "App wird neu gestartet"
+    $LaunchScript = Join-Path $InstallDir "launch_app.ps1"
+    $SourceLauncher = Join-Path $InstallDir "run_app.py"
+    Complete-UpdateProgress
+    Write-Host ""
+    Write-Host "Update abgeschlossen. Die App wird jetzt neu gestartet."
+    Start-Sleep -Seconds 3
+    if (Test-Path -LiteralPath $Relaunch) {{
+        Start-Process -FilePath $Relaunch
+    }} elseif (Test-Path -LiteralPath $LaunchScript) {{
+        Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", "`"$LaunchScript`""
+    }} elseif ((Test-Path -LiteralPath $VenvPython) -and (Test-Path -LiteralPath $SourceLauncher)) {{
+        Start-Process -FilePath $VenvPython -ArgumentList "`"$SourceLauncher`"" -WorkingDirectory $InstallDir -WindowStyle Hidden
+    }}
+}} catch {{
+    Complete-UpdateProgress
+    Write-Host ""
+    Write-Host "Update fehlgeschlagen:"
+    Write-Host $_.Exception.Message
+    Write-Host ""
+    Read-Host "Enter druecken, um dieses Fenster zu schliessen"
+    throw
 }}
 """
     script_path.write_text(payload.strip() + "\n", encoding="utf-8")
@@ -486,6 +587,25 @@ def _write_macos_updater_script(base_dir: Path, zip_path: Path, manifest: Dict[s
     main_script = str(manifest.get("main_script") or DEFAULT_MANIFEST["main_script"])
     script_path = Path(tempfile.gettempdir()) / "einsatzbericht_apply_update.sh"
     payload = f"""#!/bin/sh
+set -eu
+
+notify() {{
+  osascript -e "display notification \\"$1\\" with title \\"Einsatzbericht Manager\\"" >/dev/null 2>&1 || true
+}}
+
+fail() {{
+  echo ""
+  echo "Update fehlgeschlagen."
+  notify "Update fehlgeschlagen."
+  echo "Dieses Fenster kann geschlossen werden."
+  exit 1
+}}
+
+trap fail ERR
+
+echo "Einsatzbericht Manager Update"
+echo "Bitte dieses Fenster nicht schliessen."
+notify "Update wird installiert."
 sleep 2
 ZIP_PATH={json.dumps(str(zip_path))}
 INSTALL_DIR={json.dumps(str(base_dir))}
@@ -493,7 +613,10 @@ RELAUNCH={json.dumps(str(relaunch_path))}
 LATEST_VERSION={json.dumps(str(latest_version))}
 MAIN_SCRIPT_NAME={json.dumps(main_script)}
 STAGE="$(mktemp -d /tmp/einsatzbericht_update.XXXXXX)"
+echo ""
+echo "[1/6] Updatepaket wird entpackt"
 unzip -oq "$ZIP_PATH" -d "$STAGE"
+echo "[2/6] Updateinhalt wird geprueft"
 PAYLOAD="$STAGE/app"
 if [ ! -d "$PAYLOAD" ]; then
   FOUND="$(find "$STAGE" -maxdepth 2 -type f -name "$MAIN_SCRIPT_NAME" -print -quit)"
@@ -505,6 +628,7 @@ if [ ! -d "$PAYLOAD" ]; then
 fi
 
 stop_installed_app() {{
+  echo "[3/6] Laufende App wird beendet"
   if [ -n "$RELAUNCH" ]; then
     pkill -f "$RELAUNCH" >/dev/null 2>&1 || true
   fi
@@ -515,7 +639,19 @@ stop_installed_app() {{
 copy_payload_with_retry() {{
   attempt=1
   while [ "$attempt" -le 12 ]; do
-    if ditto "$PAYLOAD" "$INSTALL_DIR"; then
+    if [ -d "$INSTALL_DIR/data" ]; then
+      ok=1
+      for item in "$PAYLOAD"/* "$PAYLOAD"/.[!.]* "$PAYLOAD"/..?*; do
+        [ -e "$item" ] || continue
+        name="$(basename "$item")"
+        [ "$name" = "data" ] && continue
+        if ! ditto "$item" "$INSTALL_DIR/$name"; then
+          ok=0
+          break
+        fi
+      done
+      [ "$ok" -eq 1 ] && return 0
+    elif ditto "$PAYLOAD" "$INSTALL_DIR"; then
       return 0
     fi
     stop_installed_app
@@ -526,7 +662,9 @@ copy_payload_with_retry() {{
 }}
 
 stop_installed_app
+echo "[4/6] Neue App-Dateien werden kopiert"
 copy_payload_with_retry
+echo "[5/6] Versionsinformationen werden aktualisiert"
 python3 - <<PY >/dev/null 2>&1
 import json
 from pathlib import Path
@@ -538,6 +676,11 @@ try:
 except Exception:
     pass
 PY
+echo "[6/6] App wird neu gestartet"
+echo ""
+echo "Update abgeschlossen. Die App wird jetzt neu gestartet."
+notify "Update abgeschlossen. Die App wird neu gestartet."
+sleep 3
 if [ -x "$RELAUNCH" ]; then
   "$RELAUNCH" >/dev/null 2>&1 &
 else
@@ -561,13 +704,16 @@ def _launch_external_updater(base_dir: Path, zip_path: Path, manifest: Dict[str,
                 "-File",
                 str(script_path),
             ],
-            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
             close_fds=True,
         )
         return
 
     script_path = _write_macos_updater_script(base_dir, zip_path, manifest, latest_version)
-    subprocess.Popen(["/bin/sh", str(script_path)], close_fds=True)
+    try:
+        subprocess.Popen(["open", "-a", "Terminal", str(script_path)], close_fds=True)
+    except Exception:
+        subprocess.Popen(["/bin/sh", str(script_path)], close_fds=True)
 
 
 def _runtime_update_interval_minutes(manifest: Dict[str, Any]) -> int:
