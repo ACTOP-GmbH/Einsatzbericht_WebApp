@@ -510,6 +510,80 @@ function Copy-PayloadWithRetry {{
     }}
 }}
 
+function Test-ServerReady {{
+    param([int]$Port)
+    try {{
+        Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$Port/_stcore/health" -TimeoutSec 2 | Out-Null
+        return $true
+    }} catch {{
+        return $false
+    }}
+}}
+
+function Open-AppWhenReady {{
+    $InstallRoot = Split-Path -Parent $InstallDir
+    $PortFile = Join-Path $InstallRoot "logs\\server_port.txt"
+    $ports = @()
+    if (Test-Path -LiteralPath $PortFile) {{
+        try {{
+            $ports += [int](Get-Content -LiteralPath $PortFile -Raw)
+        }} catch {{
+        }}
+    }}
+    $ports += 8501..8520
+
+    foreach ($candidate in ($ports | Select-Object -Unique)) {{
+        if (Test-ServerReady -Port $candidate) {{
+            Start-Process "http://localhost:$candidate" | Out-Null
+            return $true
+        }}
+    }}
+    return $false
+}}
+
+function Wait-ForBrowserOpen {{
+    param([int]$TimeoutSeconds = 75)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {{
+        if (Open-AppWhenReady) {{
+            return $true
+        }}
+        Start-Sleep -Milliseconds 500
+    }}
+    return $false
+}}
+
+function Start-AppAndWaitForBrowser {{
+    param(
+        [string]$LaunchScript,
+        [string]$Relaunch,
+        [string]$VenvPython,
+        [string]$SourceLauncher
+    )
+
+    Write-Host "Die App wird gestartet. Bitte warten, bis der Browser geoeffnet wurde..."
+    if (Test-Path -LiteralPath $LaunchScript) {{
+        $process = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$LaunchScript`"" -Wait -PassThru
+        if ($process.ExitCode -ne 0) {{
+            throw "Die App konnte nach dem Update nicht gestartet werden."
+        }}
+        return
+    }}
+
+    if (Test-Path -LiteralPath $Relaunch) {{
+        Start-Process -FilePath $Relaunch | Out-Null
+    }} elseif ((Test-Path -LiteralPath $VenvPython) -and (Test-Path -LiteralPath $SourceLauncher)) {{
+        Start-Process -FilePath $VenvPython -ArgumentList "`"$SourceLauncher`"" -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
+    }} else {{
+        throw "Kein gueltiger App-Starter gefunden."
+    }}
+
+    if (-not (Wait-ForBrowserOpen)) {{
+        throw "Die App wurde gestartet, aber der Browser konnte nicht automatisch geoeffnet werden."
+    }}
+}}
+
 try {{
     Show-UpdateStep "Updatepaket wird entpackt"
     New-Item -ItemType Directory -Path $Stage -Force | Out-Null
@@ -553,20 +627,15 @@ try {{
         }}
     }}
 
-    Show-UpdateStep "App wird neu gestartet"
+    Show-UpdateStep "App wird gestartet"
     $LaunchScript = Join-Path $InstallDir "launch_app.ps1"
     $SourceLauncher = Join-Path $InstallDir "run_app.py"
     Complete-UpdateProgress
     Write-Host ""
-    Write-Host "Update abgeschlossen. Die App wird jetzt neu gestartet."
-    Start-Sleep -Seconds 3
-    if (Test-Path -LiteralPath $Relaunch) {{
-        Start-Process -FilePath $Relaunch
-    }} elseif (Test-Path -LiteralPath $LaunchScript) {{
-        Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", "`"$LaunchScript`""
-    }} elseif ((Test-Path -LiteralPath $VenvPython) -and (Test-Path -LiteralPath $SourceLauncher)) {{
-        Start-Process -FilePath $VenvPython -ArgumentList "`"$SourceLauncher`"" -WorkingDirectory $InstallDir -WindowStyle Hidden
-    }}
+    Write-Host "Update abgeschlossen. Die App wird jetzt gestartet."
+    Start-AppAndWaitForBrowser -LaunchScript $LaunchScript -Relaunch $Relaunch -VenvPython $VenvPython -SourceLauncher $SourceLauncher
+    Write-Host "App ist gestartet. Der Browser wurde geoeffnet."
+    Start-Sleep -Seconds 2
 }} catch {{
     Complete-UpdateProgress
     Write-Host ""
@@ -661,6 +730,42 @@ copy_payload_with_retry() {{
   return 1
 }}
 
+server_ready() {{
+  port="$1"
+  curl -fsS --max-time 2 "http://localhost:$port/_stcore/health" >/dev/null 2>&1
+}}
+
+open_app_when_ready() {{
+  install_root="$(dirname "$INSTALL_DIR")"
+  port_file="$install_root/logs/server_port.txt"
+  ports=""
+  if [ -f "$port_file" ]; then
+    ports="$(cat "$port_file" 2>/dev/null || true)"
+  fi
+  ports="$ports 8501 8502 8503 8504 8505 8506 8507 8508 8509 8510 8511 8512 8513 8514 8515 8516 8517 8518 8519 8520"
+  for port in $ports; do
+    case "$port" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    if server_ready "$port"; then
+      open "http://localhost:$port" >/dev/null 2>&1 || true
+      return 0
+    fi
+  done
+  return 1
+}}
+
+wait_for_browser_open() {{
+  deadline=$(( $(date +%s) + 75 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if open_app_when_ready; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}}
+
 stop_installed_app
 echo "[4/6] Neue App-Dateien werden kopiert"
 copy_payload_with_retry
@@ -676,16 +781,25 @@ try:
 except Exception:
     pass
 PY
-echo "[6/6] App wird neu gestartet"
+echo "[6/6] App wird gestartet"
 echo ""
-echo "Update abgeschlossen. Die App wird jetzt neu gestartet."
-notify "Update abgeschlossen. Die App wird neu gestartet."
-sleep 3
+echo "Update abgeschlossen. Die App wird jetzt gestartet."
+notify "Update abgeschlossen. Die App wird gestartet."
 if [ -x "$RELAUNCH" ]; then
   "$RELAUNCH" >/dev/null 2>&1 &
 else
   python3 "$INSTALL_DIR/run_app.py" >/dev/null 2>&1 &
 fi
+echo "Bitte warten, bis der Browser geoeffnet wurde..."
+if wait_for_browser_open; then
+  echo "App ist gestartet. Der Browser wurde geoeffnet."
+  notify "App ist gestartet."
+else
+  echo "Die App wurde gestartet, aber der Browser konnte nicht automatisch geoeffnet werden."
+  echo "Bitte starte die App erneut oder oeffne localhost manuell."
+  notify "App gestartet, Browser konnte nicht automatisch geoeffnet werden."
+fi
+sleep 3
 """
     script_path.write_text(payload, encoding="utf-8")
     script_path.chmod(0o755)
