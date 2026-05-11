@@ -1,132 +1,14 @@
 import os
-import socket
 import sys
-import threading
-import time
-import urllib.request
-import webbrowser
 
-from desktop_runtime import (
-    StartupSplash,
-    app_script_path,
-    configure_streamlit_runtime,
-    maybe_check_for_updates,
-    prepare_runtime_environment,
-    show_pending_update_changelog,
-)
-
-configure_streamlit_runtime()
-
-
-LOCAL_HOST = "localhost"
-
-
-def _apply_streamlit_options() -> None:
-    from streamlit import config as st_config
-
-    for option_name, value in {
-        "global.developmentMode": False,
-        "server.headless": True,
-        "server.showEmailPrompt": False,
-        "browser.gatherUsageStats": False,
-    }.items():
-        try:
-            st_config.set_option(option_name, value)
-        except Exception:
-            pass
-
-
-def _find_available_port(preferred: int = 8501, attempts: int = 20) -> int:
-    for port in range(preferred, preferred + attempts):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                sock.bind((LOCAL_HOST, port))
-                return port
-            except OSError:
-                continue
-    raise RuntimeError("Kein freier lokaler Port fuer die App gefunden.")
-
-
-def _server_ready(port: int, timeout: float = 1.0) -> bool:
-    try:
-        with urllib.request.urlopen(f"http://{LOCAL_HOST}:{port}/_stcore/health", timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
-def _open_existing_instance(runtime: dict, preferred: int = 8501, attempts: int = 20) -> bool:
-    port_file = runtime["user_root"] / "logs" / "server_port.txt"
-    ports = []
-    if port_file.exists():
-        try:
-            ports.append(int(port_file.read_text(encoding="utf-8").strip()))
-        except Exception:
-            pass
-    ports.extend(range(preferred, preferred + attempts))
-    for port in dict.fromkeys(ports):
-        if _server_ready(int(port)):
-            webbrowser.open(f"http://{LOCAL_HOST}:{int(port)}")
-            return True
-    return False
-
-
-def _remember_port(runtime: dict, port: int) -> None:
-    try:
-        port_file = runtime["user_root"] / "logs" / "server_port.txt"
-        port_file.parent.mkdir(parents=True, exist_ok=True)
-        port_file.write_text(str(port), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _open_browser_when_ready(port: int, splash: StartupSplash, timeout_seconds: int = 75) -> None:
-    browser_url = f"http://{LOCAL_HOST}:{port}"
-    deadline = time.time() + timeout_seconds
-
-    while time.time() < deadline:
-        splash.update("Browser wird geoeffnet, sobald die App bereit ist...")
-        if _server_ready(port, timeout=2):
-            webbrowser.open(browser_url)
-            splash.update("App ist bereit. Browser wurde geoeffnet.")
-            splash.close(delay_ms=1500)
-            return
-        time.sleep(0.5)
-
-    splash.update("Start dauert laenger als erwartet. Bitte kurz warten oder erneut starten.")
-    splash.close(delay_ms=5000)
+from desktop_launcher import CHILD_ENV, run_bootstrap, run_streamlit_child
 
 
 if __name__ == "__main__":
-    splash = StartupSplash()
-    current_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
-    os.chdir(current_dir)
-
-    runtime = prepare_runtime_environment()
-    if maybe_check_for_updates():
-        sys.exit(0)
-    show_pending_update_changelog()
-    if _open_existing_instance(runtime):
-        sys.exit(0)
-
-    splash.start("Streamlit wird geladen...")
-    import streamlit.web.cli as stcli
-
-    _apply_streamlit_options()
-    port = _find_available_port()
-    _remember_port(runtime, port)
-    threading.Thread(target=_open_browser_when_ready, args=(port, splash), daemon=True).start()
-
-    sys.argv = [
-        "streamlit",
-        "run",
-        str(app_script_path()),
-        "--global.developmentMode=false",
-        "--server.headless=true",
-        f"--server.address={LOCAL_HOST}",
-        f"--server.port={port}",
-        "--server.showEmailPrompt=false",
-        "--browser.gatherUsageStats=false",
-    ]
-    sys.exit(stcli.main())
+    if (
+        os.environ.get(CHILD_ENV) == "1"
+        or os.environ.get("EINSATZBERICHT_SUPPRESS_APP_SPLASH") == "1"
+        or "--streamlit-child" in sys.argv
+    ):
+        sys.exit(run_streamlit_child())
+    sys.exit(run_bootstrap())
