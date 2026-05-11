@@ -16,6 +16,32 @@ $venvPython = Join-Path $venvDir "Scripts\python.exe"
 $powershellPath = Join-Path $PSHOME "powershell.exe"
 $pythonCommand = $null
 $pythonArgs = @()
+$script:installActivity = "Einsatzbericht Manager Installation"
+$script:installStep = 0
+$script:installTotalSteps = 7
+$script:preserveExistingAppData = $false
+
+function Show-InstallStep {
+    param([string]$Status)
+
+    $script:installStep += 1
+    $percent = [Math]::Min([int](($script:installStep / $script:installTotalSteps) * 100), 99)
+    Write-Host ""
+    Write-Host "[$script:installStep/$script:installTotalSteps] $Status"
+    Write-Progress -Activity $script:installActivity -Status $Status -PercentComplete $percent
+}
+
+function Show-InstallStatus {
+    param([string]$Status)
+
+    $percent = [Math]::Min([int](($script:installStep / $script:installTotalSteps) * 100), 99)
+    Write-Host "  $Status"
+    Write-Progress -Activity $script:installActivity -Status $Status -PercentComplete $percent
+}
+
+function Complete-InstallProgress {
+    Write-Progress -Activity $script:installActivity -Completed
+}
 
 function Refresh-ProcessPath {
     $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -71,6 +97,32 @@ function Stop-InstalledApp {
     }
 
     Start-Sleep -Milliseconds 500
+}
+
+function Remove-InstallDirContentsWithRetry {
+    param([string]$TargetDir)
+
+    for ($attempt = 1; $attempt -le 12; $attempt++) {
+        try {
+            Get-ChildItem -LiteralPath $TargetDir -Force -ErrorAction Stop |
+                Where-Object { $_.Name -ne "data" } |
+                ForEach-Object {
+                    Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                }
+            return
+        } catch {
+            if ($attempt -eq 12) {
+                throw (
+                    "Alte App-Dateien konnten nicht ersetzt werden. " +
+                    "Bitte die App, Excel und geoeffnete Einsatzbericht-Dateien schliessen und install.bat erneut starten. " +
+                    "Details: " + $_.Exception.Message
+                )
+            }
+            Show-InstallStatus "Alte Dateien sind noch gesperrt. Neuer Versuch $attempt/12..."
+            Stop-InstalledApp
+            Start-Sleep -Seconds 1
+        }
+    }
 }
 
 function Test-PythonCommand {
@@ -144,16 +196,19 @@ function Resolve-PythonCommand {
 }
 
 function Ensure-Python {
+    Show-InstallStatus "Python wird gesucht..."
     if (Resolve-PythonCommand) {
+        Show-InstallStatus "Python wurde gefunden."
         return
     }
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        Write-Host "Python wurde nicht gefunden. Versuche Installation ueber winget..."
+        Show-InstallStatus "Python wurde nicht gefunden. Installation ueber winget wird versucht..."
         winget install --id Python.Python.3.12 -e --scope user --silent --accept-package-agreements --accept-source-agreements
         Refresh-ProcessPath
         Start-Sleep -Seconds 2
         if (Resolve-PythonCommand) {
+            Show-InstallStatus "Python wurde installiert."
             return
         }
     }
@@ -180,17 +235,20 @@ function Install-SourceRuntime {
     }
 
     Ensure-Python
+    Show-InstallStatus "Virtuelle Python-Umgebung wird erstellt..."
     Invoke-BasePython -ArgsList @("-m", "venv", $venvDir)
 
     if (-not (Test-Path -LiteralPath $venvPython)) {
         throw "Virtuelle Python-Umgebung konnte nicht erstellt werden: $venvDir"
     }
 
+    Show-InstallStatus "pip wird aktualisiert..."
     & $venvPython -m pip install --upgrade pip
     if ($LASTEXITCODE -ne 0) {
         throw "pip konnte nicht aktualisiert werden."
     }
 
+    Show-InstallStatus "Python-Abhaengigkeiten werden installiert. Das kann einige Minuten dauern..."
     & $venvPython -m pip install -r $requirementsPath
     if ($LASTEXITCODE -ne 0) {
         throw "Python-Abhaengigkeiten konnten nicht installiert werden."
@@ -200,6 +258,7 @@ function Install-SourceRuntime {
 function Copy-SourcePayload {
     param([string]$SourceDir)
 
+    Show-InstallStatus "Quelldateien werden kopiert..."
     $files = @(
         $mainScriptName,
         "run_app.py",
@@ -216,8 +275,11 @@ function Copy-SourcePayload {
     }
 
     $dataSource = Join-Path $SourceDir "data"
-    if (Test-Path -LiteralPath $dataSource) {
+    if ((Test-Path -LiteralPath $dataSource) -and (-not $script:preserveExistingAppData)) {
+        Show-InstallStatus "Leere Datenvorlage wird vorbereitet..."
         Copy-Item -LiteralPath $dataSource -Destination (Join-Path $installDir "data") -Recurse -Force
+    } elseif ($script:preserveExistingAppData) {
+        Show-InstallStatus "Vorhandener Datenordner bleibt erhalten."
     }
 
     if (-not (Test-Path -LiteralPath (Join-Path $installDir $mainScriptName))) {
@@ -338,6 +400,7 @@ $sourcePayloadCandidates = @(
     $bundledPayloadDir
 )
 $sourcePayloadDir = $null
+Show-InstallStep "Installationspaket wird geprueft"
 foreach ($candidate in $sourcePayloadCandidates) {
     if ($candidate -and (Test-Path -LiteralPath (Join-Path $candidate $mainScriptName))) {
         $sourcePayloadDir = $candidate
@@ -348,28 +411,48 @@ if (-not $sourcePayloadDir) {
     $sourcePayloadDir = $scriptRoot
 }
 
+Show-InstallStep "Installationsordner werden vorbereitet"
 New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
 New-Item -ItemType Directory -Path $startMenuDir -Force | Out-Null
 
 if (Test-Path -LiteralPath $installDir) {
+    $script:preserveExistingAppData = Test-Path -LiteralPath (Join-Path $installDir "data")
+    Show-InstallStatus "Laufende App wird beendet..."
     Stop-InstalledApp
-    Remove-Item -LiteralPath $installDir -Recurse -Force
+    Show-InstallStatus "Alte App-Dateien werden ersetzt..."
+    Remove-InstallDirContentsWithRetry -TargetDir $installDir
 }
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 
+Show-InstallStep "App-Dateien werden kopiert"
 if ($useBundledPayload) {
+    Show-InstallStatus "Gebundene App-Dateien werden kopiert..."
     Unblock-Tree -RootPath $bundledPayloadDir
-    Copy-Item -Path (Join-Path $bundledPayloadDir "*") -Destination $installDir -Recurse -Force
+    if ($script:preserveExistingAppData) {
+        Get-ChildItem -LiteralPath $bundledPayloadDir -Force |
+            Where-Object { $_.Name -ne "data" } |
+            ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $installDir -Recurse -Force }
+    } else {
+        Copy-Item -Path (Join-Path $bundledPayloadDir "*") -Destination $installDir -Recurse -Force
+    }
     Unblock-Tree -RootPath $installDir
 } else {
     Unblock-Tree -RootPath $sourcePayloadDir
     Copy-SourcePayload -SourceDir $sourcePayloadDir
     Unblock-Tree -RootPath $installDir
+    Show-InstallStep "Python-Umgebung wird vorbereitet"
     Install-SourceRuntime
 }
 
+if ($useBundledPayload) {
+    Show-InstallStep "Mitgelieferte App-Runtime wird vorbereitet"
+    Show-InstallStatus "Keine Python-Paketinstallation notwendig."
+}
+
+Show-InstallStep "Startskript wird erstellt"
 Write-LaunchScript
 
+Show-InstallStep "Verknuepfungen werden erstellt"
 $wsh = New-Object -ComObject WScript.Shell
 foreach ($shortcutPath in @($desktopShortcut, $startMenuShortcut)) {
     $shortcut = $wsh.CreateShortcut($shortcutPath)
@@ -382,6 +465,8 @@ foreach ($shortcutPath in @($desktopShortcut, $startMenuShortcut)) {
     $shortcut.Save()
 }
 
+Show-InstallStep "Installation wird abgeschlossen"
+Complete-InstallProgress
 Show-InfoMessage -Title "Installation abgeschlossen" -Message (
     "Die App wurde erfolgreich installiert.`n`n" +
     "Du kannst sie jetzt ueber den Desktop oder das Startmenue starten."
