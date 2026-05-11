@@ -1586,11 +1586,42 @@ def _render_runtime_update_notice() -> None:
     if check_for_update_info is None or start_update_from_info is None:
         return
 
+    def _current_runtime_version() -> str:
+        if load_release_manifest is None:
+            return ""
+        try:
+            return _safe_str(load_release_manifest().get("version")).strip()
+        except Exception:
+            return ""
+
+    def _clear_runtime_update_state() -> None:
+        for key in [
+            "_runtime_update_info",
+            "_runtime_update_installing",
+            "_runtime_update_installing_version",
+        ]:
+            st.session_state.pop(key, None)
+
+    running_version = _current_runtime_version()
     if st.session_state.get("_runtime_update_installing"):
+        installing_version = _safe_str(st.session_state.get("_runtime_update_installing_version")).strip()
+        if running_version and installing_version and running_version == installing_version:
+            _clear_runtime_update_state()
+            return
         st.warning("Update wird installiert. Die App wird gleich neu gestartet.")
         st.stop()
 
     update_info = st.session_state.get("_runtime_update_info")
+    if update_info and update_info.get("available"):
+        stored_current = _safe_str(update_info.get("current_version")).strip()
+        stored_latest = _safe_str(update_info.get("latest_version")).strip()
+        if (
+            (running_version and stored_latest and running_version == stored_latest)
+            or (running_version and stored_current and running_version != stored_current)
+        ):
+            _clear_runtime_update_state()
+            update_info = None
+
     if not update_info:
         update_info = check_for_update_info()
         if update_info.get("available"):
@@ -1621,6 +1652,8 @@ def _render_runtime_update_notice() -> None:
                     ok, msg = start_update_from_info(update_info)
                 if ok:
                     st.session_state["_runtime_update_installing"] = True
+                    st.session_state["_runtime_update_installing_version"] = latest_version
+                    st.session_state.pop("_runtime_update_info", None)
                     st.success(msg)
                     st.stop()
                 st.error(f"Update konnte nicht gestartet werden: {msg}")
