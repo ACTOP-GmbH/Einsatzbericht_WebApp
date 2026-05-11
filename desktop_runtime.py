@@ -8,10 +8,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import urllib.request
 from pathlib import Path
-from queue import Empty, Queue
 from typing import Any, Dict, Optional
 import traceback
 
@@ -33,91 +31,6 @@ DEFAULT_MANIFEST: Dict[str, Any] = {
     "update_interval_hours": 12,
     "runtime_update_check_interval_minutes": 30,
 }
-
-
-class StartupSplash:
-    """Small desktop loading window for cold starts before Streamlit is ready."""
-
-    def __init__(self, *, title: str = "Einsatzbericht Manager") -> None:
-        self.title = title
-        self._disabled = os.environ.get("EINSATZBERICHT_SUPPRESS_APP_SPLASH", "").strip() == "1"
-        self._events: Queue[tuple[str, str | int]] = Queue()
-        self._ready = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self, message: str = "App startet...") -> "StartupSplash":
-        if self._disabled or self._thread:
-            return self
-        self._thread = threading.Thread(target=self._run, args=(message,), daemon=True)
-        self._thread.start()
-        self._ready.wait(timeout=1.5)
-        return self
-
-    def update(self, message: str) -> None:
-        if self._disabled:
-            return
-        self._events.put(("update", message))
-
-    def close(self, delay_ms: int = 0) -> None:
-        if self._disabled:
-            return
-        self._events.put(("close", max(int(delay_ms), 0)))
-
-    def _run(self, message: str) -> None:
-        try:
-            import tkinter as tk
-            from tkinter import ttk
-
-            root = tk.Tk()
-            root.title(self.title)
-            root.resizable(False, False)
-            root.protocol("WM_DELETE_WINDOW", lambda: None)
-            root.attributes("-topmost", True)
-
-            width = 460
-            height = 170
-            root.update_idletasks()
-            x = max((root.winfo_screenwidth() - width) // 2, 0)
-            y = max((root.winfo_screenheight() - height) // 2, 0)
-            root.geometry(f"{width}x{height}+{x}+{y}")
-
-            container = ttk.Frame(root, padding=24)
-            container.pack(fill="both", expand=True)
-
-            title_label = ttk.Label(
-                container,
-                text="Einsatzbericht Manager wird gestartet",
-                font=("Segoe UI", 12, "bold"),
-            )
-            title_label.pack(anchor="w")
-
-            status_var = tk.StringVar(value=message)
-            status_label = ttk.Label(container, textvariable=status_var, wraplength=400)
-            status_label.pack(anchor="w", pady=(12, 16))
-
-            progress = ttk.Progressbar(container, mode="indeterminate")
-            progress.pack(fill="x")
-            progress.start(12)
-
-            def pump_events() -> None:
-                try:
-                    while True:
-                        event, value = self._events.get_nowait()
-                        if event == "update":
-                            status_var.set(str(value))
-                        elif event == "close":
-                            root.after(int(value), root.destroy)
-                            return
-                except Empty:
-                    pass
-                root.after(100, pump_events)
-
-            self._ready.set()
-            root.after(100, pump_events)
-            root.mainloop()
-        except Exception:
-            self._disabled = True
-            self._ready.set()
 
 
 def configure_streamlit_runtime() -> None:
