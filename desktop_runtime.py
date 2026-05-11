@@ -427,17 +427,64 @@ function Complete-UpdateProgress {{
 }}
 
 function Stop-InstalledApp {{
-    Get-Process -Name "run_app" -ErrorAction SilentlyContinue |
-        Where-Object {{ -not $_.Path -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) }} |
-        Stop-Process -Force -ErrorAction SilentlyContinue
+    $InstallRoot = Split-Path -Parent $InstallDir
+    $deadline = (Get-Date).AddSeconds(10)
 
-    foreach ($ProcessName in @("python.exe", "pythonw.exe")) {{
+    do {{
+        $processIds = New-Object "System.Collections.Generic.HashSet[int]"
+
+        Get-Process -Name "run_app" -ErrorAction SilentlyContinue | ForEach-Object {{
+            if ((-not $_.Path) -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {{
+                [void]$processIds.Add([int]$_.Id)
+            }}
+        }}
+
+        foreach ($ProcessName in @("python.exe", "pythonw.exe", "powershell.exe", "pwsh.exe")) {{
+            try {{
+                Get-CimInstance Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction SilentlyContinue |
+                    Where-Object {{
+                        $cmd = [string]($_.CommandLine)
+                        $exe = [string]($_.ExecutablePath)
+                        ($cmd.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                        ($cmd.IndexOf($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                        ($exe -and $exe.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase))
+                    }} |
+                    ForEach-Object {{ [void]$processIds.Add([int]$_.ProcessId) }}
+            }} catch {{
+            }}
+        }}
+
+        $ids = @()
+        foreach ($processId in $processIds) {{
+            if ($processId -and $processId -ne $PID) {{
+                $ids += [int]$processId
+            }}
+        }}
+        $ids = @($ids | Select-Object -Unique)
+        if ($ids.Count -eq 0) {{
+            return
+        }}
+        foreach ($processId in $ids) {{
+            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }}
+        Start-Sleep -Milliseconds 500
+    }} while ((Get-Date) -lt $deadline)
+
+    $remaining = @()
+    foreach ($ProcessName in @("run_app", "python", "pythonw", "powershell", "pwsh")) {{
         try {{
-            Get-CimInstance Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction SilentlyContinue |
-                Where-Object {{ $_.CommandLine -and $_.CommandLine.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }} |
-                ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}
+            $remaining += Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+                Where-Object {{
+                    $_.Id -ne $PID -and (
+                        ((-not $_.Path) -and $_.ProcessName -eq "run_app") -or
+                        ($_.Path -and $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase))
+                    )
+                }}
         }} catch {{
         }}
+    }}
+    if ($remaining.Count -gt 0) {{
+        throw "Die laufende App konnte nicht vollstaendig beendet werden."
     }}
 }}
 
