@@ -492,7 +492,7 @@ while ((Get-Date) -lt $deadline) {
     Update-StartupWindow -Status "Browser wird geoeffnet, sobald die App bereit ist..."
     if (Open-ExistingInstance) {
         Update-StartupWindow -Status "App ist bereit. Browser wurde geoeffnet."
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 1500
         Close-StartupWindow
         exit 0
     }
