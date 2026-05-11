@@ -354,11 +354,92 @@ $env:STREAMLIT_SERVER_HEADLESS = "true"
 $env:STREAMLIT_SERVER_SHOW_EMAIL_PROMPT = "false"
 $env:STREAMLIT_GLOBAL_DEVELOPMENT_MODE = "false"
 
+$script:startupForm = $null
+$script:startupStatusLabel = $null
+
 $streamlitDir = Join-Path $env:USERPROFILE ".streamlit"
 New-Item -ItemType Directory -Path $streamlitDir -Force | Out-Null
 Set-Content -LiteralPath (Join-Path $streamlitDir "credentials.toml") -Value "[general]`nemail = `"`"`n" -Encoding UTF8
 if (-not (Test-Path -LiteralPath (Join-Path $streamlitDir "config.toml"))) {
     Set-Content -LiteralPath (Join-Path $streamlitDir "config.toml") -Value "[browser]`ngatherUsageStats = false`n`n[server]`nheadless = true`nshowEmailPrompt = false`n" -Encoding UTF8
+}
+
+function Show-StartupWindow {
+    param([string]$Status = "App startet...")
+
+    try {
+        if ($script:startupForm -and -not $script:startupForm.IsDisposed) {
+            Update-StartupWindow -Status $Status
+            return
+        }
+
+        $script:startupForm = New-Object System.Windows.Forms.Form
+        $script:startupForm.Text = "Einsatzbericht Manager"
+        $script:startupForm.Width = 470
+        $script:startupForm.Height = 175
+        $script:startupForm.StartPosition = "CenterScreen"
+        $script:startupForm.FormBorderStyle = "FixedDialog"
+        $script:startupForm.MaximizeBox = $false
+        $script:startupForm.MinimizeBox = $false
+        $script:startupForm.ControlBox = $false
+        $script:startupForm.TopMost = $true
+
+        $titleLabel = New-Object System.Windows.Forms.Label
+        $titleLabel.Text = "Einsatzbericht Manager wird gestartet"
+        $titleLabel.Left = 24
+        $titleLabel.Top = 22
+        $titleLabel.Width = 405
+        $titleLabel.Height = 24
+
+        $script:startupStatusLabel = New-Object System.Windows.Forms.Label
+        $script:startupStatusLabel.Text = $Status
+        $script:startupStatusLabel.Left = 24
+        $script:startupStatusLabel.Top = 56
+        $script:startupStatusLabel.Width = 405
+        $script:startupStatusLabel.Height = 28
+
+        $progress = New-Object System.Windows.Forms.ProgressBar
+        $progress.Left = 24
+        $progress.Top = 96
+        $progress.Width = 405
+        $progress.Height = 18
+        $progress.Style = "Marquee"
+        $progress.MarqueeAnimationSpeed = 30
+
+        [void]$script:startupForm.Controls.Add($titleLabel)
+        [void]$script:startupForm.Controls.Add($script:startupStatusLabel)
+        [void]$script:startupForm.Controls.Add($progress)
+        [void]$script:startupForm.Show()
+        [System.Windows.Forms.Application]::DoEvents()
+    } catch {
+    }
+}
+
+function Update-StartupWindow {
+    param([string]$Status)
+
+    try {
+        if ($script:startupStatusLabel -and -not $script:startupStatusLabel.IsDisposed) {
+            $script:startupStatusLabel.Text = $Status
+        }
+        if ($script:startupForm -and -not $script:startupForm.IsDisposed) {
+            $script:startupForm.Refresh()
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+    } catch {
+    }
+}
+
+function Close-StartupWindow {
+    try {
+        if ($script:startupForm -and -not $script:startupForm.IsDisposed) {
+            $script:startupForm.Close()
+            $script:startupForm.Dispose()
+        }
+    } catch {
+    }
+    $script:startupForm = $null
+    $script:startupStatusLabel = $null
 }
 
 function Test-ServerReady {
@@ -394,18 +475,25 @@ if (Open-ExistingInstance) {
     exit 0
 }
 
+Show-StartupWindow -Status "App-Prozess wird gestartet..."
+
 if (Test-Path -LiteralPath $launcherPath) {
     Start-Process -FilePath $launcherPath -WorkingDirectory $installDir -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath | Out-Null
 } elseif ((Test-Path -LiteralPath $venvPython) -and (Test-Path -LiteralPath $sourceLauncher)) {
     Start-Process -FilePath $venvPython -ArgumentList "`"$sourceLauncher`"" -WorkingDirectory $installDir -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath | Out-Null
 } else {
+    Close-StartupWindow
     [System.Windows.Forms.MessageBox]::Show("Die App wurde nicht vollstaendig installiert.", "Startfehler") | Out-Null
     exit 1
 }
 
-$deadline = (Get-Date).AddSeconds(45)
+$deadline = (Get-Date).AddSeconds(75)
 while ((Get-Date) -lt $deadline) {
+    Update-StartupWindow -Status "Browser wird geoeffnet, sobald die App bereit ist..."
     if (Open-ExistingInstance) {
+        Update-StartupWindow -Status "App ist bereit. Browser wurde geoeffnet."
+        Start-Sleep -Milliseconds 1500
+        Close-StartupWindow
         exit 0
     }
     Start-Sleep -Milliseconds 500
@@ -418,10 +506,12 @@ foreach ($path in @($stderrPath, $stdoutPath)) {
     }
 }
 if ($details) {
+    Close-StartupWindow
     [System.Windows.Forms.MessageBox]::Show("Die App konnte nicht gestartet werden.`n`nDetails:`n$details", "Startfehler") | Out-Null
     exit 1
 }
 
+Close-StartupWindow
 [System.Windows.Forms.MessageBox]::Show("Die App wurde gestartet, aber der Browser konnte die lokale Seite nicht erreichen.`n`nBitte pruefe Firewall/Virenscanner oder starte erneut.", "Startfehler") | Out-Null
 '@
 
