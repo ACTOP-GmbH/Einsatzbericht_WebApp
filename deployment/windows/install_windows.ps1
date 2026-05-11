@@ -353,6 +353,7 @@ $env:STREAMLIT_BROWSER_GATHER_USAGE_STATS = "false"
 $env:STREAMLIT_SERVER_HEADLESS = "true"
 $env:STREAMLIT_SERVER_SHOW_EMAIL_PROMPT = "false"
 $env:STREAMLIT_GLOBAL_DEVELOPMENT_MODE = "false"
+$env:EINSATZBERICHT_SUPPRESS_APP_SPLASH = "1"
 
 $script:startupForm = $null
 $script:startupStatusLabel = $null
