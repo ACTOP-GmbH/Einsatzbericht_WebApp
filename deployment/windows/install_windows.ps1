@@ -11,9 +11,11 @@ $startMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
 $startMenuShortcut = Join-Path $startMenuDir "Einsatzbericht Manager.lnk"
 $launcherPath = Join-Path $installDir "run_app.exe"
 $launchScriptPath = Join-Path $installDir "launch_app.ps1"
+$launchWrapperPath = Join-Path $installDir "launch_app.vbs"
 $venvDir = Join-Path $installDir ".venv"
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
 $powershellPath = Join-Path $PSHOME "powershell.exe"
+$wscriptPath = Join-Path $env:WINDIR "System32\wscript.exe"
 $pythonCommand = $null
 $pythonArgs = @()
 $script:installActivity = "Einsatzbericht Manager Installation"
@@ -520,6 +522,18 @@ Close-StartupWindow
     Unblock-File -LiteralPath $launchScriptPath -ErrorAction SilentlyContinue
 }
 
+function Write-LaunchWrapper {
+    $command = "`"$powershellPath`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launchScriptPath`""
+    $escapedCommand = $command.Replace('"', '""')
+    $wrapperScript = @"
+Set shell = CreateObject("WScript.Shell")
+shell.Run "$escapedCommand", 0, False
+"@
+
+    Set-Content -LiteralPath $launchWrapperPath -Value $wrapperScript -Encoding ASCII
+    Unblock-File -LiteralPath $launchWrapperPath -ErrorAction SilentlyContinue
+}
+
 $bundledPayloadDir = Join-Path $scriptRoot "app"
 $bundledLauncher = Join-Path $bundledPayloadDir "run_app.exe"
 $useBundledPayload = Test-Path -LiteralPath $bundledLauncher
@@ -582,16 +596,23 @@ if ($useBundledPayload) {
 
 Show-InstallStep "Startskript wird erstellt"
 Write-LaunchScript
+Write-LaunchWrapper
 
 Show-InstallStep "Verknuepfungen werden erstellt"
 $wsh = New-Object -ComObject WScript.Shell
 foreach ($shortcutPath in @($desktopShortcut, $startMenuShortcut)) {
     $shortcut = $wsh.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $powershellPath
-    $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launchScriptPath`""
     $shortcut.WorkingDirectory = $installDir
     if (Test-Path -LiteralPath $launcherPath) {
+        $shortcut.TargetPath = $launcherPath
+        $shortcut.Arguments = ""
         $shortcut.IconLocation = $launcherPath
+    } elseif (Test-Path -LiteralPath $wscriptPath) {
+        $shortcut.TargetPath = $wscriptPath
+        $shortcut.Arguments = "`"$launchWrapperPath`""
+    } else {
+        $shortcut.TargetPath = $powershellPath
+        $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launchScriptPath`""
     }
     $shortcut.Save()
 }
