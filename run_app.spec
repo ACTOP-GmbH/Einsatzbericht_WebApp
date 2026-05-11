@@ -11,6 +11,9 @@ datas += copy_metadata("streamlit")
 
 hiddenimports = [
     "streamlit.runtime.scriptrunner.magic_funcs",
+    "tkinter",
+    "tkinter.messagebox",
+    "tkinter.ttk",
 ]
 
 

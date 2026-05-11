@@ -7,6 +7,7 @@ import urllib.request
 import webbrowser
 
 from desktop_runtime import (
+    StartupSplash,
     app_script_path,
     configure_streamlit_runtime,
     maybe_check_for_updates,
@@ -17,14 +18,13 @@ from desktop_runtime import (
 
 configure_streamlit_runtime()
 
-import streamlit.web.cli as stcli
-from streamlit import config as st_config
-
 
 LOCAL_HOST = "localhost"
 
 
 def _apply_streamlit_options() -> None:
+    from streamlit import config as st_config
+
     for option_name, value in {
         "global.developmentMode": False,
         "server.headless": True,
@@ -82,33 +82,43 @@ def _remember_port(runtime: dict, port: int) -> None:
         pass
 
 
-def _open_browser_when_ready(port: int, timeout_seconds: int = 45) -> None:
+def _open_browser_when_ready(port: int, splash: StartupSplash, timeout_seconds: int = 75) -> None:
     browser_url = f"http://{LOCAL_HOST}:{port}"
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
+        splash.update("Browser wird geoeffnet, sobald die App bereit ist...")
         if _server_ready(port, timeout=2):
             webbrowser.open(browser_url)
+            splash.update("App ist bereit. Browser wurde geoeffnet.")
+            splash.close(delay_ms=1500)
             return
         time.sleep(0.5)
 
+    splash.update("Start dauert laenger als erwartet. Bitte kurz warten oder erneut starten.")
+    splash.close(delay_ms=5000)
+
 
 if __name__ == "__main__":
+    splash = StartupSplash()
     try:
         current_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
         os.chdir(current_dir)
 
         runtime = prepare_runtime_environment()
-        _apply_streamlit_options()
         if maybe_check_for_updates():
             sys.exit(0)
         show_pending_update_changelog()
         if _open_existing_instance(runtime):
             sys.exit(0)
 
+        splash.start("Streamlit wird geladen...")
+        import streamlit.web.cli as stcli
+
+        _apply_streamlit_options()
         port = _find_available_port()
         _remember_port(runtime, port)
-        threading.Thread(target=_open_browser_when_ready, args=(port,), daemon=True).start()
+        threading.Thread(target=_open_browser_when_ready, args=(port, splash), daemon=True).start()
 
         sys.argv = [
             "streamlit",
@@ -123,5 +133,6 @@ if __name__ == "__main__":
         ]
         sys.exit(stcli.main())
     except Exception as exc:
+        splash.close()
         report_startup_failure(exc)
         sys.exit(1)
