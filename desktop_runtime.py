@@ -956,7 +956,7 @@ def start_update_from_info(update_info: Dict[str, Any], base_dir: Optional[Path]
     return True, "Update wird installiert. Die App startet danach neu."
 
 
-def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
+def maybe_check_for_updates(base_dir: Optional[Path] = None, *, force: bool = False) -> bool:
     resource_dir = base_dir or _resource_dir()
     manifest = load_release_manifest(resource_dir)
     current_version = str(manifest.get("version") or "").strip()
@@ -965,7 +965,7 @@ def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
     runtime = prepare_runtime_environment(resource_dir)
     user_root = runtime["user_root"]
 
-    if not _should_check_for_updates(user_root, manifest):
+    if not force and not _should_check_for_updates(user_root, manifest):
         return False
 
     update_info = _available_update_payload(manifest, current_version)
