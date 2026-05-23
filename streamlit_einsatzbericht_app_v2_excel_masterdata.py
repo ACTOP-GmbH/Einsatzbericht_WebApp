@@ -11,6 +11,7 @@ import json
 import re
 import hashlib
 import time
+import warnings
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,6 +107,13 @@ def _safe_str(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _row_value(row: Tuple[Any, ...], col_idx: int) -> Any:
+    idx = col_idx - 1
+    if idx < 0 or idx >= len(row):
+        return None
+    return row[idx]
 
 
 def _normalize_yes_no(value: Any) -> str:
@@ -228,8 +236,8 @@ def _display_row_label(row: pd.Series) -> str:
 def _read_list_column(ws, col_idx: int, start_row: int = 2) -> List[str]:
     values: List[str] = []
     seen = set()
-    for r in range(start_row, ws.max_row + 1):
-        v = ws.cell(r, col_idx).value
+    for row in ws.iter_rows(min_row=start_row, min_col=col_idx, max_col=col_idx, values_only=True):
+        v = row[0] if row else None
         if _is_blank(v):
             continue
         s = _safe_str(v).strip()
@@ -258,20 +266,20 @@ def _load_lookups(wb: openpyxl.Workbook) -> Dict[str, Any]:
     lookups["projekte"] = _read_list_column(h, 7)
 
     projekt_infos: Dict[str, Dict[str, Any]] = {}
-    for r in range(2, h.max_row + 1):
-        projekt = h.cell(r, 7).value
+    for row in h.iter_rows(min_row=2, max_col=PROJECT_USES_CODING_COL, values_only=True):
+        projekt = _row_value(row, 7)
         if _is_blank(projekt):
             continue
         p = _safe_str(projekt).strip()
         projekt_infos[p] = {
             "Projekt": p,
-            "Kunde": h.cell(r, 8).value,
-            "Straße": h.cell(r, 9).value,
-            "Ort": h.cell(r, 10).value,
-            "Ansprechpartner": h.cell(r, 11).value,
-            "Projektadresse Standard": h.cell(r, 12).value,
-            "Projektadresse Alternativ": h.cell(r, 13).value,
-            "Kodierung verwenden": _normalize_yes_no(h.cell(r, PROJECT_USES_CODING_COL).value)
+            "Kunde": _row_value(row, 8),
+            "Straße": _row_value(row, 9),
+            "Ort": _row_value(row, 10),
+            "Ansprechpartner": _row_value(row, 11),
+            "Projektadresse Standard": _row_value(row, 12),
+            "Projektadresse Alternativ": _row_value(row, 13),
+            "Kodierung verwenden": _normalize_yes_no(_row_value(row, PROJECT_USES_CODING_COL))
             or DEFAULT_PROJECT_USES_CODING,
         }
     lookups["projekt_infos"] = projekt_infos
@@ -282,16 +290,16 @@ def _load_lookups(wb: openpyxl.Workbook) -> Dict[str, Any]:
     if KODIERUNG_SHEET in wb.sheetnames:
         k = wb[KODIERUNG_SHEET]
         seen = set()
-        for r in range(2, k.max_row + 1):
-            aufgabe = k.cell(r, 2).value  # B
+        for row in k.iter_rows(min_row=2, max_col=4, values_only=True):
+            aufgabe = _row_value(row, 2)  # B
             if _is_blank(aufgabe):
                 continue
             aufgabe_s = _safe_str(aufgabe).strip()
             if aufgabe_s not in seen:
                 kodierungen_aufgaben.append(aufgabe_s)
                 seen.add(aufgabe_s)
-            kod_intern = k.cell(r, 3).value  # C
-            kod_eb = k.cell(r, 4).value  # D
+            kod_intern = _row_value(row, 3)  # C
+            kod_eb = _row_value(row, 4)  # D
             if not _is_blank(kod_eb):
                 kodierung_map_eb[aufgabe_s] = _safe_str(kod_eb).strip()
             if not _is_blank(kod_intern):
@@ -303,9 +311,9 @@ def _load_lookups(wb: openpyxl.Workbook) -> Dict[str, Any]:
     relevante: List[str] = []
     if KODIERUNG_SHEET in wb.sheetnames:
         k = wb[KODIERUNG_SHEET]
-        for r in range(2, k.max_row + 1):
-            marker = _safe_str(k.cell(r, 1).value).strip().lower()
-            aufgabe = k.cell(r, 2).value
+        for row in k.iter_rows(min_row=2, max_col=2, values_only=True):
+            marker = _safe_str(_row_value(row, 1)).strip().lower()
+            aufgabe = _row_value(row, 2)
             if marker == "x" and not _is_blank(aufgabe):
                 relevante.append(_safe_str(aufgabe).strip())
     if not relevante and RELEVANTE_KODIERUNG_SHEET in wb.sheetnames:
@@ -322,13 +330,15 @@ def _read_taetigkeiten_df(wb: openpyxl.Workbook) -> pd.DataFrame:
     ws = wb[TAETIGKEITEN_SHEET]
 
     rows: List[Dict[str, Any]] = []
-    for r in range(2, ws.max_row + 1):
-        raw = [ws.cell(r, c).value for c in range(1, 15)]
-        is_empty = all(_is_blank(ws.cell(r, c).value) for c in KEY_COLS_FOR_EMPTY_CHECK)
+    for r, row in enumerate(ws.iter_rows(min_row=2, max_col=14, values_only=True), start=2):
+        raw = tuple(row)
+        if len(raw) < 14:
+            raw = raw + (None,) * (14 - len(raw))
+        is_empty = all(_is_blank(_row_value(raw, c)) for c in KEY_COLS_FOR_EMPTY_CHECK)
         if is_empty:
             continue
 
-        rec = dict(zip(TAET_COLS, raw))
+        rec = dict(zip(TAET_COLS, raw[:14]))
         rec["_excel_row"] = r
         rec["Datum"] = _to_date(rec.get("Datum"))
         rec["Zeit von"] = _to_time(rec.get("Zeit von"))
@@ -373,13 +383,15 @@ def _read_team_df(wb: openpyxl.Workbook) -> pd.DataFrame:
     ws = wb[TEAM_SHEET]
     rows: List[Dict[str, Any]] = []
 
-    for r in range(2, ws.max_row + 1):
-        raw = [ws.cell(r, c).value for c in range(1, 16)]
-        is_empty = all(_is_blank(ws.cell(r, c).value) for c in TEAM_KEY_COLS_FOR_EMPTY_CHECK)
+    for r, row in enumerate(ws.iter_rows(min_row=2, max_col=15, values_only=True), start=2):
+        raw = tuple(row)
+        if len(raw) < 15:
+            raw = raw + (None,) * (15 - len(raw))
+        is_empty = all(_is_blank(_row_value(raw, c)) for c in TEAM_KEY_COLS_FOR_EMPTY_CHECK)
         if is_empty:
             continue
 
-        rec = dict(zip(TEAM_COLS, raw))
+        rec = dict(zip(TEAM_COLS, raw[:15]))
         rec["_excel_row"] = r
         rec["Datum"] = _to_date(rec.get("Datum"))
         rec["Zeit von"] = _to_time(rec.get("Zeit von"))
@@ -518,6 +530,20 @@ def _is_valid_app_workbook(path: Path) -> bool:
             wb.close()
         except Exception:
             pass
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_is_valid_app_workbook(path_str: str, modified_time: float, file_size: int) -> bool:
+    return _is_valid_app_workbook(Path(path_str))
+
+
+def _is_valid_app_workbook_cached(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        stat = resolved.stat()
+    except Exception:
+        return False
+    return _cached_is_valid_app_workbook(str(resolved), float(stat.st_mtime), int(stat.st_size))
 
 
 def _load_workbook_with_retry(path: Path, *, attempts: int = 8, delay_seconds: float = 0.35, **kwargs):
@@ -1023,16 +1049,22 @@ def load_workbook_data(path_str: str) -> WorkbookData:
     path = _resolve_excel_path(path_str)
     if not path.exists():
         raise FileNotFoundError(f"Datei nicht gefunden: {path}")
-    wb = _load_workbook_with_retry(path)
-    lookups = _load_lookups(wb)
-    taetigkeiten_df = _apply_project_coding_policy(_read_taetigkeiten_df(wb), lookups)
-    team_df = _apply_project_coding_policy(_read_team_df(wb), lookups)
-    milestones_df = _read_milestones_df(wb)
-    user_rights_df = _read_user_rights_df(wb)
-    project_roles_df = _read_project_roles_df(wb)
-    return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, team_df=team_df, lookups=lookups,
-                        milestones_df=milestones_df, user_rights_df=user_rights_df,
-                        project_roles_df=project_roles_df)
+    wb = _load_workbook_with_retry(path, read_only=True, data_only=True)
+    try:
+        lookups = _load_lookups(wb)
+        taetigkeiten_df = _apply_project_coding_policy(_read_taetigkeiten_df(wb), lookups)
+        team_df = _apply_project_coding_policy(_read_team_df(wb), lookups)
+        milestones_df = _read_milestones_df(wb)
+        user_rights_df = _read_user_rights_df(wb)
+        project_roles_df = _read_project_roles_df(wb)
+        return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, team_df=team_df, lookups=lookups,
+                            milestones_df=milestones_df, user_rights_df=user_rights_df,
+                            project_roles_df=project_roles_df)
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
 
 
 @st.cache_data(show_spinner=False)
@@ -1064,13 +1096,13 @@ def _read_milestones_df(wb: openpyxl.Workbook) -> pd.DataFrame:
     ws = wb[MILESTONES_SHEET]
     rows: List[Dict[str, Any]] = []
 
-    for r in range(2, ws.max_row + 1):
-        projekt = ws.cell(r, 1).value
-        name = ws.cell(r, 2).value
-        datum = ws.cell(r, 3).value
-        status = ws.cell(r, 4).value
-        fort = ws.cell(r, 5).value
-        comment = ws.cell(r, 6).value
+    for r, row in enumerate(ws.iter_rows(min_row=2, max_col=6, values_only=True), start=2):
+        projekt = _row_value(row, 1)
+        name = _row_value(row, 2)
+        datum = _row_value(row, 3)
+        status = _row_value(row, 4)
+        fort = _row_value(row, 5)
+        comment = _row_value(row, 6)
 
         if _is_blank(projekt) and _is_blank(name) and _is_blank(datum) and _is_blank(status) and _is_blank(
                 fort) and _is_blank(comment):
@@ -1432,9 +1464,9 @@ def _read_user_rights_df(wb: openpyxl.Workbook) -> pd.DataFrame:
 
     ws = wb[USER_RIGHTS_SHEET]
     rows: List[Dict[str, Any]] = []
-    for r in range(2, ws.max_row + 1):
-        mitarbeiter = _safe_str(ws.cell(r, 1).value).strip()
-        ansicht = _normalize_view_mode(ws.cell(r, 2).value)
+    for row in ws.iter_rows(min_row=2, max_col=2, values_only=True):
+        mitarbeiter = _safe_str(_row_value(row, 1)).strip()
+        ansicht = _normalize_view_mode(_row_value(row, 2))
         if not mitarbeiter:
             continue
         rows.append({
@@ -1450,10 +1482,10 @@ def _read_project_roles_df(wb: openpyxl.Workbook) -> pd.DataFrame:
 
     ws = wb[PROJECT_ROLES_SHEET]
     rows: List[Dict[str, Any]] = []
-    for r in range(2, ws.max_row + 1):
-        mitarbeiter = _safe_str(ws.cell(r, 1).value).strip()
-        projekt = _safe_str(ws.cell(r, 2).value).strip()
-        rolle = _safe_str(ws.cell(r, 3).value).strip()
+    for row in ws.iter_rows(min_row=2, max_col=3, values_only=True):
+        mitarbeiter = _safe_str(_row_value(row, 1)).strip()
+        projekt = _safe_str(_row_value(row, 2)).strip()
+        rolle = _safe_str(_row_value(row, 3)).strip()
         if not mitarbeiter or not projekt:
             continue
         rows.append({
@@ -2001,31 +2033,44 @@ def _parse_month_year_from_filename(p: Path) -> Tuple[Optional[int], Optional[in
     return y, m
 
 
-def _read_project_from_sheet(ws) -> str:
-    c12 = _safe_str(ws["C12"].value).strip()
+def _read_sheet_rows(ws, max_rows: int = 480, max_cols: int = 30) -> List[Tuple[Any, ...]]:
+    return [
+        tuple(row)
+        for row in ws.iter_rows(min_row=1, max_row=max_rows, max_col=max_cols, values_only=True)
+    ]
+
+
+def _sheet_value(rows: List[Tuple[Any, ...]], row_idx: int, col_idx: int) -> Any:
+    if row_idx < 1 or row_idx > len(rows):
+        return None
+    return _row_value(rows[row_idx - 1], col_idx)
+
+
+def _read_project_from_sheet_rows(rows: List[Tuple[Any, ...]]) -> str:
+    c12 = _safe_str(_sheet_value(rows, 12, 3)).strip()
     if c12:
         return c12
     for r in range(1, 50):
         for c in range(1, 12):
-            v = ws.cell(r, c).value
+            v = _sheet_value(rows, r, c)
             if isinstance(v, str) and v.strip().lower() == "firma:":
-                right = _safe_str(ws.cell(r, c + 1).value).strip()
+                right = _safe_str(_sheet_value(rows, r, c + 1)).strip()
                 if right:
                     return right
     return ""
 
 
-def _read_name_from_sheet(ws) -> str:
+def _read_name_from_sheet_rows(rows: List[Tuple[Any, ...]]) -> str:
     # 1. Oftmals in C7 hinterlegt
-    c7 = _safe_str(ws["C7"].value).strip()
+    c7 = _safe_str(_sheet_value(rows, 7, 3)).strip()
 
     # 2. Sicherheitshalber dynamisch scannen
     for r in range(1, 20):
         for c in range(1, 10):
-            v = _safe_str(ws.cell(r, c).value).strip().lower()
+            v = _safe_str(_sheet_value(rows, r, c)).strip().lower()
             if "berater" in v or "name" in v or "mitarbeiter" in v:
                 for offset in range(1, 4):
-                    val = _safe_str(ws.cell(r, c + offset).value).strip()
+                    val = _safe_str(_sheet_value(rows, r, c + offset)).strip()
                     if val and len(val) > 2:
                         return val
     if c7 and len(c7) > 2:
@@ -2033,12 +2078,14 @@ def _read_name_from_sheet(ws) -> str:
     return ""
 
 
-def _find_header(ws, max_rows: int = 80, max_cols: int = 30) -> Tuple[Optional[int], Dict[str, int]]:
+def _find_header_in_sheet_rows(
+    rows: List[Tuple[Any, ...]], max_rows: int = 80, max_cols: int = 30
+) -> Tuple[Optional[int], Dict[str, int]]:
     required = {"datum", "beginn", "ende", "art"}
     for r in range(1, max_rows + 1):
         mapping: Dict[str, int] = {}
         for c in range(1, max_cols + 1):
-            v = ws.cell(r, c).value
+            v = _sheet_value(rows, r, c)
             if isinstance(v, str) and v.strip():
                 mapping[v.strip().lower()] = c
         if required.issubset(mapping.keys()):
@@ -2047,160 +2094,183 @@ def _find_header(ws, max_rows: int = 80, max_cols: int = 30) -> Tuple[Optional[i
 
 
 def _read_einsatzbericht_xlsx(path: Path, allowed_types: List[str]) -> Tuple[Dict[str, Any], pd.DataFrame]:
-    wb = openpyxl.load_workbook(path, data_only=True)
-    ws = None
-    for sheet_name in ["Einsatzbericht", "Tabelle1"]:
-        if sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-            break
-    if ws is None:
-        ws = wb[wb.sheetnames[0]]
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Data Validation extension is not supported.*",
+            category=UserWarning,
+            module="openpyxl",
+        )
+        wb = _load_workbook_with_retry(path, read_only=True, data_only=True)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="Data Validation extension is not supported.*",
+                category=UserWarning,
+                module="openpyxl",
+            )
+            ws = None
+            for sheet_name in ["Einsatzbericht", "Tabelle1", "EB"]:
+                if sheet_name in wb.sheetnames:
+                    ws = wb[sheet_name]
+                    break
+            if ws is None:
+                ws = wb[wb.sheetnames[0]]
 
-    header_row, col = _find_header(ws)
-    if header_row is None:
-        meta = {"project": "", "year": None, "month": None, "source_path": str(path), "name": ""}
-        return meta, pd.DataFrame(
-            columns=["Datum", "Beginn", "Ende", "Pause_Min", "Zeit_h", "Art", "Kodierung_EB", "Leistungsbeschreibung"])
+            sheet_rows = _read_sheet_rows(ws)
+        header_row, col = _find_header_in_sheet_rows(sheet_rows)
+        if header_row is None:
+            meta = {"project": "", "year": None, "month": None, "source_path": str(path), "name": ""}
+            return meta, pd.DataFrame(
+                columns=["Datum", "Beginn", "Ende", "Pause_Min", "Zeit_h", "Art", "Kodierung_EB",
+                         "Leistungsbeschreibung"])
 
-    project = _read_project_from_sheet(ws)
-    mitarbeiter_name = _read_name_from_sheet(ws)
+        project = _read_project_from_sheet_rows(sheet_rows)
+        mitarbeiter_name = _read_name_from_sheet_rows(sheet_rows)
 
-    year = ws["K2"].value
-    month = ws["K3"].value
-    if _is_blank(year) or _is_blank(month):
-        y2, m2 = _parse_month_year_from_filename(path)
-        year = year if not _is_blank(year) else y2
-        month = month if not _is_blank(month) else m2
+        year = _sheet_value(sheet_rows, 2, 11)
+        month = _sheet_value(sheet_rows, 3, 11)
+        if _is_blank(year) or _is_blank(month):
+            y2, m2 = _parse_month_year_from_filename(path)
+            year = year if not _is_blank(year) else y2
+            month = month if not _is_blank(month) else m2
 
-    def c(name: str) -> Optional[int]:
-        return col.get(name.lower())
+        def c(name: str) -> Optional[int]:
+            return col.get(name.lower())
 
-    c_datum = c("datum")
-    c_beginn = c("beginn")
-    c_ende = c("ende")
-    c_pause = c("pause (h)") or c("pause")
-    c_zeit = c("zeit  (h)") or c("zeit (h)") or c("zeit")
-    c_art = c("art")
-    c_text = c("leistungsbeschreibung") or c("beschreibung")
-    c_kod = c("kodierung") or c("kodierung eb")
+        c_datum = c("datum")
+        c_beginn = c("beginn")
+        c_ende = c("ende")
+        c_pause = c("pause (h)") or c("pause")
+        c_zeit = c("zeit  (h)") or c("zeit (h)") or c("zeit")
+        c_art = c("art")
+        c_text = c("leistungsbeschreibung") or c("beschreibung")
+        c_kod = c("kodierung") or c("kodierung eb")
 
-    rows = []
-    empty_streak = 0
-    start = header_row + 1
-    last_seen_date = None
-
-    valid_arts = {str(t).strip().lower() for t in allowed_types if str(t).strip()}
-
-    for r in range(start, start + 400):
-        a = ws.cell(r, c_datum).value if c_datum else None
-        b = ws.cell(r, c_beginn).value if c_beginn else None
-        e = ws.cell(r, c_ende).value if c_ende else None
-        t = ws.cell(r, c_text).value if c_text else None
-        z_val = ws.cell(r, c_zeit).value if c_zeit else None
-        art_val = ws.cell(r, c_art).value if c_art else None
-
-        if _is_blank(a) and _is_blank(b) and _is_blank(e) and _is_blank(t) and _is_blank(z_val) and _is_blank(art_val):
-            empty_streak += 1
-            if empty_streak >= 5:
-                break
-            continue
+        rows = []
         empty_streak = 0
+        start = header_row + 1
+        last_seen_date = None
 
-        art = _safe_str(art_val).strip()
+        valid_arts = {str(t).strip().lower() for t in allowed_types if str(t).strip()}
 
-        if not art or art.lower() not in valid_arts:
-            continue
+        for r in range(start, start + 400):
+            a = _sheet_value(sheet_rows, r, c_datum) if c_datum else None
+            b = _sheet_value(sheet_rows, r, c_beginn) if c_beginn else None
+            e = _sheet_value(sheet_rows, r, c_ende) if c_ende else None
+            t = _sheet_value(sheet_rows, r, c_text) if c_text else None
+            z_val = _sheet_value(sheet_rows, r, c_zeit) if c_zeit else None
+            art_val = _sheet_value(sheet_rows, r, c_art) if c_art else None
 
-        datum = _to_date(a)
-        if datum is not None:
-            last_seen_date = datum
-        elif last_seen_date is not None:
-            datum = last_seen_date
+            if _is_blank(a) and _is_blank(b) and _is_blank(e) and _is_blank(t) and _is_blank(z_val) and _is_blank(
+                    art_val):
+                empty_streak += 1
+                if empty_streak >= 5:
+                    break
+                continue
+            empty_streak = 0
 
-        beginn = _to_time(b)
-        ende = _to_time(e)
-        text = _safe_str(t).strip()
+            art = _safe_str(art_val).strip()
 
-        zeit_h = None
-        if not _is_blank(z_val):
-            if isinstance(z_val, (int, float)):
-                zeit_h = float(z_val)
-            elif isinstance(z_val, (dt.time, dt.datetime)):
-                zeit_h = z_val.hour + z_val.minute / 60.0
-            else:
-                try:
-                    zeit_h = float(str(z_val).strip().replace(',', '.'))
-                except Exception:
-                    zeit_h = None
+            if not art or art.lower() not in valid_arts:
+                continue
 
-        kod_eb = _safe_str(ws.cell(r, c_kod).value).strip() if c_kod else ""
+            datum = _to_date(a)
+            if datum is not None:
+                last_seen_date = datum
+            elif last_seen_date is not None:
+                datum = last_seen_date
 
-        has_manual_content = False
-        if zeit_h is not None:
-            try:
-                has_manual_content = abs(float(zeit_h)) > 1e-9
-            except Exception:
-                has_manual_content = True
+            beginn = _to_time(b)
+            ende = _to_time(e)
+            text = _safe_str(t).strip()
 
-        if beginn is None and ende is None and not text and not has_manual_content:
-            continue
-
-        pause_min = 0
-        if c_pause:
-            p_val = ws.cell(r, c_pause).value
-            if not _is_blank(p_val):
-                if isinstance(p_val, (int, float)):
-                    pause_min = int(round(float(p_val) * 60))
-                elif isinstance(p_val, (dt.time, dt.datetime)):
-                    pause_min = p_val.hour * 60 + p_val.minute
-                elif isinstance(p_val, str):
-                    s_val = p_val.strip().replace(',', '.')
+            zeit_h = None
+            if not _is_blank(z_val):
+                if isinstance(z_val, (int, float)):
+                    zeit_h = float(z_val)
+                elif isinstance(z_val, (dt.time, dt.datetime)):
+                    zeit_h = z_val.hour + z_val.minute / 60.0
+                else:
                     try:
-                        pause_min = int(round(float(s_val) * 60))
-                    except ValueError:
-                        pause_min = _time_to_minutes(_to_time(p_val))
+                        zeit_h = float(str(z_val).strip().replace(',', '.'))
+                    except Exception:
+                        zeit_h = None
 
-        if beginn is not None and ende is not None and zeit_h is not None:
-            total_duration_hours = _compute_hours_decimal(beginn, ende, 0)
-            if total_duration_hours is not None:
-                inferred_pause_hours = total_duration_hours - zeit_h
-                inferred_pause_min = int(round(inferred_pause_hours * 60))
-                if -5 <= inferred_pause_min < 720:
-                    pause_min = max(0, inferred_pause_min)
+            kod_eb = _safe_str(_sheet_value(sheet_rows, r, c_kod)).strip() if c_kod else ""
 
-        if pause_min >= 720:
+            has_manual_content = False
+            if zeit_h is not None:
+                try:
+                    has_manual_content = abs(float(zeit_h)) > 1e-9
+                except Exception:
+                    has_manual_content = True
+
+            if beginn is None and ende is None and not text and not has_manual_content:
+                continue
+
             pause_min = 0
+            if c_pause:
+                p_val = _sheet_value(sheet_rows, r, c_pause)
+                if not _is_blank(p_val):
+                    if isinstance(p_val, (int, float)):
+                        pause_min = int(round(float(p_val) * 60))
+                    elif isinstance(p_val, (dt.time, dt.datetime)):
+                        pause_min = p_val.hour * 60 + p_val.minute
+                    elif isinstance(p_val, str):
+                        s_val = p_val.strip().replace(',', '.')
+                        try:
+                            pause_min = int(round(float(s_val) * 60))
+                        except ValueError:
+                            pause_min = _time_to_minutes(_to_time(p_val))
 
-        if zeit_h is None and beginn is not None and ende is not None:
-            zeit_h = _compute_hours_decimal(beginn, ende, pause_min)
+            if beginn is not None and ende is not None and zeit_h is not None:
+                total_duration_hours = _compute_hours_decimal(beginn, ende, 0)
+                if total_duration_hours is not None:
+                    inferred_pause_hours = total_duration_hours - zeit_h
+                    inferred_pause_min = int(round(inferred_pause_hours * 60))
+                    if -5 <= inferred_pause_min < 720:
+                        pause_min = max(0, inferred_pause_min)
 
-        rows.append({
-            "Datum": datum,
-            "Beginn": beginn,
-            "Ende": ende,
-            "Pause_Min": pause_min,
-            "Zeit_h": zeit_h,
-            "Art": art,
-            "Kodierung_EB": kod_eb,
-            "Leistungsbeschreibung": text,
-            "_source_row": r,
-        })
+            if pause_min >= 720:
+                pause_min = 0
 
-    df_lines = pd.DataFrame(rows)
-    if (year is None or month is None) and not df_lines.empty:
-        first_date = df_lines["Datum"].dropna().iloc[0] if df_lines["Datum"].notna().any() else None
-        if isinstance(first_date, dt.date):
-            year = year or first_date.year
-            month = month or first_date.month
+            if zeit_h is None and beginn is not None and ende is not None:
+                zeit_h = _compute_hours_decimal(beginn, ende, pause_min)
 
-    meta = {
-        "project": project,
-        "year": year,
-        "month": month,
-        "name": mitarbeiter_name,
-        "source_path": str(path),
-    }
-    return meta, df_lines
+            rows.append({
+                "Datum": datum,
+                "Beginn": beginn,
+                "Ende": ende,
+                "Pause_Min": pause_min,
+                "Zeit_h": zeit_h,
+                "Art": art,
+                "Kodierung_EB": kod_eb,
+                "Leistungsbeschreibung": text,
+                "_source_row": r,
+            })
+
+        df_lines = pd.DataFrame(rows)
+        if (year is None or month is None) and not df_lines.empty:
+            first_date = df_lines["Datum"].dropna().iloc[0] if df_lines["Datum"].notna().any() else None
+            if isinstance(first_date, dt.date):
+                year = year or first_date.year
+                month = month or first_date.month
+
+        meta = {
+            "project": project,
+            "year": year,
+            "month": month,
+            "name": mitarbeiter_name,
+            "source_path": str(path),
+        }
+        return meta, df_lines
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
 
 
 def _normalize_import_key_text(value: Any) -> str:
@@ -3244,13 +3314,13 @@ def main() -> None:
     if remembered_path:
         try:
             remembered_resolved = _resolve_excel_path(remembered_path)
-            if remembered_resolved.exists() and _is_valid_app_workbook(remembered_resolved):
+            if remembered_resolved.exists() and _is_valid_app_workbook_cached(remembered_resolved):
                 default_path = remembered_path
         except Exception:
             default_path = ""
     if not default_path:
         for cand in _default_excel_candidates():
-            if cand.exists() and _is_valid_app_workbook(cand):
+            if cand.exists() and _is_valid_app_workbook_cached(cand):
                 try:
                     script_dir = Path(__file__).resolve().parent
                     default_path = str(cand.resolve().relative_to(script_dir))
@@ -3267,7 +3337,7 @@ def main() -> None:
     if _safe_str(st.session_state.get("excel_path_input", "")).strip():
         try:
             _tmp_vis = _resolve_excel_path(_safe_str(st.session_state.get("excel_path_input", "")).strip())
-            if not _tmp_vis.exists() or not _is_valid_app_workbook(_tmp_vis):
+            if not _tmp_vis.exists() or not _is_valid_app_workbook_cached(_tmp_vis):
                 st.session_state["excel_path_input"] = default_path
         except Exception:
             st.session_state["excel_path_input"] = default_path

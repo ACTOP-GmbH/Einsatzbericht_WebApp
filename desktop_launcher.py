@@ -11,7 +11,10 @@ from queue import Empty, Queue
 
 
 LOCAL_HOST = "localhost"
+LOCAL_CONNECT_HOST = "127.0.0.1"
+PORT_SEARCH_ATTEMPTS = 10
 CHILD_ENV = "EINSATZBERICHT_STREAMLIT_CHILD"
+PROCESS_START_TIME = time.perf_counter()
 
 
 class BootstrapSplash:
@@ -98,28 +101,46 @@ def _child_command() -> list[str]:
     return [sys.executable, str(Path(__file__).resolve()), "--streamlit-child"]
 
 
-def _server_ready(port: int, timeout: float = 1.0) -> bool:
+def _port_accepts_connection(port: int, timeout: float = 0.01) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex((LOCAL_CONNECT_HOST, port)) == 0
+
+
+def _server_ready(port: int, timeout: float = 0.35) -> bool:
+    if not _port_accepts_connection(port):
+        return False
     try:
-        with urllib.request.urlopen(f"http://{LOCAL_HOST}:{port}/_stcore/health", timeout=timeout):
+        with urllib.request.urlopen(f"http://{LOCAL_CONNECT_HOST}:{port}/_stcore/health", timeout=timeout):
             return True
     except Exception:
         return False
 
 
-def _candidate_ports(runtime: dict, preferred: int = 8501, attempts: int = 20) -> list[int]:
-    ports: list[int] = []
-    port_file = runtime["user_root"] / "logs" / "server_port.txt"
-    if port_file.exists():
-        try:
-            ports.append(int(port_file.read_text(encoding="utf-8").strip()))
-        except Exception:
-            pass
-    ports.extend(range(preferred, preferred + attempts))
-    return list(dict.fromkeys(ports))
+def _candidate_ports(preferred: int = 8501, attempts: int = PORT_SEARCH_ATTEMPTS) -> list[int]:
+    return list(range(preferred, preferred + attempts))
+
+
+def _startup_log_path(runtime: dict) -> Path:
+    log_dir = runtime["user_root"] / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "startup_timing.log"
+
+
+def _log_startup_event(runtime: dict, label: str, start_time: float = PROCESS_START_TIME) -> None:
+    try:
+        elapsed = time.perf_counter() - start_time
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        role = "child" if os.environ.get(CHILD_ENV) == "1" or "--streamlit-child" in sys.argv else "bootstrap"
+        _startup_log_path(runtime).open("a", encoding="utf-8").write(
+            f"{timestamp}\tpid={os.getpid()}\trole={role}\t+{elapsed:.3f}s\t{label}\n"
+        )
+    except Exception:
+        pass
 
 
 def _open_existing_instance(runtime: dict) -> bool:
-    for port in _candidate_ports(runtime):
+    for port in _candidate_ports():
         if _server_ready(int(port)):
             webbrowser.open(f"http://{LOCAL_HOST}:{int(port)}")
             return True
@@ -132,10 +153,13 @@ def _wait_for_child(runtime: dict, child: subprocess.Popen, splash: BootstrapSpl
         splash.update("Browser wird geoeffnet, sobald die App bereit ist...")
         if _open_existing_instance(runtime):
             splash.update("App ist bereit. Browser wurde geoeffnet.")
+            _log_startup_event(runtime, "child health check succeeded; browser opened")
             return True
         if child.poll() is not None:
+            _log_startup_event(runtime, f"child exited before health check succeeded: code={child.returncode}")
             return False
         time.sleep(0.5)
+    _log_startup_event(runtime, "child health check timed out")
     return False
 
 
@@ -176,21 +200,29 @@ def run_bootstrap() -> int:
 
         configure_streamlit_runtime()
         runtime = prepare_runtime_environment()
+        _log_startup_event(runtime, "bootstrap runtime prepared")
 
         splash.update("Updates werden geprueft...")
+        update_start = time.perf_counter()
         if maybe_check_for_updates():
+            _log_startup_event(runtime, f"update check started installer after {time.perf_counter() - update_start:.3f}s")
             splash.close()
             return 0
         show_pending_update_changelog()
+        _log_startup_event(runtime, f"update check finished after {time.perf_counter() - update_start:.3f}s")
 
         splash.update("Laufende Instanz wird gesucht...")
+        existing_start = time.perf_counter()
         if _open_existing_instance(runtime):
+            _log_startup_event(runtime, f"existing instance found after {time.perf_counter() - existing_start:.3f}s")
             splash.close(delay_ms=500)
             time.sleep(0.6)
             return 0
+        _log_startup_event(runtime, f"existing instance search finished after {time.perf_counter() - existing_start:.3f}s")
 
         splash.update("Streamlit wird gestartet...")
         child = _start_child(runtime)
+        _log_startup_event(runtime, f"child process started: pid={child.pid}")
         if _wait_for_child(runtime, child, splash):
             splash.close(delay_ms=1500)
             time.sleep(1.6)
@@ -224,12 +256,12 @@ def _apply_streamlit_options() -> None:
             pass
 
 
-def _find_available_port(preferred: int = 8501, attempts: int = 20) -> int:
+def _find_available_port(preferred: int = 8501, attempts: int = PORT_SEARCH_ATTEMPTS) -> int:
     for port in range(preferred, preferred + attempts):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                sock.bind((LOCAL_HOST, port))
+                sock.bind((LOCAL_CONNECT_HOST, port))
                 return port
             except OSError:
                 continue
@@ -248,16 +280,21 @@ def _remember_port(runtime: dict, port: int) -> None:
 def run_streamlit_child() -> int:
     from desktop_runtime import app_script_path, configure_streamlit_runtime, prepare_runtime_environment, report_startup_failure
 
+    runtime = None
     try:
         configure_streamlit_runtime()
         os.chdir(_current_dir())
         runtime = prepare_runtime_environment()
+        _log_startup_event(runtime, "child runtime prepared")
 
+        import_start = time.perf_counter()
         import streamlit.web.cli as stcli
+        _log_startup_event(runtime, f"streamlit.web.cli imported after {time.perf_counter() - import_start:.3f}s")
 
         _apply_streamlit_options()
         port = _find_available_port()
         _remember_port(runtime, port)
+        _log_startup_event(runtime, f"streamlit options applied; selected port={port}")
 
         sys.argv = [
             "streamlit",
@@ -265,13 +302,16 @@ def run_streamlit_child() -> int:
             str(app_script_path()),
             "--global.developmentMode=false",
             "--server.headless=true",
-            f"--server.address={LOCAL_HOST}",
+            f"--server.address={LOCAL_CONNECT_HOST}",
             f"--server.port={port}",
             "--server.showEmailPrompt=false",
             "--browser.gatherUsageStats=false",
         ]
+        _log_startup_event(runtime, "calling streamlit cli main")
         return int(stcli.main() or 0)
     except Exception as exc:
+        if runtime is not None:
+            _log_startup_event(runtime, f"child failed: {exc}")
         report_startup_failure(exc)
         return 1
 
