@@ -179,6 +179,15 @@ def _mark_update_checked(user_root: Path, timestamp_key: str = "last_check_utc",
     _save_update_state(user_root, state)
 
 
+def _mark_update_started(user_root: Path, latest_version: str) -> None:
+    state = _load_update_state(user_root)
+    state["last_update_start_utc"] = dt.datetime.utcnow().isoformat()
+    state["last_update_result"] = "started"
+    state["latest_version"] = latest_version
+    state.pop("last_update_error", None)
+    _save_update_state(user_root, state)
+
+
 def _mark_pending_update_changelog(user_root: Path, version: str, changelog: str) -> None:
     state = _load_update_state(user_root)
     state["pending_changelog_version"] = version
@@ -408,6 +417,7 @@ $Relaunch = {json.dumps(str(relaunch_path))}
 $LatestVersion = {json.dumps(str(latest_version))}
 $MainScriptName = {json.dumps(main_script)}
 $Stage = Join-Path $env:TEMP ("einsatzbericht_update_" + [guid]::NewGuid().ToString())
+$StatePath = Join-Path (Join-Path (Split-Path -Parent $InstallDir) "logs") "update_state.json"
 $script:UpdateActivity = "Einsatzbericht Manager Update"
 $script:UpdateStep = 0
 $script:UpdateTotalSteps = 7
@@ -424,6 +434,32 @@ function Show-UpdateStep {{
 
 function Complete-UpdateProgress {{
     Write-Progress -Activity $script:UpdateActivity -Completed
+}}
+
+function Set-UpdateStateValues {{
+    param([hashtable]$Values)
+
+    try {{
+        $StateDir = Split-Path -Parent $StatePath
+        New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+        $State = @{{}}
+        if (Test-Path -LiteralPath $StatePath) {{
+            try {{
+                $Existing = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+                if ($Existing) {{
+                    $Existing.PSObject.Properties | ForEach-Object {{
+                        $State[$_.Name] = $_.Value
+                    }}
+                }}
+            }} catch {{
+            }}
+        }}
+        foreach ($Key in $Values.Keys) {{
+            $State[$Key] = $Values[$Key]
+        }}
+        $State | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+    }} catch {{
+    }}
 }}
 
 function Get-InstalledAppProcessIds {{
@@ -682,6 +718,13 @@ try {{
         }}
     }}
 
+    Set-UpdateStateValues @{{
+        last_update_result = "installed"
+        installed_version = $LatestVersion
+        last_update_success_utc = (Get-Date).ToUniversalTime().ToString("o")
+        last_update_error = $null
+    }}
+
     Show-UpdateStep "App wird gestartet"
     $LaunchScript = Join-Path $InstallDir "launch_app.ps1"
     $SourceLauncher = Join-Path $InstallDir "run_app.py"
@@ -693,6 +736,13 @@ try {{
     Start-Sleep -Seconds 2
 }} catch {{
     Complete-UpdateProgress
+    Set-UpdateStateValues @{{
+        last_update_result = "failed"
+        last_update_error = $_.Exception.Message
+        last_update_failed_utc = (Get-Date).ToUniversalTime().ToString("o")
+        last_check_utc = $null
+        last_runtime_check_utc = $null
+    }}
     Write-Host ""
     Write-Host "Update fehlgeschlagen:"
     Write-Host $_.Exception.Message
@@ -1004,7 +1054,7 @@ def start_update_from_info(update_info: Dict[str, Any], base_dir: Optional[Path]
         zip_path = _download_update_zip(update_url, user_root, download_name)
         _mark_pending_update_changelog(user_root, latest_version, changelog)
         _launch_external_updater(install_dir, zip_path, manifest, latest_version)
-        _mark_update_checked(user_root, last_update_result="started", latest_version=latest_version)
+        _mark_update_started(user_root, latest_version)
     except Exception as exc:
         _mark_update_checked(user_root, last_update_result="failed", last_update_error=str(exc))
         return False, str(exc)
