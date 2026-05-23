@@ -426,73 +426,136 @@ function Complete-UpdateProgress {{
     Write-Progress -Activity $script:UpdateActivity -Completed
 }}
 
-function Stop-InstalledApp {{
+function Get-InstalledAppProcessIds {{
     $InstallRoot = Split-Path -Parent $InstallDir
-    $deadline = (Get-Date).AddSeconds(10)
+    $processIds = New-Object "System.Collections.Generic.HashSet[int]"
+
+    Get-Process -Name "run_app" -ErrorAction SilentlyContinue | ForEach-Object {{
+        if ((-not $_.Path) -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {{
+            [void]$processIds.Add([int]$_.Id)
+        }}
+    }}
+
+    foreach ($ProcessName in @("python.exe", "pythonw.exe", "powershell.exe", "pwsh.exe")) {{
+        try {{
+            Get-CimInstance Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction SilentlyContinue |
+                Where-Object {{
+                    $cmd = [string]($_.CommandLine)
+                    $exe = [string]($_.ExecutablePath)
+                    (($cmd -and $cmd.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                     ($cmd -and $cmd.IndexOf($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                     ($exe -and $exe.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)))
+                }} |
+                ForEach-Object {{ [void]$processIds.Add([int]$_.ProcessId) }}
+        }} catch {{
+        }}
+    }}
+
+    $ids = @()
+    foreach ($processId in $processIds) {{
+        if ($processId -and $processId -ne $PID) {{
+            $ids += [int]$processId
+        }}
+    }}
+    return @($ids | Select-Object -Unique)
+}}
+
+function Stop-InstalledApp {{
+    $deadline = (Get-Date).AddSeconds(30)
 
     do {{
-        $processIds = New-Object "System.Collections.Generic.HashSet[int]"
-
-        Get-Process -Name "run_app" -ErrorAction SilentlyContinue | ForEach-Object {{
-            if ((-not $_.Path) -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {{
-                [void]$processIds.Add([int]$_.Id)
-            }}
-        }}
-
-        foreach ($ProcessName in @("python.exe", "pythonw.exe", "powershell.exe", "pwsh.exe")) {{
-            try {{
-                Get-CimInstance Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction SilentlyContinue |
-                    Where-Object {{
-                        $cmd = [string]($_.CommandLine)
-                        $exe = [string]($_.ExecutablePath)
-                        ($cmd.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                        ($cmd.IndexOf($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                        ($exe -and $exe.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase))
-                    }} |
-                    ForEach-Object {{ [void]$processIds.Add([int]$_.ProcessId) }}
-            }} catch {{
-            }}
-        }}
-
-        $ids = @()
-        foreach ($processId in $processIds) {{
-            if ($processId -and $processId -ne $PID) {{
-                $ids += [int]$processId
-            }}
-        }}
-        $ids = @($ids | Select-Object -Unique)
+        $ids = @(Get-InstalledAppProcessIds)
         if ($ids.Count -eq 0) {{
             return
         }}
+
         foreach ($processId in $ids) {{
             Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }}
+        try {{
+            Wait-Process -Id $ids -Timeout 3 -ErrorAction SilentlyContinue
+        }} catch {{
         }}
         Start-Sleep -Milliseconds 500
     }} while ((Get-Date) -lt $deadline)
 
-    $remaining = @()
-    foreach ($ProcessName in @("run_app", "python", "pythonw", "powershell", "pwsh")) {{
-        try {{
-            $remaining += Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
-                Where-Object {{
-                    $_.Id -ne $PID -and (
-                        ((-not $_.Path) -and $_.ProcessName -eq "run_app") -or
-                        ($_.Path -and $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase))
-                    )
-                }}
-        }} catch {{
-        }}
-    }}
+    $remaining = @(Get-InstalledAppProcessIds)
     if ($remaining.Count -gt 0) {{
         throw "Die laufende App konnte nicht vollstaendig beendet werden."
     }}
 }}
 
+function Test-FileUnlocked {{
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {{
+        return $true
+    }}
+
+    $stream = $null
+    try {{
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        return $true
+    }} catch {{
+        return $false
+    }} finally {{
+        if ($stream) {{
+            $stream.Close()
+        }}
+    }}
+}}
+
+function Get-LockedAppFiles {{
+    $paths = @()
+    $launcher = Join-Path $InstallDir "run_app.exe"
+    if (Test-Path -LiteralPath $launcher -PathType Leaf) {{
+        $paths += $launcher
+    }}
+
+    $internalDir = Join-Path $InstallDir "_internal"
+    if (Test-Path -LiteralPath $internalDir -PathType Container) {{
+        $extensions = @(".dll", ".pyd", ".exe")
+        $paths += Get-ChildItem -LiteralPath $internalDir -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {{ $extensions -contains $_.Extension.ToLowerInvariant() }} |
+            ForEach-Object {{ $_.FullName }}
+    }}
+
+    $locked = @()
+    foreach ($path in ($paths | Sort-Object -Unique)) {{
+        if (-not (Test-FileUnlocked -Path $path)) {{
+            $locked += $path
+        }}
+    }}
+    return @($locked)
+}}
+
+function Wait-InstallDirUnlocked {{
+    param([int]$TimeoutSeconds = 45)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $locked = @()
+    do {{
+        $locked = @(Get-LockedAppFiles)
+        if ($locked.Count -eq 0) {{
+            return
+        }}
+        Stop-InstalledApp
+        Start-Sleep -Milliseconds 500
+    }} while ((Get-Date) -lt $deadline)
+
+    $sample = ($locked | Select-Object -First 3) -join ", "
+    if (-not $sample) {{
+        $sample = $InstallDir
+    }}
+    throw "App-Dateien sind noch durch einen Prozess gesperrt: $sample"
+}}
+
 function Copy-PayloadWithRetry {{
     param([string]$PayloadPath)
 
-    for ($Attempt = 1; $Attempt -le 12; $Attempt++) {{
+    for ($Attempt = 1; $Attempt -le 20; $Attempt++) {{
         try {{
+            Wait-InstallDirUnlocked -TimeoutSeconds 5
             $PreserveExistingAppData = Test-Path -LiteralPath (Join-Path $InstallDir "data")
             $Items = Get-ChildItem -LiteralPath $PayloadPath -Force -ErrorAction Stop |
                 Where-Object {{ -not ($PreserveExistingAppData -and $_.Name -eq "data") }}
@@ -501,7 +564,7 @@ function Copy-PayloadWithRetry {{
             }}
             return
         }} catch {{
-            if ($Attempt -eq 12) {{
+            if ($Attempt -eq 20) {{
                 throw
             }}
             Stop-InstalledApp
@@ -513,7 +576,7 @@ function Copy-PayloadWithRetry {{
 function Test-ServerReady {{
     param([int]$Port)
     try {{
-        Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$Port/_stcore/health" -TimeoutSec 2 | Out-Null
+        Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/_stcore/health" -TimeoutSec 2 | Out-Null
         return $true
     }} catch {{
         return $false
@@ -521,16 +584,7 @@ function Test-ServerReady {{
 }}
 
 function Open-AppWhenReady {{
-    $InstallRoot = Split-Path -Parent $InstallDir
-    $PortFile = Join-Path $InstallRoot "logs\\server_port.txt"
-    $ports = @()
-    if (Test-Path -LiteralPath $PortFile) {{
-        try {{
-            $ports += [int](Get-Content -LiteralPath $PortFile -Raw)
-        }} catch {{
-        }}
-    }}
-    $ports += 8501..8520
+    $ports = 8501..8510
 
     foreach ($candidate in ($ports | Select-Object -Unique)) {{
         if (Test-ServerReady -Port $candidate) {{
@@ -602,6 +656,7 @@ try {{
 
     Show-UpdateStep "Laufende App wird beendet"
     Stop-InstalledApp
+    Wait-InstallDirUnlocked -TimeoutSeconds 45
 
     Show-UpdateStep "Neue App-Dateien werden kopiert"
     Copy-PayloadWithRetry -PayloadPath $Payload
