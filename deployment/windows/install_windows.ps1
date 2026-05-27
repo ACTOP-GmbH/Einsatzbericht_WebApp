@@ -11,9 +11,11 @@ $startMenuDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
 $startMenuShortcut = Join-Path $startMenuDir "Einsatzbericht Manager.lnk"
 $launcherPath = Join-Path $installDir "run_app.exe"
 $launchScriptPath = Join-Path $installDir "launch_app.ps1"
+$launchWrapperPath = Join-Path $installDir "launch_app.vbs"
 $venvDir = Join-Path $installDir ".venv"
 $venvPython = Join-Path $venvDir "Scripts\python.exe"
 $powershellPath = Join-Path $PSHOME "powershell.exe"
+$wscriptPath = Join-Path $env:WINDIR "System32\wscript.exe"
 $pythonCommand = $null
 $pythonArgs = @()
 $script:installActivity = "Einsatzbericht Manager Installation"
@@ -335,189 +337,59 @@ function Copy-SourcePayload {
 
 function Write-LaunchScript {
     $launchScript = @'
-$ErrorActionPreference = "SilentlyContinue"
-Add-Type -AssemblyName System.Windows.Forms
+$ErrorActionPreference = "Stop"
 
 $installDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $launcherPath = Join-Path $installDir "run_app.exe"
 $venvPython = Join-Path $installDir ".venv\Scripts\python.exe"
 $sourceLauncher = Join-Path $installDir "run_app.py"
-$stdoutPath = Join-Path $installDir "launch_stdout.log"
-$stderrPath = Join-Path $installDir "launch_stderr.log"
-$installRoot = Split-Path -Parent $installDir
-$portFile = Join-Path $installRoot "logs\server_port.txt"
-$localHostName = "localhost"
-$port = 8501
 
 $env:STREAMLIT_BROWSER_GATHER_USAGE_STATS = "false"
 $env:STREAMLIT_SERVER_HEADLESS = "true"
 $env:STREAMLIT_SERVER_SHOW_EMAIL_PROMPT = "false"
 $env:STREAMLIT_GLOBAL_DEVELOPMENT_MODE = "false"
-$env:EINSATZBERICHT_SUPPRESS_APP_SPLASH = "1"
 
-$script:startupForm = $null
-$script:startupStatusLabel = $null
-
-$streamlitDir = Join-Path $env:USERPROFILE ".streamlit"
-New-Item -ItemType Directory -Path $streamlitDir -Force | Out-Null
-Set-Content -LiteralPath (Join-Path $streamlitDir "credentials.toml") -Value "[general]`nemail = `"`"`n" -Encoding UTF8
-if (-not (Test-Path -LiteralPath (Join-Path $streamlitDir "config.toml"))) {
-    Set-Content -LiteralPath (Join-Path $streamlitDir "config.toml") -Value "[browser]`ngatherUsageStats = false`n`n[server]`nheadless = true`nshowEmailPrompt = false`n" -Encoding UTF8
-}
-
-function Show-StartupWindow {
-    param([string]$Status = "App startet...")
-
+function Show-LaunchError {
+    param([string]$Message)
     try {
-        if ($script:startupForm -and -not $script:startupForm.IsDisposed) {
-            Update-StartupWindow -Status $Status
-            return
-        }
-
-        $script:startupForm = New-Object System.Windows.Forms.Form
-        $script:startupForm.Text = "Einsatzbericht Manager"
-        $script:startupForm.Width = 470
-        $script:startupForm.Height = 175
-        $script:startupForm.StartPosition = "CenterScreen"
-        $script:startupForm.FormBorderStyle = "FixedDialog"
-        $script:startupForm.MaximizeBox = $false
-        $script:startupForm.MinimizeBox = $false
-        $script:startupForm.ControlBox = $false
-        $script:startupForm.TopMost = $true
-
-        $titleLabel = New-Object System.Windows.Forms.Label
-        $titleLabel.Text = "Einsatzbericht Manager wird gestartet"
-        $titleLabel.Left = 24
-        $titleLabel.Top = 22
-        $titleLabel.Width = 405
-        $titleLabel.Height = 24
-
-        $script:startupStatusLabel = New-Object System.Windows.Forms.Label
-        $script:startupStatusLabel.Text = $Status
-        $script:startupStatusLabel.Left = 24
-        $script:startupStatusLabel.Top = 56
-        $script:startupStatusLabel.Width = 405
-        $script:startupStatusLabel.Height = 28
-
-        $progress = New-Object System.Windows.Forms.ProgressBar
-        $progress.Left = 24
-        $progress.Top = 96
-        $progress.Width = 405
-        $progress.Height = 18
-        $progress.Style = "Marquee"
-        $progress.MarqueeAnimationSpeed = 30
-
-        [void]$script:startupForm.Controls.Add($titleLabel)
-        [void]$script:startupForm.Controls.Add($script:startupStatusLabel)
-        [void]$script:startupForm.Controls.Add($progress)
-        [void]$script:startupForm.Show()
-        [System.Windows.Forms.Application]::DoEvents()
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show($Message, "Startfehler") | Out-Null
     } catch {
+        Write-Host $Message
     }
 }
 
-function Update-StartupWindow {
-    param([string]$Status)
-
-    try {
-        if ($script:startupStatusLabel -and -not $script:startupStatusLabel.IsDisposed) {
-            $script:startupStatusLabel.Text = $Status
-        }
-        if ($script:startupForm -and -not $script:startupForm.IsDisposed) {
-            $script:startupForm.Refresh()
-            [System.Windows.Forms.Application]::DoEvents()
-        }
-    } catch {
-    }
-}
-
-function Close-StartupWindow {
-    try {
-        if ($script:startupForm -and -not $script:startupForm.IsDisposed) {
-            $script:startupForm.Close()
-            $script:startupForm.Dispose()
-        }
-    } catch {
-    }
-    $script:startupForm = $null
-    $script:startupStatusLabel = $null
-}
-
-function Test-ServerReady {
-    param([int]$Port)
-    try {
-        $Url = "http://${localHostName}:$Port/_stcore/health"
-        Invoke-WebRequest -UseBasicParsing -Uri $Url -TimeoutSec 2 | Out-Null
-        return $true
-    } catch {
-        return $false
-    }
-}
-
-function Open-ExistingInstance {
-    $ports = @()
-    if (Test-Path -LiteralPath $portFile) {
-        try {
-            $ports += [int](Get-Content -LiteralPath $portFile -Raw)
-        } catch {
-        }
-    }
-    $ports += 8501..8520
-    foreach ($candidate in ($ports | Select-Object -Unique)) {
-        if (Test-ServerReady -Port $candidate) {
-            Start-Process "http://${localHostName}:$candidate" | Out-Null
-            return $true
-        }
-    }
-    return $false
-}
-
-if (Open-ExistingInstance) {
-    exit 0
-}
-
-Show-StartupWindow -Status "App-Prozess wird gestartet..."
-
-if (Test-Path -LiteralPath $launcherPath) {
-    Start-Process -FilePath $launcherPath -WorkingDirectory $installDir -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath | Out-Null
-} elseif ((Test-Path -LiteralPath $venvPython) -and (Test-Path -LiteralPath $sourceLauncher)) {
-    Start-Process -FilePath $venvPython -ArgumentList "`"$sourceLauncher`"" -WorkingDirectory $installDir -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath | Out-Null
-} else {
-    Close-StartupWindow
-    [System.Windows.Forms.MessageBox]::Show("Die App wurde nicht vollstaendig installiert.", "Startfehler") | Out-Null
-    exit 1
-}
-
-$deadline = (Get-Date).AddSeconds(75)
-while ((Get-Date) -lt $deadline) {
-    Update-StartupWindow -Status "Browser wird geoeffnet, sobald die App bereit ist..."
-    if (Open-ExistingInstance) {
-        Update-StartupWindow -Status "App ist bereit. Browser wurde geoeffnet."
-        Start-Sleep -Milliseconds 1500
-        Close-StartupWindow
+try {
+    if (Test-Path -LiteralPath $launcherPath) {
+        Start-Process -FilePath $launcherPath -WorkingDirectory $installDir | Out-Null
         exit 0
     }
-    Start-Sleep -Milliseconds 500
-}
-
-$details = ""
-foreach ($path in @($stderrPath, $stdoutPath)) {
-    if (Test-Path -LiteralPath $path) {
-        $details += (Get-Content -LiteralPath $path -Raw)
+    if ((Test-Path -LiteralPath $venvPython) -and (Test-Path -LiteralPath $sourceLauncher)) {
+        Start-Process -FilePath $venvPython -ArgumentList "`"$sourceLauncher`"" -WorkingDirectory $installDir -WindowStyle Hidden | Out-Null
+        exit 0
     }
-}
-if ($details) {
-    Close-StartupWindow
-    [System.Windows.Forms.MessageBox]::Show("Die App konnte nicht gestartet werden.`n`nDetails:`n$details", "Startfehler") | Out-Null
+    Show-LaunchError "Die App wurde nicht vollstaendig installiert."
+    exit 1
+} catch {
+    Show-LaunchError ("Die App konnte nicht gestartet werden.`n`nDetails:`n" + $_.Exception.Message)
     exit 1
 }
-
-Close-StartupWindow
-[System.Windows.Forms.MessageBox]::Show("Die App wurde gestartet, aber der Browser konnte die lokale Seite nicht erreichen.`n`nBitte pruefe Firewall/Virenscanner oder starte erneut.", "Startfehler") | Out-Null
 '@
 
     Set-Content -LiteralPath $launchScriptPath -Value $launchScript -Encoding UTF8
     Unblock-File -LiteralPath $launchScriptPath -ErrorAction SilentlyContinue
+}
+
+function Write-LaunchWrapper {
+    $command = "`"$powershellPath`" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launchScriptPath`""
+    $escapedCommand = $command.Replace('"', '""')
+    $wrapperScript = @"
+Set shell = CreateObject("WScript.Shell")
+shell.Run "$escapedCommand", 0, False
+"@
+
+    Set-Content -LiteralPath $launchWrapperPath -Value $wrapperScript -Encoding ASCII
+    Unblock-File -LiteralPath $launchWrapperPath -ErrorAction SilentlyContinue
 }
 
 $bundledPayloadDir = Join-Path $scriptRoot "app"
@@ -582,16 +454,23 @@ if ($useBundledPayload) {
 
 Show-InstallStep "Startskript wird erstellt"
 Write-LaunchScript
+Write-LaunchWrapper
 
 Show-InstallStep "Verknuepfungen werden erstellt"
 $wsh = New-Object -ComObject WScript.Shell
 foreach ($shortcutPath in @($desktopShortcut, $startMenuShortcut)) {
     $shortcut = $wsh.CreateShortcut($shortcutPath)
-    $shortcut.TargetPath = $powershellPath
-    $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launchScriptPath`""
     $shortcut.WorkingDirectory = $installDir
     if (Test-Path -LiteralPath $launcherPath) {
+        $shortcut.TargetPath = $launcherPath
+        $shortcut.Arguments = ""
         $shortcut.IconLocation = $launcherPath
+    } elseif (Test-Path -LiteralPath $wscriptPath) {
+        $shortcut.TargetPath = $wscriptPath
+        $shortcut.Arguments = "`"$launchWrapperPath`""
+    } else {
+        $shortcut.TargetPath = $powershellPath
+        $shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launchScriptPath`""
     }
     $shortcut.Save()
 }

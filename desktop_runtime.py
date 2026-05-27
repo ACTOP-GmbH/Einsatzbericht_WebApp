@@ -78,7 +78,7 @@ def load_release_manifest(base_dir: Optional[Path] = None) -> Dict[str, Any]:
     manifest = dict(DEFAULT_MANIFEST)
     if manifest_path.exists():
         try:
-            manifest.update(json.loads(manifest_path.read_text(encoding="utf-8")))
+            manifest.update(json.loads(manifest_path.read_text(encoding="utf-8-sig")))
         except Exception:
             pass
     return manifest
@@ -158,7 +158,7 @@ def _load_update_state(user_root: Path) -> Dict[str, Any]:
     if not state_path.exists():
         return {}
     try:
-        return json.loads(state_path.read_text(encoding="utf-8"))
+        return json.loads(state_path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
 
@@ -653,18 +653,15 @@ function Start-AppAndWaitForBrowser {{
     )
 
     Write-Host "Die App wird gestartet. Bitte warten, bis der Browser geoeffnet wurde..."
-    if (Test-Path -LiteralPath $LaunchScript) {{
-        $process = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$LaunchScript`"" -Wait -PassThru
-        if ($process.ExitCode -ne 0) {{
-            throw "Die App konnte nach dem Update nicht gestartet werden."
-        }}
-        return
-    }}
-
     if (Test-Path -LiteralPath $Relaunch) {{
         Start-Process -FilePath $Relaunch | Out-Null
     }} elseif ((Test-Path -LiteralPath $VenvPython) -and (Test-Path -LiteralPath $SourceLauncher)) {{
         Start-Process -FilePath $VenvPython -ArgumentList "`"$SourceLauncher`"" -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
+    }} elseif (Test-Path -LiteralPath $LaunchScript) {{
+        $process = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$LaunchScript`"" -Wait -PassThru
+        if ($process.ExitCode -ne 0) {{
+            throw "Die App konnte nach dem Update nicht gestartet werden."
+        }}
     }} else {{
         throw "Kein gueltiger App-Starter gefunden."
     }}
@@ -698,8 +695,14 @@ try {{
     Copy-PayloadWithRetry -PayloadPath $Payload
 
     Show-UpdateStep "Versionsinformationen werden aktualisiert"
-    $ManifestPath = Join-Path $InstallDir "release_manifest.json"
-    if (Test-Path -LiteralPath $ManifestPath) {{
+    $ManifestPaths = @(
+        (Join-Path $InstallDir "release_manifest.json"),
+        (Join-Path $InstallDir "_internal\\release_manifest.json")
+    )
+    foreach ($ManifestPath in $ManifestPaths) {{
+        if (-not (Test-Path -LiteralPath $ManifestPath)) {{
+            continue
+        }}
         try {{
             $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
             $Manifest.version = $LatestVersion
