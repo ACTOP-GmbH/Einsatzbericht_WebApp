@@ -99,6 +99,11 @@ class WorkbookData:
 def _is_blank(value: Any) -> bool:
     if value is None:
         return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
     if isinstance(value, str) and value.strip() == "":
         return True
     return False
@@ -150,6 +155,11 @@ def _to_date(value: Any) -> Optional[dt.date]:
 def _to_time(value: Any) -> Optional[dt.time]:
     if value is None:
         return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
     if isinstance(value, dt.datetime):
         return value.time().replace(microsecond=0)
     if isinstance(value, dt.time):
@@ -167,11 +177,28 @@ def _to_time(value: Any) -> Optional[dt.time]:
         s = value.strip()
         if not s:
             return None
-        for fmt in ("%H:%M:%S", "%H:%M"):
+        for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
             try:
                 return dt.datetime.strptime(s, fmt).time()
             except ValueError:
                 pass
+        try:
+            return pd.to_datetime(s).time().replace(microsecond=0)
+        except Exception:
+            pass
+        try:
+            delta = pd.to_timedelta(s)
+            if pd.notna(delta):
+                return _to_time(delta.to_pytimedelta())
+        except Exception:
+            pass
+    try:
+        if isinstance(value, pd.Timedelta):
+            return _to_time(value.to_pytimedelta())
+        if isinstance(value, pd.Timestamp):
+            return value.time().replace(microsecond=0)
+    except Exception:
+        pass
     return None
 
 
@@ -3539,6 +3566,9 @@ def main() -> None:
                 )
                 editor_df = pd.DataFrame([placeholder], columns=editor_cols)
 
+            for time_col in ("Zeit von", "Zeit bis"):
+                editor_df[time_col] = editor_df[time_col].apply(_format_time)
+
             editor_df["Löschen"] = False
 
             data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
@@ -3568,15 +3598,16 @@ def main() -> None:
                 height=420,
                 num_rows="dynamic",
                 hide_index=True,
-                column_order=[c for c in editor_cols + ["Löschen"] if c != "_excel_row"],
+                column_order=editor_cols + ["Löschen"],
                 disabled=["_excel_row", "Dauer"],
                 column_config={
                     "_excel_row": st.column_config.NumberColumn("ID",
-                                                                help="Technische ID (nicht ändern)"),
+                                                                help="Technische Excel-Zeile (nicht ändern)",
+                                                                width="small"),
                     "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
                     "Projekt": st.column_config.SelectboxColumn("Projekt", options=projekte_opts),
-                    "Zeit von": st.column_config.TimeColumn("Zeit von", format="HH:mm"),
-                    "Zeit bis": st.column_config.TimeColumn("Zeit bis", format="HH:mm"),
+                    "Zeit von": st.column_config.TextColumn("Zeit von", help="Format HH:MM, z.B. 08:30"),
+                    "Zeit bis": st.column_config.TextColumn("Zeit bis", help="Format HH:MM, z.B. 17:00"),
                     "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5),
                     "Zahl": st.column_config.NumberColumn("Zeit (h)",
                                                           help="Dezimalstunden für manuelle Angaben (z.B. Organisatorisches)",
@@ -3650,28 +3681,77 @@ def main() -> None:
                 )
 
             if st.button("Tabellenänderungen speichern", key="save_inline_table"):
+                def _inline_time_invalid(value: Any) -> bool:
+                    if _is_blank(value):
+                        return False
+                    if isinstance(value, str) and not re.fullmatch(r"\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?", value.strip()):
+                        return True
+                    return _to_time(value) is None
+
+                def _inline_number_key(value: Any) -> Optional[float]:
+                    if value is None or _is_blank(value):
+                        return None
+                    try:
+                        if pd.isna(value):
+                            return None
+                    except Exception:
+                        pass
+                    try:
+                        return round(float(value), 6)
+                    except Exception:
+                        return None
+
+                def _inline_record_key(rec: Dict[str, Any]) -> tuple:
+                    return (
+                        _format_date(rec.get("Datum")),
+                        _safe_str(rec.get("Projekt")).strip(),
+                        _format_time(rec.get("Zeit von")),
+                        _format_time(rec.get("Zeit bis")),
+                        int(rec.get("Pause_Min") or 0),
+                        _inline_number_key(rec.get("Zahl")),
+                        int(rec.get("km") or 0),
+                        _safe_str(rec.get("Tätigkeit")).strip(),
+                        _safe_str(rec.get("Kodierung")).strip(),
+                        _safe_str(rec.get("Interne Projekte")).strip(),
+                        _safe_str(rec.get("Info")),
+                        _normalize_yes_no(rec.get("Abgerechnet")) or _safe_str(rec.get("Abgerechnet")).strip(),
+                        _normalize_yes_no(rec.get("eingetragen")) or _safe_str(rec.get("eingetragen")).strip(),
+                    )
+
+                def _missing_excel_row(value: Any) -> bool:
+                    if value is None:
+                        return True
+                    try:
+                        return bool(pd.isna(value))
+                    except Exception:
+                        return False
+
                 orig_by_row = {}
-                original_excel_rows = set()
                 for _, r in editor_df.iterrows():
                     exr = r.get("_excel_row")
-                    if exr is None or (isinstance(exr, float) and pd.isna(exr)):
+                    if _missing_excel_row(exr):
                         continue
                     try:
                         row_idx = int(exr)
                         orig_by_row[row_idx] = _editor_row_to_record(r)
-                        original_excel_rows.add(row_idx)
                     except Exception:
                         continue
 
                 updates: List[Tuple[int, Dict[str, Any]]] = []
                 inserts: List[Dict[str, Any]] = []
                 deletes: List[int] = []
-                kept_excel_rows = set()
+                time_errors: List[str] = []
 
                 for _, r in edited_df.iterrows():
                     exr = r.get("_excel_row")
                     mark_delete = bool(r.get("Löschen", False))
-                    is_new = (exr is None) or (isinstance(exr, float) and pd.isna(exr))
+                    is_new = _missing_excel_row(exr)
+
+                    row_label = "Neue Zeile" if is_new else f"ID {int(exr)}"
+                    if not mark_delete:
+                        for time_col in ("Zeit von", "Zeit bis"):
+                            if _inline_time_invalid(r.get(time_col)):
+                                time_errors.append(f"{row_label}: {time_col} muss im Format HH:MM sein.")
 
                     if is_new:
                         if _is_editor_row_blank(r):
@@ -3682,7 +3762,6 @@ def main() -> None:
                         continue
 
                     row_excel = int(exr)
-                    kept_excel_rows.add(row_excel)
 
                     if mark_delete:
                         deletes.append(row_excel)
@@ -3691,8 +3770,12 @@ def main() -> None:
                     new_rec = _editor_row_to_record(r)
                     old_rec = orig_by_row.get(row_excel)
 
-                    if old_rec is None or _key_for_import(new_rec) != _key_for_import(old_rec):
+                    if old_rec is None or _inline_record_key(new_rec) != _inline_record_key(old_rec):
                         updates.append((row_excel, new_rec))
+
+                if time_errors:
+                    st.error("Ungültige Uhrzeit:\n\n" + "\n".join(time_errors[:10]))
+                    st.stop()
 
                 coding_errors = _coding_required_errors(
                     inserts + [rec for _, rec in updates],
@@ -3701,10 +3784,6 @@ def main() -> None:
                 if coding_errors:
                     st.error("Kodierung fehlt:\n\n" + "\n".join(coding_errors[:10]))
                     st.stop()
-
-                for r_id in original_excel_rows:
-                    if r_id not in kept_excel_rows and r_id not in deletes:
-                        deletes.append(r_id)
 
                 def _mutator_inline(wb):
                     ws = wb[TAETIGKEITEN_SHEET]
