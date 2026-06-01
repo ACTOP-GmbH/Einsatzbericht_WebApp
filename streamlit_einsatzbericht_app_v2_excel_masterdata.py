@@ -3610,15 +3610,6 @@ def main() -> None:
                 except Exception:
                     return False
 
-            def _inline_editor_index(row_pos: int, row: pd.Series) -> str:
-                exr = row.get("_excel_row")
-                if _missing_excel_row_value(exr):
-                    return f"new-{row_pos}"
-                try:
-                    return f"excel-{int(exr)}"
-                except Exception:
-                    return f"new-{row_pos}"
-
             def _apply_inline_defaults(row: Dict[str, Any]) -> None:
                 if _is_blank(row.get("Datum")):
                     row["Datum"] = today_default
@@ -3648,12 +3639,8 @@ def main() -> None:
                 lambda r: _calc_dauer_str(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min"), r.get("Zahl")),
                 axis=1
             )
-            editor_key = "taetigkeiten_inline_editor"
+            editor_key = "taetigkeiten_inline_editor_v2"
             editor_input_df = editor_df[editor_cols + ["Löschen"]].copy()
-            editor_input_df.index = [
-                _inline_editor_index(row_pos, row)
-                for row_pos, (_, row) in enumerate(editor_input_df.iterrows())
-            ]
 
             editor_state = st.session_state.get(editor_key)
             if isinstance(editor_state, dict):
@@ -3692,7 +3679,7 @@ def main() -> None:
                 num_rows="dynamic",
                 hide_index=True,
                 column_order=[c for c in editor_cols + ["Löschen"] if c != "_excel_row"],
-                disabled=["Dauer"],
+                disabled=["_excel_row", "Dauer"],
                 column_config={
                     "_excel_row": None,
                     "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY", default=today_default),
@@ -3827,11 +3814,6 @@ def main() -> None:
                     if not _missing_excel_row_value(exr):
                         try:
                             return int(exr)
-                        except Exception:
-                            pass
-                    if isinstance(row_ref, str) and row_ref.startswith("excel-"):
-                        try:
-                            return int(row_ref.removeprefix("excel-"))
                         except Exception:
                             pass
                     return None
