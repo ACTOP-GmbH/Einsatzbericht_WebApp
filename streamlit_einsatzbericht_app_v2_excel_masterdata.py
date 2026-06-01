@@ -1037,8 +1037,12 @@ def _excel_original_report_action(
             return _excel_original_report_action_com(
                 xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df
             )
-        except Exception:
-            pass  # Fallthrough to fallback
+        except Exception as exc:
+            if action == "pdf":
+                return False, f"PDF-Export unter Windows braucht Microsoft Excel und pywin32/win32com. Ursache: {exc}", []
+            if action == "print":
+                return False, f"Druck unter Windows braucht Microsoft Excel und pywin32/win32com. Ursache: {exc}", []
+            # Opening and XLSX copy still have a useful openpyxl fallback.
 
     return _excel_original_report_action_fallback(
         xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df, is_mac
