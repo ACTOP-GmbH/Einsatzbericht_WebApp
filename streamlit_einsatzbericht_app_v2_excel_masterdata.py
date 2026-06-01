@@ -3589,16 +3589,32 @@ def main() -> None:
 
             data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
 
-            def _calc_dauer_str(zv, zb, pause_min, zahl) -> str:
+            def _calc_hours_value(zv, zb, pause_min, zahl) -> Optional[float]:
                 h = _compute_hours_decimal(zv, zb, int(pause_min or 0))
+                if h is not None:
+                    return h
+                if zahl is None or _is_blank(zahl):
+                    return None
+                try:
+                    if pd.isna(zahl):
+                        return None
+                except Exception:
+                    pass
+                try:
+                    return round(float(zahl), 4)
+                except Exception:
+                    return None
+
+            def _calc_hours_display(zv, zb, pause_min, zahl) -> str:
+                h = _calc_hours_value(zv, zb, pause_min, zahl)
                 if h is None:
-                    try:
-                        if zahl is not None and pd.notna(zahl):
-                            h = float(zahl)
-                        else:
-                            return ""
-                    except Exception:
-                        return ""
+                    return ""
+                return f"{h:.2f}"
+
+            def _calc_dauer_str(zv, zb, pause_min, zahl) -> str:
+                h = _calc_hours_value(zv, zb, pause_min, zahl)
+                if h is None:
+                    return ""
                 mins = int(round(h * 60))
                 return f"{mins // 60:02d}:{mins % 60:02d}"
 
@@ -3630,16 +3646,26 @@ def main() -> None:
                         "Abgerechnet",
                         "eingetragen",
                 ):
-                    if row.get(text_col) is None:
+                    if _is_blank(row.get(text_col)):
                         row[text_col] = ""
+                    elif text_col in {"Zeit von", "Zeit bis"}:
+                        row[text_col] = _format_time(row.get(text_col))
+                    else:
+                        row[text_col] = _safe_str(row.get(text_col))
+                row["Zahl"] = _calc_hours_display(row.get("Zeit von"), row.get("Zeit bis"), row.get("Pause_Min"),
+                                                  row.get("Zahl"))
                 row["Dauer"] = _calc_dauer_str(row.get("Zeit von"), row.get("Zeit bis"), row.get("Pause_Min"),
                                                row.get("Zahl"))
 
+            editor_df["Zahl"] = editor_df.apply(
+                lambda r: _calc_hours_display(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min"), r.get("Zahl")),
+                axis=1
+            )
             editor_df["Dauer"] = editor_df.apply(
                 lambda r: _calc_dauer_str(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min"), r.get("Zahl")),
                 axis=1
             )
-            editor_key = "taetigkeiten_inline_editor_v2"
+            editor_key = "taetigkeiten_inline_editor_v3"
             editor_input_df = editor_df[editor_cols + ["Löschen"]].copy()
 
             editor_state = st.session_state.get(editor_key)
@@ -3659,6 +3685,12 @@ def main() -> None:
                         if 0 <= row_pos < len(editor_input_df):
                             merged = editor_input_df.iloc[row_pos].to_dict()
                             merged.update(changes)
+                            changes["Zahl"] = _calc_hours_display(
+                                merged.get("Zeit von"),
+                                merged.get("Zeit bis"),
+                                merged.get("Pause_Min"),
+                                merged.get("Zahl"),
+                            )
                             changes["Dauer"] = _calc_dauer_str(
                                 merged.get("Zeit von"),
                                 merged.get("Zeit bis"),
@@ -3679,7 +3711,7 @@ def main() -> None:
                 num_rows="dynamic",
                 hide_index=True,
                 column_order=[c for c in editor_cols + ["Löschen"] if c != "_excel_row"],
-                disabled=["_excel_row", "Dauer"],
+                disabled=["_excel_row", "Zahl", "Dauer"],
                 column_config={
                     "_excel_row": None,
                     "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY", default=today_default),
@@ -3695,9 +3727,10 @@ def main() -> None:
                                                             validate=r"^$|^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$"),
                     "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5,
                                                                default=0),
-                    "Zahl": st.column_config.NumberColumn("Zeit (h)",
-                                                          help="Dezimalstunden für manuelle Angaben (z.B. Organisatorisches)",
-                                                          min_value=0.0, step=0.25, format="%.2f"),
+                    "Zahl": st.column_config.TextColumn("Zeit (h)",
+                                                        help="Automatisch aus Beginn, Ende und Pause berechnet",
+                                                        default="",
+                                                        width="small"),
                     "Dauer": st.column_config.TextColumn("Dauer",
                                                          help="Berechnet aus Zeit von/bis und Pause (oder Zeit h)",
                                                          width="small"),
@@ -3708,7 +3741,7 @@ def main() -> None:
                                                                  default=""),
                     "Interne Projekte": st.column_config.SelectboxColumn("Interne Projekte", options=interne_opts,
                                                                         default=""),
-                    "Info": st.column_config.TextColumn("Leistungsbeschreibung", width="large"),
+                    "Info": st.column_config.TextColumn("Leistungsbeschreibung", width="large", default=""),
                     "Abgerechnet": st.column_config.SelectboxColumn("Abgerechnet", options=[""] + ja_nein_opts,
                                                                     default=""),
                     "eingetragen": st.column_config.SelectboxColumn("eingetragen", options=[""] + ja_nein_opts,
