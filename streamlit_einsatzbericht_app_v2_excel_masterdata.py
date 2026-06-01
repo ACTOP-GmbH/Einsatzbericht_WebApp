@@ -3626,17 +3626,24 @@ def main() -> None:
                 except Exception:
                     return False
 
-            def _apply_inline_defaults(row: Dict[str, Any]) -> None:
+            def _set_row_value(row: Dict[str, Any], key: str, value: Any) -> bool:
+                if row.get(key) == value:
+                    return False
+                row[key] = value
+                return True
+
+            def _apply_inline_defaults(row: Dict[str, Any]) -> bool:
+                changed = False
                 if _is_blank(row.get("Datum")):
-                    row["Datum"] = today_default
+                    changed = _set_row_value(row, "Datum", today_default) or changed
                 if _is_blank(row.get("Projekt")) and default_project:
-                    row["Projekt"] = default_project
+                    changed = _set_row_value(row, "Projekt", default_project) or changed
                 if _is_blank(row.get("Pause_Min")):
-                    row["Pause_Min"] = 0
+                    changed = _set_row_value(row, "Pause_Min", 0) or changed
                 if _is_blank(row.get("km")):
-                    row["km"] = 0
+                    changed = _set_row_value(row, "km", 0) or changed
                 if _is_blank(row.get("Tätigkeit")):
-                    row["Tätigkeit"] = default_type
+                    changed = _set_row_value(row, "Tätigkeit", default_type) or changed
                 for text_col in (
                         "Zeit von",
                         "Zeit bis",
@@ -3647,15 +3654,22 @@ def main() -> None:
                         "eingetragen",
                 ):
                     if _is_blank(row.get(text_col)):
-                        row[text_col] = ""
+                        changed = _set_row_value(row, text_col, "") or changed
                     elif text_col in {"Zeit von", "Zeit bis"}:
-                        row[text_col] = _format_time(row.get(text_col))
+                        changed = _set_row_value(row, text_col, _format_time(row.get(text_col))) or changed
                     else:
-                        row[text_col] = _safe_str(row.get(text_col))
-                row["Zahl"] = _calc_hours_display(row.get("Zeit von"), row.get("Zeit bis"), row.get("Pause_Min"),
-                                                  row.get("Zahl"))
-                row["Dauer"] = _calc_dauer_str(row.get("Zeit von"), row.get("Zeit bis"), row.get("Pause_Min"),
-                                               row.get("Zahl"))
+                        changed = _set_row_value(row, text_col, _safe_str(row.get(text_col))) or changed
+                changed = _set_row_value(
+                    row,
+                    "Zahl",
+                    _calc_hours_display(row.get("Zeit von"), row.get("Zeit bis"), row.get("Pause_Min"), row.get("Zahl")),
+                ) or changed
+                changed = _set_row_value(
+                    row,
+                    "Dauer",
+                    _calc_dauer_str(row.get("Zeit von"), row.get("Zeit bis"), row.get("Pause_Min"), row.get("Zahl")),
+                ) or changed
+                return changed
 
             editor_df["Zahl"] = editor_df.apply(
                 lambda r: _calc_hours_display(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min"), r.get("Zahl")),
@@ -3665,9 +3679,11 @@ def main() -> None:
                 lambda r: _calc_dauer_str(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min"), r.get("Zahl")),
                 axis=1
             )
-            editor_key = "taetigkeiten_inline_editor_v3"
+            editor_nonce = int(st.session_state.get("_taetigkeiten_inline_editor_nonce", 0) or 0)
+            editor_key = f"taetigkeiten_inline_editor_v4_{editor_nonce}"
             editor_input_df = editor_df[editor_cols + ["Löschen"]].copy()
 
+            editor_state_changed = False
             editor_state = st.session_state.get(editor_key)
             if isinstance(editor_state, dict):
                 edited_rows = editor_state.get("edited_rows")
@@ -3685,23 +3701,32 @@ def main() -> None:
                         if 0 <= row_pos < len(editor_input_df):
                             merged = editor_input_df.iloc[row_pos].to_dict()
                             merged.update(changes)
-                            changes["Zahl"] = _calc_hours_display(
-                                merged.get("Zeit von"),
-                                merged.get("Zeit bis"),
-                                merged.get("Pause_Min"),
-                                merged.get("Zahl"),
-                            )
-                            changes["Dauer"] = _calc_dauer_str(
-                                merged.get("Zeit von"),
-                                merged.get("Zeit bis"),
-                                merged.get("Pause_Min"),
-                                merged.get("Zahl"),
-                            )
+                            editor_state_changed = _set_row_value(
+                                changes,
+                                "Zahl",
+                                _calc_hours_display(
+                                    merged.get("Zeit von"),
+                                    merged.get("Zeit bis"),
+                                    merged.get("Pause_Min"),
+                                    merged.get("Zahl"),
+                                ),
+                            ) or editor_state_changed
+                            merged.update(changes)
+                            editor_state_changed = _set_row_value(
+                                changes,
+                                "Dauer",
+                                _calc_dauer_str(
+                                    merged.get("Zeit von"),
+                                    merged.get("Zeit bis"),
+                                    merged.get("Pause_Min"),
+                                    merged.get("Zahl"),
+                                ),
+                            ) or editor_state_changed
                 added_rows = editor_state.get("added_rows")
                 if isinstance(added_rows, list):
                     for row in added_rows:
                         if isinstance(row, dict):
-                            _apply_inline_defaults(row)
+                            editor_state_changed = _apply_inline_defaults(row) or editor_state_changed
 
             edited_df = data_editor_fn(
                 editor_input_df,
@@ -3804,7 +3829,8 @@ def main() -> None:
                         _is_blank(r.get("Kodierung"))
                 )
 
-            if st.button("Tabellenänderungen speichern", key="save_inline_table"):
+            save_inline_clicked = st.button("Tabellenänderungen speichern", key="save_inline_table")
+            if save_inline_clicked:
                 def _inline_time_invalid(value: Any) -> bool:
                     if _is_blank(value):
                         return False
@@ -3930,9 +3956,14 @@ def main() -> None:
                     st.success(
                         f"Gespeichert. Updates: {len(updates)}, Neu: {len(inserts)}, Gelöscht: {len(deletes)}. {msg}"
                     )
+                    st.session_state.pop(editor_key, None)
+                    st.session_state["_taetigkeiten_inline_editor_nonce"] = editor_nonce + 1
                     _refresh_after_workbook_change()
                 else:
                     st.error(msg)
+
+            if editor_state_changed and not save_inline_clicked:
+                st.rerun()
 
         st.markdown("---")
         st.caption("Neue Tätigkeiten und Änderungen bitte direkt in der Tabelle oben erfassen.")
