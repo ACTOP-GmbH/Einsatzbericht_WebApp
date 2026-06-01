@@ -45,6 +45,7 @@ REPORT_DETAIL_END_ROW = 35
 REPORT_DETAIL_COL_START = 1  # A
 REPORT_DETAIL_COL_END = 8  # H
 REPORT_CONSULTANT_CELL = "H9"
+REPORT_KM_CELL = "H13"
 REPORT_ROWS_PER_PAGE = REPORT_DETAIL_END_ROW - REPORT_DETAIL_START_ROW + 1
 MILESTONES_SHEET = "Meilensteine"
 MILESTONE_COLS = ["Projekt", "Meilenstein", "Datum", "Status", "Fortschritt", "Kommentar"]
@@ -636,12 +637,15 @@ def _set_original_report_context_com(
         month: int,
         project: str,
         consultant: Optional[str] = None,
+        km_total: Optional[int] = None,
 ) -> None:
     ws.Range("K2").Value = int(year)
     ws.Range("K3").Value = int(month)
     ws.Range("C12").Value = str(project)
     if consultant is not None:
         ws.Range(REPORT_CONSULTANT_CELL).Value = _safe_str(consultant).strip() or None
+    if km_total is not None:
+        ws.Range(REPORT_KM_CELL).Value = int(km_total)
 
 
 def _write_original_report_page_com(
@@ -651,8 +655,9 @@ def _write_original_report_page_com(
         month: int,
         project: str,
         consultant: Optional[str] = None,
+        km_total: Optional[int] = None,
 ) -> None:
-    _set_original_report_context_com(ws, year, month, project, consultant)
+    _set_original_report_context_com(ws, year, month, project, consultant, km_total)
 
     _clear_original_report_detail_area_com(ws)
 
@@ -685,12 +690,15 @@ def _set_original_report_context_openpyxl(
         month: int,
         project: str,
         consultant: Optional[str] = None,
+        km_total: Optional[int] = None,
 ) -> None:
     ws["K2"].value = int(year)
     ws["K3"].value = int(month)
     ws["C12"].value = str(project)
     if consultant is not None:
         ws[REPORT_CONSULTANT_CELL].value = _safe_str(consultant).strip() or None
+    if km_total is not None:
+        ws[REPORT_KM_CELL].value = int(km_total)
 
 
 def _write_original_report_page_openpyxl(
@@ -700,8 +708,9 @@ def _write_original_report_page_openpyxl(
         month: int,
         project: str,
         consultant: Optional[str] = None,
+        km_total: Optional[int] = None,
 ) -> None:
-    _set_original_report_context_openpyxl(ws, year, month, project, consultant)
+    _set_original_report_context_openpyxl(ws, year, month, project, consultant, km_total)
 
     for r in range(REPORT_DETAIL_START_ROW, REPORT_DETAIL_END_ROW + 1):
         for c in range(REPORT_DETAIL_COL_START, REPORT_DETAIL_COL_END + 1):
@@ -746,6 +755,13 @@ def _report_row_to_excel_values(row: pd.Series) -> List[Any]:
         kod_eb = _safe_str(kod_eb) or None
     leistung = _safe_str(row.get("Leistungsbeschreibung"))
     return [datum, beginn, ende, pause, zeit_h, art, kod_eb, leistung]
+
+
+def _report_total_km(report_df: Optional[pd.DataFrame]) -> Optional[int]:
+    if report_df is None or report_df.empty or "km" not in report_df.columns:
+        return None
+    km_values = pd.to_numeric(report_df["km"], errors="coerce").fillna(0)
+    return int(km_values.sum())
 
 
 def _split_report_pages(report_df: Optional[pd.DataFrame]) -> List[pd.DataFrame]:
@@ -809,6 +825,7 @@ def _excel_original_report_action_com(
         if not pages:
             pages = [pd.DataFrame()]
         page_count = len(pages)
+        report_km_total = _report_total_km(report_df)
 
         def _recalc() -> None:
             try:
@@ -835,7 +852,9 @@ def _excel_original_report_action_com(
             exported_files: List[Path] = []
             for page_idx, page_df in enumerate(pages, start=1):
                 if report_df is not None:
-                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project), consultant)
+                    _write_original_report_page_com(
+                        ws, page_df, int(year), int(month), str(project), consultant, report_km_total
+                    )
                 else:
                     _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                     _prepare_report_formula_in_excel_sheet_com(ws)
@@ -869,7 +888,9 @@ def _excel_original_report_action_com(
             exported_files: List[Path] = []
             for page_idx, page_df in enumerate(pages, start=1):
                 if report_df is not None:
-                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project), consultant)
+                    _write_original_report_page_com(
+                        ws, page_df, int(year), int(month), str(project), consultant, report_km_total
+                    )
                 else:
                     _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                     _prepare_report_formula_in_excel_sheet_com(ws)
@@ -898,7 +919,9 @@ def _excel_original_report_action_com(
         if action == "print":
             for page_df in pages:
                 if report_df is not None:
-                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project), consultant)
+                    _write_original_report_page_com(
+                        ws, page_df, int(year), int(month), str(project), consultant, report_km_total
+                    )
                 else:
                     _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                     _prepare_report_formula_in_excel_sheet_com(ws)
@@ -917,7 +940,9 @@ def _excel_original_report_action_com(
 
         if action == "open":
             if report_df is not None:
-                _write_original_report_page_com(ws, pages[0], int(year), int(month), str(project), consultant)
+                _write_original_report_page_com(
+                    ws, pages[0], int(year), int(month), str(project), consultant, report_km_total
+                )
             else:
                 _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                 _prepare_report_formula_in_excel_sheet_com(ws)
@@ -977,6 +1002,7 @@ def _excel_original_report_action_fallback(
         if not pages:
             pages = [pd.DataFrame()]
         page_count = len(pages)
+        report_km_total = _report_total_km(report_df)
 
         exported_files: List[Path] = []
 
@@ -993,7 +1019,7 @@ def _excel_original_report_action_fallback(
 
         for page_idx, page_df in enumerate(pages, start=1):
             if report_df is not None:
-                _write_original_report_page_openpyxl(ws, page_df, year, month, project, consultant)
+                _write_original_report_page_openpyxl(ws, page_df, year, month, project, consultant, report_km_total)
             else:
                 _set_original_report_context_openpyxl(ws, year, month, project, consultant)
                 _prepare_report_formula_in_excel_sheet_openpyxl(ws)
@@ -1610,10 +1636,10 @@ def _collect_known_users(
     _extend_from_df(team_df, "Mitarbeiter")
 
     explicit_fallback = _safe_str(fallback_user).strip()
-    if explicit_fallback:
+    if explicit_fallback and explicit_fallback.casefold() != "ich":
         names.append(explicit_fallback)
     elif not names:
-        names.append(_safe_str(os.getenv("USERNAME")).strip() or "Ich")
+        names.append(_safe_str(os.getenv("USERNAME")).strip() or _safe_str(os.getenv("USER")).strip() or "Unbekannt")
 
     out: List[str] = []
     seen = set()
@@ -1622,6 +1648,13 @@ def _collect_known_users(
             seen.add(name)
             out.append(name)
     return out
+
+
+def _report_consultant_name(active_user: Any) -> str:
+    user = _safe_str(active_user).strip()
+    if user and user.casefold() != "ich":
+        return user
+    return _safe_str(os.getenv("USERNAME")).strip() or _safe_str(os.getenv("USER")).strip() or "Unbekannt"
 
 
 def _user_is_controller(user_rights_df: pd.DataFrame, user_name: str) -> bool:
@@ -1841,6 +1874,8 @@ def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: i
     x["Ende"] = x["Zeit bis"].apply(_format_time)
     x["Pause"] = x["Pause"].apply(_format_time)
     x["Zeit (h)"] = x["Zahl"].apply(lambda v: round(float(v), 2) if v is not None and not pd.isna(v) else None)
+    km_source = x["km"] if "km" in x.columns else pd.Series(0, index=x.index)
+    x["km"] = pd.to_numeric(km_source, errors="coerce").fillna(0).astype(int)
     x["Art"] = x["Tätigkeit"]
     x["Leistungsbeschreibung"] = x["Info"].fillna("")
 
@@ -1850,7 +1885,7 @@ def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: i
 
     return x[
         ["_excel_row", "Datum", "Beginn", "Ende", "Pause", "Zeit (h)", "Art", "Kodierung EB", "Leistungsbeschreibung",
-         "Abgerechnet"]].reset_index(drop=True)
+         "km", "Abgerechnet"]].reset_index(drop=True)
 
 
 def _summaries_from_report(report_df: pd.DataFrame) -> Dict[str, float]:
@@ -3480,7 +3515,12 @@ def main() -> None:
         fallback_user=_safe_str(st.session_state.get("active_user_name", "")),
     )
     remembered_user = _safe_str(st.session_state.get("active_user_name", "")).strip()
-    default_user = remembered_user if remembered_user in known_users else (known_users[0] if known_users else "Ich")
+    if remembered_user and remembered_user not in known_users:
+        st.session_state.pop("active_user_name", None)
+        remembered_user = ""
+    default_user = remembered_user if remembered_user in known_users else (
+        known_users[0] if known_users else _report_consultant_name("")
+    )
 
     with st.sidebar:
         st.header("Ansicht")
@@ -4620,12 +4660,13 @@ def main() -> None:
         )
 
         b1, b2, b3, b4 = st.columns(4)
+        report_consultant = _report_consultant_name(active_user)
 
         with b1:
             if st.button("Original in Excel öffnen", key="open_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
                     data.path, int(r_year), int(r_month), r_project, action="open", report_df=report_df,
-                    consultant=active_user
+                    consultant=report_consultant
                 )
                 (st.success if ok else st.error)(msg)
 
@@ -4637,7 +4678,7 @@ def main() -> None:
 
                 ok, msg, exported_files = _excel_original_report_action(
                     data.path, int(r_year), int(r_month), r_project, action="pdf", pdf_output_path=pdf_target,
-                    report_df=report_df, consultant=active_user
+                    report_df=report_df, consultant=report_consultant
                 )
                 if ok:
                     st.success(msg)
@@ -4665,7 +4706,7 @@ def main() -> None:
 
                 ok, msg, exported_files = _excel_original_report_action(
                     data.path, int(r_year), int(r_month), r_project, action="xlsx", xlsx_output_path=xlsx_target,
-                    report_df=report_df, consultant=active_user
+                    report_df=report_df, consultant=report_consultant
                 )
                 if ok:
                     st.success(msg)
@@ -4689,7 +4730,7 @@ def main() -> None:
             if st.button("Original direkt drucken", key="print_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
                     data.path, int(r_year), int(r_month), r_project, action="print", report_df=report_df,
-                    consultant=active_user
+                    consultant=report_consultant
                 )
                 (st.success if ok else st.error)(msg)
 
