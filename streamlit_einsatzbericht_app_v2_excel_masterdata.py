@@ -1131,8 +1131,38 @@ def load_workbook_data(path_str: str) -> WorkbookData:
 
 
 @st.cache_data(show_spinner=False)
-def _cached_load_workbook_data(path_str: str, modified_time: float, refresh_nonce: int) -> WorkbookData:
-    return load_workbook_data(path_str)
+def _cached_load_workbook_data(path_str: str, modified_time: float, refresh_nonce: int) -> tuple:
+    data = load_workbook_data(path_str)
+    return (
+        str(data.path),
+        data.taetigkeiten_df,
+        data.team_df,
+        data.lookups,
+        data.milestones_df,
+        data.user_rights_df,
+        data.project_roles_df,
+    )
+
+
+def _workbook_data_from_cached_payload(payload: tuple) -> WorkbookData:
+    (
+        path_str,
+        taetigkeiten_df,
+        team_df,
+        lookups,
+        milestones_df,
+        user_rights_df,
+        project_roles_df,
+    ) = payload
+    return WorkbookData(
+        path=Path(path_str),
+        taetigkeiten_df=taetigkeiten_df,
+        team_df=team_df,
+        lookups=lookups,
+        milestones_df=milestones_df,
+        user_rights_df=user_rights_df,
+        project_roles_df=project_roles_df,
+    )
 
 
 # --------------------- Milestone ------------------------------------
@@ -3428,7 +3458,9 @@ def main() -> None:
         if resolved_path.exists():
             mtime = resolved_path.stat().st_mtime
             refresh_nonce = int(st.session_state.get("_workbook_refresh_nonce", 0) or 0)
-            data = _cached_load_workbook_data(str(resolved_path), mtime, refresh_nonce)
+            data = _workbook_data_from_cached_payload(
+                _cached_load_workbook_data(str(resolved_path), mtime, refresh_nonce)
+            )
         else:
             data = load_workbook_data(excel_path)  # triggers FileNotFoundError cleanly
     except Exception as e:
@@ -3682,8 +3714,38 @@ def main() -> None:
             editor_nonce = int(st.session_state.get("_taetigkeiten_inline_editor_nonce", 0) or 0)
             editor_key = f"taetigkeiten_inline_editor_v4_{editor_nonce}"
             editor_input_df = editor_df[editor_cols + ["Löschen"]].copy()
+            editor_row_by_pos: Dict[int, int] = {}
+            editor_row_by_index: Dict[Any, int] = {}
+            for row_pos, (row_index, row) in enumerate(editor_input_df.iterrows()):
+                exr = row.get("_excel_row")
+                if _missing_excel_row_value(exr):
+                    continue
+                try:
+                    row_excel = int(exr)
+                except Exception:
+                    continue
+                editor_row_by_pos[row_pos] = row_excel
+                editor_row_by_index[row_index] = row_excel
+
+            def _editor_state_row_pos(row_key: Any) -> Optional[int]:
+                try:
+                    return int(editor_input_df.index.get_loc(row_key))
+                except Exception:
+                    pass
+                try:
+                    numeric_key = int(row_key)
+                except Exception:
+                    return None
+                try:
+                    return int(editor_input_df.index.get_loc(numeric_key))
+                except Exception:
+                    pass
+                if 0 <= numeric_key < len(editor_input_df):
+                    return numeric_key
+                return None
 
             editor_state_changed = False
+            editor_deleted_excel_rows: set[int] = set()
             editor_state = st.session_state.get(editor_key)
             if isinstance(editor_state, dict):
                 edited_rows = editor_state.get("edited_rows")
@@ -3691,13 +3753,9 @@ def main() -> None:
                     for row_key, changes in edited_rows.items():
                         if not isinstance(changes, dict):
                             continue
-                        try:
-                            row_pos = editor_input_df.index.get_loc(row_key)
-                        except Exception:
-                            try:
-                                row_pos = int(row_key)
-                            except Exception:
-                                continue
+                        row_pos = _editor_state_row_pos(row_key)
+                        if row_pos is None:
+                            continue
                         if 0 <= row_pos < len(editor_input_df):
                             merged = editor_input_df.iloc[row_pos].to_dict()
                             merged.update(changes)
@@ -3727,6 +3785,12 @@ def main() -> None:
                     for row in added_rows:
                         if isinstance(row, dict):
                             editor_state_changed = _apply_inline_defaults(row) or editor_state_changed
+                deleted_rows = editor_state.get("deleted_rows")
+                if isinstance(deleted_rows, list):
+                    for row_key in deleted_rows:
+                        row_pos = _editor_state_row_pos(row_key)
+                        if row_pos is not None and row_pos in editor_row_by_pos:
+                            editor_deleted_excel_rows.add(editor_row_by_pos[row_pos])
 
             edited_df = data_editor_fn(
                 editor_input_df,
@@ -3868,13 +3932,17 @@ def main() -> None:
                         _normalize_yes_no(rec.get("eingetragen")) or _safe_str(rec.get("eingetragen")).strip(),
                     )
 
-                def _excel_row_from_editor(row_ref: Any, row: pd.Series) -> Optional[int]:
+                def _excel_row_from_editor(row_ref: Any, row: pd.Series, row_pos: int) -> Optional[int]:
                     exr = row.get("_excel_row")
                     if not _missing_excel_row_value(exr):
                         try:
                             return int(exr)
                         except Exception:
                             pass
+                    if row_ref in editor_row_by_index:
+                        return editor_row_by_index[row_ref]
+                    if not editor_deleted_excel_rows and row_pos in editor_row_by_pos:
+                        return editor_row_by_pos[row_pos]
                     return None
 
                 orig_by_row = {}
@@ -3890,13 +3958,16 @@ def main() -> None:
 
                 updates: List[Tuple[int, Dict[str, Any]]] = []
                 inserts: List[Dict[str, Any]] = []
-                deletes: List[int] = []
+                deletes: List[int] = list(sorted(editor_deleted_excel_rows))
                 time_errors: List[str] = []
 
-                for row_ref, r in edited_df.iterrows():
-                    row_excel = _excel_row_from_editor(row_ref, r)
+                for row_pos, (row_ref, r) in enumerate(edited_df.iterrows()):
+                    row_excel = _excel_row_from_editor(row_ref, r, row_pos)
                     mark_delete = bool(r.get("Löschen", False))
                     is_new = row_excel is None
+
+                    if row_excel in editor_deleted_excel_rows:
+                        continue
 
                     row_label = "Neue Zeile" if is_new else f"Excel-Zeile {row_excel}"
                     if not mark_delete:
