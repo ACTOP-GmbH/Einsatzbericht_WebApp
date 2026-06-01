@@ -78,7 +78,7 @@ def load_release_manifest(base_dir: Optional[Path] = None) -> Dict[str, Any]:
     manifest = dict(DEFAULT_MANIFEST)
     if manifest_path.exists():
         try:
-            manifest.update(json.loads(manifest_path.read_text(encoding="utf-8")))
+            manifest.update(json.loads(manifest_path.read_text(encoding="utf-8-sig")))
         except Exception:
             pass
     return manifest
@@ -158,7 +158,7 @@ def _load_update_state(user_root: Path) -> Dict[str, Any]:
     if not state_path.exists():
         return {}
     try:
-        return json.loads(state_path.read_text(encoding="utf-8"))
+        return json.loads(state_path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
 
@@ -176,6 +176,15 @@ def _mark_update_checked(user_root: Path, timestamp_key: str = "last_check_utc",
     state = _load_update_state(user_root)
     state[timestamp_key] = dt.datetime.utcnow().isoformat()
     state.update(extra)
+    _save_update_state(user_root, state)
+
+
+def _mark_update_started(user_root: Path, latest_version: str) -> None:
+    state = _load_update_state(user_root)
+    state["last_update_start_utc"] = dt.datetime.utcnow().isoformat()
+    state["last_update_result"] = "started"
+    state["latest_version"] = latest_version
+    state.pop("last_update_error", None)
     _save_update_state(user_root, state)
 
 
@@ -408,6 +417,7 @@ $Relaunch = {json.dumps(str(relaunch_path))}
 $LatestVersion = {json.dumps(str(latest_version))}
 $MainScriptName = {json.dumps(main_script)}
 $Stage = Join-Path $env:TEMP ("einsatzbericht_update_" + [guid]::NewGuid().ToString())
+$StatePath = Join-Path (Join-Path (Split-Path -Parent $InstallDir) "logs") "update_state.json"
 $script:UpdateActivity = "Einsatzbericht Manager Update"
 $script:UpdateStep = 0
 $script:UpdateTotalSteps = 7
@@ -426,73 +436,162 @@ function Complete-UpdateProgress {{
     Write-Progress -Activity $script:UpdateActivity -Completed
 }}
 
-function Stop-InstalledApp {{
-    $InstallRoot = Split-Path -Parent $InstallDir
-    $deadline = (Get-Date).AddSeconds(10)
+function Set-UpdateStateValues {{
+    param([hashtable]$Values)
 
-    do {{
-        $processIds = New-Object "System.Collections.Generic.HashSet[int]"
-
-        Get-Process -Name "run_app" -ErrorAction SilentlyContinue | ForEach-Object {{
-            if ((-not $_.Path) -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {{
-                [void]$processIds.Add([int]$_.Id)
-            }}
-        }}
-
-        foreach ($ProcessName in @("python.exe", "pythonw.exe", "powershell.exe", "pwsh.exe")) {{
+    try {{
+        $StateDir = Split-Path -Parent $StatePath
+        New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+        $State = @{{}}
+        if (Test-Path -LiteralPath $StatePath) {{
             try {{
-                Get-CimInstance Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction SilentlyContinue |
-                    Where-Object {{
-                        $cmd = [string]($_.CommandLine)
-                        $exe = [string]($_.ExecutablePath)
-                        ($cmd.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                        ($cmd.IndexOf($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                        ($exe -and $exe.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase))
-                    }} |
-                    ForEach-Object {{ [void]$processIds.Add([int]$_.ProcessId) }}
+                $Existing = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+                if ($Existing) {{
+                    $Existing.PSObject.Properties | ForEach-Object {{
+                        $State[$_.Name] = $_.Value
+                    }}
+                }}
             }} catch {{
             }}
         }}
-
-        $ids = @()
-        foreach ($processId in $processIds) {{
-            if ($processId -and $processId -ne $PID) {{
-                $ids += [int]$processId
-            }}
+        foreach ($Key in $Values.Keys) {{
+            $State[$Key] = $Values[$Key]
         }}
-        $ids = @($ids | Select-Object -Unique)
+        $State | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+    }} catch {{
+    }}
+}}
+
+function Get-InstalledAppProcessIds {{
+    $InstallRoot = Split-Path -Parent $InstallDir
+    $processIds = New-Object "System.Collections.Generic.HashSet[int]"
+
+    Get-Process -Name "run_app" -ErrorAction SilentlyContinue | ForEach-Object {{
+        if ((-not $_.Path) -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {{
+            [void]$processIds.Add([int]$_.Id)
+        }}
+    }}
+
+    foreach ($ProcessName in @("python.exe", "pythonw.exe", "powershell.exe", "pwsh.exe")) {{
+        try {{
+            Get-CimInstance Win32_Process -Filter "Name = '$ProcessName'" -ErrorAction SilentlyContinue |
+                Where-Object {{
+                    $cmd = [string]($_.CommandLine)
+                    $exe = [string]($_.ExecutablePath)
+                    (($cmd -and $cmd.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                     ($cmd -and $cmd.IndexOf($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                     ($exe -and $exe.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)))
+                }} |
+                ForEach-Object {{ [void]$processIds.Add([int]$_.ProcessId) }}
+        }} catch {{
+        }}
+    }}
+
+    $ids = @()
+    foreach ($processId in $processIds) {{
+        if ($processId -and $processId -ne $PID) {{
+            $ids += [int]$processId
+        }}
+    }}
+    return @($ids | Select-Object -Unique)
+}}
+
+function Stop-InstalledApp {{
+    $deadline = (Get-Date).AddSeconds(30)
+
+    do {{
+        $ids = @(Get-InstalledAppProcessIds)
         if ($ids.Count -eq 0) {{
             return
         }}
+
         foreach ($processId in $ids) {{
             Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+        }}
+        try {{
+            Wait-Process -Id $ids -Timeout 3 -ErrorAction SilentlyContinue
+        }} catch {{
         }}
         Start-Sleep -Milliseconds 500
     }} while ((Get-Date) -lt $deadline)
 
-    $remaining = @()
-    foreach ($ProcessName in @("run_app", "python", "pythonw", "powershell", "pwsh")) {{
-        try {{
-            $remaining += Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
-                Where-Object {{
-                    $_.Id -ne $PID -and (
-                        ((-not $_.Path) -and $_.ProcessName -eq "run_app") -or
-                        ($_.Path -and $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase))
-                    )
-                }}
-        }} catch {{
-        }}
-    }}
+    $remaining = @(Get-InstalledAppProcessIds)
     if ($remaining.Count -gt 0) {{
         throw "Die laufende App konnte nicht vollstaendig beendet werden."
     }}
 }}
 
+function Test-FileUnlocked {{
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {{
+        return $true
+    }}
+
+    $stream = $null
+    try {{
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        return $true
+    }} catch {{
+        return $false
+    }} finally {{
+        if ($stream) {{
+            $stream.Close()
+        }}
+    }}
+}}
+
+function Get-LockedAppFiles {{
+    $paths = @()
+    $launcher = Join-Path $InstallDir "run_app.exe"
+    if (Test-Path -LiteralPath $launcher -PathType Leaf) {{
+        $paths += $launcher
+    }}
+
+    $internalDir = Join-Path $InstallDir "_internal"
+    if (Test-Path -LiteralPath $internalDir -PathType Container) {{
+        $extensions = @(".dll", ".pyd", ".exe")
+        $paths += Get-ChildItem -LiteralPath $internalDir -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object {{ $extensions -contains $_.Extension.ToLowerInvariant() }} |
+            ForEach-Object {{ $_.FullName }}
+    }}
+
+    $locked = @()
+    foreach ($path in ($paths | Sort-Object -Unique)) {{
+        if (-not (Test-FileUnlocked -Path $path)) {{
+            $locked += $path
+        }}
+    }}
+    return @($locked)
+}}
+
+function Wait-InstallDirUnlocked {{
+    param([int]$TimeoutSeconds = 45)
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $locked = @()
+    do {{
+        $locked = @(Get-LockedAppFiles)
+        if ($locked.Count -eq 0) {{
+            return
+        }}
+        Stop-InstalledApp
+        Start-Sleep -Milliseconds 500
+    }} while ((Get-Date) -lt $deadline)
+
+    $sample = ($locked | Select-Object -First 3) -join ", "
+    if (-not $sample) {{
+        $sample = $InstallDir
+    }}
+    throw "App-Dateien sind noch durch einen Prozess gesperrt: $sample"
+}}
+
 function Copy-PayloadWithRetry {{
     param([string]$PayloadPath)
 
-    for ($Attempt = 1; $Attempt -le 12; $Attempt++) {{
+    for ($Attempt = 1; $Attempt -le 20; $Attempt++) {{
         try {{
+            Wait-InstallDirUnlocked -TimeoutSeconds 5
             $PreserveExistingAppData = Test-Path -LiteralPath (Join-Path $InstallDir "data")
             $Items = Get-ChildItem -LiteralPath $PayloadPath -Force -ErrorAction Stop |
                 Where-Object {{ -not ($PreserveExistingAppData -and $_.Name -eq "data") }}
@@ -501,7 +600,7 @@ function Copy-PayloadWithRetry {{
             }}
             return
         }} catch {{
-            if ($Attempt -eq 12) {{
+            if ($Attempt -eq 20) {{
                 throw
             }}
             Stop-InstalledApp
@@ -513,7 +612,7 @@ function Copy-PayloadWithRetry {{
 function Test-ServerReady {{
     param([int]$Port)
     try {{
-        Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$Port/_stcore/health" -TimeoutSec 2 | Out-Null
+        Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/_stcore/health" -TimeoutSec 2 | Out-Null
         return $true
     }} catch {{
         return $false
@@ -521,16 +620,7 @@ function Test-ServerReady {{
 }}
 
 function Open-AppWhenReady {{
-    $InstallRoot = Split-Path -Parent $InstallDir
-    $PortFile = Join-Path $InstallRoot "logs\\server_port.txt"
-    $ports = @()
-    if (Test-Path -LiteralPath $PortFile) {{
-        try {{
-            $ports += [int](Get-Content -LiteralPath $PortFile -Raw)
-        }} catch {{
-        }}
-    }}
-    $ports += 8501..8520
+    $ports = 8501..8510
 
     foreach ($candidate in ($ports | Select-Object -Unique)) {{
         if (Test-ServerReady -Port $candidate) {{
@@ -563,18 +653,15 @@ function Start-AppAndWaitForBrowser {{
     )
 
     Write-Host "Die App wird gestartet. Bitte warten, bis der Browser geoeffnet wurde..."
-    if (Test-Path -LiteralPath $LaunchScript) {{
-        $process = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$LaunchScript`"" -Wait -PassThru
-        if ($process.ExitCode -ne 0) {{
-            throw "Die App konnte nach dem Update nicht gestartet werden."
-        }}
-        return
-    }}
-
     if (Test-Path -LiteralPath $Relaunch) {{
         Start-Process -FilePath $Relaunch | Out-Null
     }} elseif ((Test-Path -LiteralPath $VenvPython) -and (Test-Path -LiteralPath $SourceLauncher)) {{
         Start-Process -FilePath $VenvPython -ArgumentList "`"$SourceLauncher`"" -WorkingDirectory $InstallDir -WindowStyle Hidden | Out-Null
+    }} elseif (Test-Path -LiteralPath $LaunchScript) {{
+        $process = Start-Process -FilePath "powershell" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$LaunchScript`"" -Wait -PassThru
+        if ($process.ExitCode -ne 0) {{
+            throw "Die App konnte nach dem Update nicht gestartet werden."
+        }}
     }} else {{
         throw "Kein gueltiger App-Starter gefunden."
     }}
@@ -602,13 +689,20 @@ try {{
 
     Show-UpdateStep "Laufende App wird beendet"
     Stop-InstalledApp
+    Wait-InstallDirUnlocked -TimeoutSeconds 45
 
     Show-UpdateStep "Neue App-Dateien werden kopiert"
     Copy-PayloadWithRetry -PayloadPath $Payload
 
     Show-UpdateStep "Versionsinformationen werden aktualisiert"
-    $ManifestPath = Join-Path $InstallDir "release_manifest.json"
-    if (Test-Path -LiteralPath $ManifestPath) {{
+    $ManifestPaths = @(
+        (Join-Path $InstallDir "release_manifest.json"),
+        (Join-Path $InstallDir "_internal\\release_manifest.json")
+    )
+    foreach ($ManifestPath in $ManifestPaths) {{
+        if (-not (Test-Path -LiteralPath $ManifestPath)) {{
+            continue
+        }}
         try {{
             $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
             $Manifest.version = $LatestVersion
@@ -627,6 +721,13 @@ try {{
         }}
     }}
 
+    Set-UpdateStateValues @{{
+        last_update_result = "installed"
+        installed_version = $LatestVersion
+        last_update_success_utc = (Get-Date).ToUniversalTime().ToString("o")
+        last_update_error = $null
+    }}
+
     Show-UpdateStep "App wird gestartet"
     $LaunchScript = Join-Path $InstallDir "launch_app.ps1"
     $SourceLauncher = Join-Path $InstallDir "run_app.py"
@@ -638,6 +739,13 @@ try {{
     Start-Sleep -Seconds 2
 }} catch {{
     Complete-UpdateProgress
+    Set-UpdateStateValues @{{
+        last_update_result = "failed"
+        last_update_error = $_.Exception.Message
+        last_update_failed_utc = (Get-Date).ToUniversalTime().ToString("o")
+        last_check_utc = $null
+        last_runtime_check_utc = $null
+    }}
     Write-Host ""
     Write-Host "Update fehlgeschlagen:"
     Write-Host $_.Exception.Message
@@ -949,14 +1057,14 @@ def start_update_from_info(update_info: Dict[str, Any], base_dir: Optional[Path]
         zip_path = _download_update_zip(update_url, user_root, download_name)
         _mark_pending_update_changelog(user_root, latest_version, changelog)
         _launch_external_updater(install_dir, zip_path, manifest, latest_version)
-        _mark_update_checked(user_root, last_update_result="started", latest_version=latest_version)
+        _mark_update_started(user_root, latest_version)
     except Exception as exc:
         _mark_update_checked(user_root, last_update_result="failed", last_update_error=str(exc))
         return False, str(exc)
     return True, "Update wird installiert. Die App startet danach neu."
 
 
-def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
+def maybe_check_for_updates(base_dir: Optional[Path] = None, *, force: bool = False) -> bool:
     resource_dir = base_dir or _resource_dir()
     manifest = load_release_manifest(resource_dir)
     current_version = str(manifest.get("version") or "").strip()
@@ -965,7 +1073,7 @@ def maybe_check_for_updates(base_dir: Optional[Path] = None) -> bool:
     runtime = prepare_runtime_environment(resource_dir)
     user_root = runtime["user_root"]
 
-    if not _should_check_for_updates(user_root, manifest):
+    if not force and not _should_check_for_updates(user_root, manifest):
         return False
 
     update_info = _available_update_payload(manifest, current_version)

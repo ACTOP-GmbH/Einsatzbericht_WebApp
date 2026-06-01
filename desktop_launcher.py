@@ -204,7 +204,7 @@ def run_bootstrap() -> int:
 
         splash.update("Updates werden geprueft...")
         update_start = time.perf_counter()
-        if maybe_check_for_updates():
+        if maybe_check_for_updates(force=True):
             _log_startup_event(runtime, f"update check started installer after {time.perf_counter() - update_start:.3f}s")
             splash.close()
             return 0

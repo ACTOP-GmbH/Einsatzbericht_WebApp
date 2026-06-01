@@ -14,6 +14,18 @@ hiddenimports = [
     "tkinter",
     "tkinter.messagebox",
     "tkinter.ttk",
+    "pythoncom",
+    "pywintypes",
+    "win32timezone",
+    "win32com",
+    "win32com.client",
+    "win32com.client.build",
+    "win32com.client.CLSIDToClass",
+    "win32com.client.dynamic",
+    "win32com.client.gencache",
+    "win32com.client.makepy",
+    "win32com.client.selecttlb",
+    "win32com.client.util",
 ]
 
 

@@ -44,6 +44,7 @@ REPORT_DETAIL_START_ROW = 17
 REPORT_DETAIL_END_ROW = 35
 REPORT_DETAIL_COL_START = 1  # A
 REPORT_DETAIL_COL_END = 8  # H
+REPORT_CONSULTANT_CELL = "H9"
 REPORT_ROWS_PER_PAGE = REPORT_DETAIL_END_ROW - REPORT_DETAIL_START_ROW + 1
 MILESTONES_SHEET = "Meilensteine"
 MILESTONE_COLS = ["Projekt", "Meilenstein", "Datum", "Status", "Fortschritt", "Kommentar"]
@@ -98,6 +99,11 @@ class WorkbookData:
 def _is_blank(value: Any) -> bool:
     if value is None:
         return True
+    try:
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
     if isinstance(value, str) and value.strip() == "":
         return True
     return False
@@ -149,6 +155,11 @@ def _to_date(value: Any) -> Optional[dt.date]:
 def _to_time(value: Any) -> Optional[dt.time]:
     if value is None:
         return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
     if isinstance(value, dt.datetime):
         return value.time().replace(microsecond=0)
     if isinstance(value, dt.time):
@@ -166,11 +177,28 @@ def _to_time(value: Any) -> Optional[dt.time]:
         s = value.strip()
         if not s:
             return None
-        for fmt in ("%H:%M:%S", "%H:%M"):
+        for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
             try:
                 return dt.datetime.strptime(s, fmt).time()
             except ValueError:
                 pass
+        try:
+            return pd.to_datetime(s).time().replace(microsecond=0)
+        except Exception:
+            pass
+        try:
+            delta = pd.to_timedelta(s)
+            if pd.notna(delta):
+                return _to_time(delta.to_pytimedelta())
+        except Exception:
+            pass
+    try:
+        if isinstance(value, pd.Timedelta):
+            return _to_time(value.to_pytimedelta())
+        if isinstance(value, pd.Timestamp):
+            return value.time().replace(microsecond=0)
+    except Exception:
+        pass
     return None
 
 
@@ -602,10 +630,29 @@ def _clear_original_report_detail_area_com(ws) -> None:
     ws.Range(f"A{REPORT_DETAIL_START_ROW}:H{REPORT_DETAIL_END_ROW}").ClearContents()
 
 
-def _write_original_report_page_com(ws, page_df: pd.DataFrame, year: int, month: int, project: str) -> None:
+def _set_original_report_context_com(
+        ws,
+        year: int,
+        month: int,
+        project: str,
+        consultant: Optional[str] = None,
+) -> None:
     ws.Range("K2").Value = int(year)
     ws.Range("K3").Value = int(month)
     ws.Range("C12").Value = str(project)
+    if consultant is not None:
+        ws.Range(REPORT_CONSULTANT_CELL).Value = _safe_str(consultant).strip() or None
+
+
+def _write_original_report_page_com(
+        ws,
+        page_df: pd.DataFrame,
+        year: int,
+        month: int,
+        project: str,
+        consultant: Optional[str] = None,
+) -> None:
+    _set_original_report_context_com(ws, year, month, project, consultant)
 
     _clear_original_report_detail_area_com(ws)
 
@@ -632,10 +679,29 @@ def _prepare_report_formula_in_excel_sheet_openpyxl(ws) -> None:
     ws.cell(REPORT_DETAIL_START_ROW, 1).value = formula_en
 
 
-def _write_original_report_page_openpyxl(ws, page_df: pd.DataFrame, year: int, month: int, project: str) -> None:
+def _set_original_report_context_openpyxl(
+        ws,
+        year: int,
+        month: int,
+        project: str,
+        consultant: Optional[str] = None,
+) -> None:
     ws["K2"].value = int(year)
     ws["K3"].value = int(month)
     ws["C12"].value = str(project)
+    if consultant is not None:
+        ws[REPORT_CONSULTANT_CELL].value = _safe_str(consultant).strip() or None
+
+
+def _write_original_report_page_openpyxl(
+        ws,
+        page_df: pd.DataFrame,
+        year: int,
+        month: int,
+        project: str,
+        consultant: Optional[str] = None,
+) -> None:
+    _set_original_report_context_openpyxl(ws, year, month, project, consultant)
 
     for r in range(REPORT_DETAIL_START_ROW, REPORT_DETAIL_END_ROW + 1):
         for c in range(REPORT_DETAIL_COL_START, REPORT_DETAIL_COL_END + 1):
@@ -703,6 +769,7 @@ def _excel_original_report_action_com(
         pdf_output_path: Optional[Path] = None,
         xlsx_output_path: Optional[Path] = None,
         report_df: Optional[pd.DataFrame] = None,
+        consultant: Optional[str] = None,
 ) -> Tuple[bool, str, List[Path]]:
     """Original Windows-only COM automation path via pywin32."""
     try:
@@ -768,11 +835,9 @@ def _excel_original_report_action_com(
             exported_files: List[Path] = []
             for page_idx, page_df in enumerate(pages, start=1):
                 if report_df is not None:
-                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project))
+                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project), consultant)
                 else:
-                    ws.Range("K2").Value = int(year)
-                    ws.Range("K3").Value = int(month)
-                    ws.Range("C12").Value = str(project)
+                    _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                     _prepare_report_formula_in_excel_sheet_com(ws)
                 _recalc()
 
@@ -804,11 +869,9 @@ def _excel_original_report_action_com(
             exported_files: List[Path] = []
             for page_idx, page_df in enumerate(pages, start=1):
                 if report_df is not None:
-                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project))
+                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project), consultant)
                 else:
-                    ws.Range("K2").Value = int(year)
-                    ws.Range("K3").Value = int(month)
-                    ws.Range("C12").Value = str(project)
+                    _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                     _prepare_report_formula_in_excel_sheet_com(ws)
                 _recalc()
 
@@ -835,11 +898,9 @@ def _excel_original_report_action_com(
         if action == "print":
             for page_df in pages:
                 if report_df is not None:
-                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project))
+                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project), consultant)
                 else:
-                    ws.Range("K2").Value = int(year)
-                    ws.Range("K3").Value = int(month)
-                    ws.Range("C12").Value = str(project)
+                    _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                     _prepare_report_formula_in_excel_sheet_com(ws)
                 _recalc()
                 ws.PrintOut()
@@ -856,11 +917,9 @@ def _excel_original_report_action_com(
 
         if action == "open":
             if report_df is not None:
-                _write_original_report_page_com(ws, pages[0], int(year), int(month), str(project))
+                _write_original_report_page_com(ws, pages[0], int(year), int(month), str(project), consultant)
             else:
-                ws.Range("K2").Value = int(year)
-                ws.Range("K3").Value = int(month)
-                ws.Range("C12").Value = str(project)
+                _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                 _prepare_report_formula_in_excel_sheet_com(ws)
             _recalc()
             excel.Visible = True
@@ -904,6 +963,7 @@ def _excel_original_report_action_fallback(
         pdf_output_path: Optional[Path] = None,
         xlsx_output_path: Optional[Path] = None,
         report_df: Optional[pd.DataFrame] = None,
+        consultant: Optional[str] = None,
         is_mac: bool = False,
 ) -> Tuple[bool, str, List[Path]]:
     """Cross-Platform Fallback (macOS / Linux / fallback for Windows without win32com)."""
@@ -933,11 +993,9 @@ def _excel_original_report_action_fallback(
 
         for page_idx, page_df in enumerate(pages, start=1):
             if report_df is not None:
-                _write_original_report_page_openpyxl(ws, page_df, year, month, project)
+                _write_original_report_page_openpyxl(ws, page_df, year, month, project, consultant)
             else:
-                ws["K2"].value = int(year)
-                ws["K3"].value = int(month)
-                ws["C12"].value = str(project)
+                _set_original_report_context_openpyxl(ws, year, month, project, consultant)
                 _prepare_report_formula_in_excel_sheet_openpyxl(ws)
 
             if action == "xlsx":
@@ -1024,6 +1082,7 @@ def _excel_original_report_action(
         pdf_output_path: Optional[Path] = None,
         xlsx_output_path: Optional[Path] = None,
         report_df: Optional[pd.DataFrame] = None,
+        consultant: Optional[str] = None,
 ) -> Tuple[bool, str, List[Path]]:
     """
     Main dispatcher: Uses COM on Windows if available. Otherwise, falls back
@@ -1035,13 +1094,17 @@ def _excel_original_report_action(
     if is_windows:
         try:
             return _excel_original_report_action_com(
-                xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df
+                xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df, consultant
             )
-        except Exception:
-            pass  # Fallthrough to fallback
+        except Exception as exc:
+            if action == "pdf":
+                return False, f"PDF-Export unter Windows braucht Microsoft Excel und pywin32/win32com. Ursache: {exc}", []
+            if action == "print":
+                return False, f"Druck unter Windows braucht Microsoft Excel und pywin32/win32com. Ursache: {exc}", []
+            # Opening and XLSX copy still have a useful openpyxl fallback.
 
     return _excel_original_report_action_fallback(
-        xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df, is_mac
+        xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df, consultant, is_mac
     )
 
 
@@ -1068,8 +1131,38 @@ def load_workbook_data(path_str: str) -> WorkbookData:
 
 
 @st.cache_data(show_spinner=False)
-def _cached_load_workbook_data(path_str: str, modified_time: float, refresh_nonce: int) -> WorkbookData:
-    return load_workbook_data(path_str)
+def _cached_load_workbook_data(path_str: str, modified_time: float, refresh_nonce: int) -> tuple:
+    data = load_workbook_data(path_str)
+    return (
+        str(data.path),
+        data.taetigkeiten_df,
+        data.team_df,
+        data.lookups,
+        data.milestones_df,
+        data.user_rights_df,
+        data.project_roles_df,
+    )
+
+
+def _workbook_data_from_cached_payload(payload: tuple) -> WorkbookData:
+    (
+        path_str,
+        taetigkeiten_df,
+        team_df,
+        lookups,
+        milestones_df,
+        user_rights_df,
+        project_roles_df,
+    ) = payload
+    return WorkbookData(
+        path=Path(path_str),
+        taetigkeiten_df=taetigkeiten_df,
+        team_df=team_df,
+        lookups=lookups,
+        milestones_df=milestones_df,
+        user_rights_df=user_rights_df,
+        project_roles_df=project_roles_df,
+    )
 
 
 # --------------------- Milestone ------------------------------------
@@ -3365,7 +3458,9 @@ def main() -> None:
         if resolved_path.exists():
             mtime = resolved_path.stat().st_mtime
             refresh_nonce = int(st.session_state.get("_workbook_refresh_nonce", 0) or 0)
-            data = _cached_load_workbook_data(str(resolved_path), mtime, refresh_nonce)
+            data = _workbook_data_from_cached_payload(
+                _cached_load_workbook_data(str(resolved_path), mtime, refresh_nonce)
+            )
         else:
             data = load_workbook_data(excel_path)  # triggers FileNotFoundError cleanly
     except Exception as e:
@@ -3457,6 +3552,9 @@ def main() -> None:
             st.info("Keine Tätigkeiten für den aktuellen Filter gefunden.")
         show_inline_editor = True
         if show_inline_editor:
+            today_default = dt.date.today()
+            default_type = "F" if "F" in typen_opts else (typen_opts[0] if typen_opts else "")
+            default_project = f_project if f_project in projekte_opts else ""
             editor_cols = [
                 "_excel_row",
                 "Datum",
@@ -3488,12 +3586,11 @@ def main() -> None:
                     editor_df[c] = None
 
             if editor_df.empty:
-                default_type = "F" if "F" in typen_opts else (typen_opts[0] if typen_opts else "")
                 placeholder = {c: None for c in editor_cols}
                 placeholder.update(
                     {
-                        "Datum": dt.date(int(f_year), int(f_month), 1),
-                        "Projekt": f_project or "",
+                        "Datum": today_default,
+                        "Projekt": default_project,
                         "Pause_Min": 0,
                         "km": 0,
                         "Tätigkeit": default_type,
@@ -3503,59 +3600,242 @@ def main() -> None:
                 )
                 editor_df = pd.DataFrame([placeholder], columns=editor_cols)
 
+            for time_col in ("Zeit von", "Zeit bis"):
+                editor_df[time_col] = editor_df[time_col].apply(_format_time)
+
+            for text_col in (
+                    "Projekt",
+                    "Kodierung",
+                    "Interne Projekte",
+                    "Info",
+                    "Abgerechnet",
+                    "eingetragen",
+            ):
+                editor_df[text_col] = editor_df[text_col].apply(lambda v: "" if _is_blank(v) else _safe_str(v))
+
+            for number_col in ("Pause_Min", "km"):
+                editor_df[number_col] = editor_df[number_col].apply(lambda v: 0 if _is_blank(v) else v)
+
+            editor_df["Tätigkeit"] = editor_df["Tätigkeit"].apply(lambda v: default_type if _is_blank(v) else _safe_str(v))
             editor_df["Löschen"] = False
 
             data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
 
-            def _calc_dauer_str(zv, zb, pause_min, zahl) -> str:
+            def _calc_hours_value(zv, zb, pause_min, zahl) -> Optional[float]:
                 h = _compute_hours_decimal(zv, zb, int(pause_min or 0))
+                if h is not None:
+                    return h
+                if zahl is None or _is_blank(zahl):
+                    return None
+                try:
+                    if pd.isna(zahl):
+                        return None
+                except Exception:
+                    pass
+                try:
+                    return round(float(zahl), 4)
+                except Exception:
+                    return None
+
+            def _calc_hours_display(zv, zb, pause_min, zahl) -> str:
+                h = _calc_hours_value(zv, zb, pause_min, zahl)
                 if h is None:
-                    try:
-                        if zahl is not None and pd.notna(zahl):
-                            h = float(zahl)
-                        else:
-                            return ""
-                    except Exception:
-                        return ""
+                    return ""
+                return f"{h:.2f}"
+
+            def _calc_dauer_str(zv, zb, pause_min, zahl) -> str:
+                h = _calc_hours_value(zv, zb, pause_min, zahl)
+                if h is None:
+                    return ""
                 mins = int(round(h * 60))
                 return f"{mins // 60:02d}:{mins % 60:02d}"
 
+            def _missing_excel_row_value(value: Any) -> bool:
+                if value is None:
+                    return True
+                try:
+                    return bool(pd.isna(value))
+                except Exception:
+                    return False
+
+            def _set_row_value(row: Dict[str, Any], key: str, value: Any) -> bool:
+                if row.get(key) == value:
+                    return False
+                row[key] = value
+                return True
+
+            def _apply_inline_defaults(row: Dict[str, Any]) -> bool:
+                changed = False
+                if _is_blank(row.get("Datum")):
+                    changed = _set_row_value(row, "Datum", today_default) or changed
+                if _is_blank(row.get("Projekt")) and default_project:
+                    changed = _set_row_value(row, "Projekt", default_project) or changed
+                if _is_blank(row.get("Pause_Min")):
+                    changed = _set_row_value(row, "Pause_Min", 0) or changed
+                if _is_blank(row.get("km")):
+                    changed = _set_row_value(row, "km", 0) or changed
+                if _is_blank(row.get("Tätigkeit")):
+                    changed = _set_row_value(row, "Tätigkeit", default_type) or changed
+                for text_col in (
+                        "Zeit von",
+                        "Zeit bis",
+                        "Kodierung",
+                        "Interne Projekte",
+                        "Info",
+                        "Abgerechnet",
+                        "eingetragen",
+                ):
+                    if _is_blank(row.get(text_col)):
+                        changed = _set_row_value(row, text_col, "") or changed
+                    elif text_col in {"Zeit von", "Zeit bis"}:
+                        changed = _set_row_value(row, text_col, _format_time(row.get(text_col))) or changed
+                    else:
+                        changed = _set_row_value(row, text_col, _safe_str(row.get(text_col))) or changed
+                changed = _set_row_value(
+                    row,
+                    "Zahl",
+                    _calc_hours_display(row.get("Zeit von"), row.get("Zeit bis"), row.get("Pause_Min"), row.get("Zahl")),
+                ) or changed
+                changed = _set_row_value(
+                    row,
+                    "Dauer",
+                    _calc_dauer_str(row.get("Zeit von"), row.get("Zeit bis"), row.get("Pause_Min"), row.get("Zahl")),
+                ) or changed
+                return changed
+
+            editor_df["Zahl"] = editor_df.apply(
+                lambda r: _calc_hours_display(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min"), r.get("Zahl")),
+                axis=1
+            )
             editor_df["Dauer"] = editor_df.apply(
                 lambda r: _calc_dauer_str(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min"), r.get("Zahl")),
                 axis=1
             )
+            editor_nonce = int(st.session_state.get("_taetigkeiten_inline_editor_nonce", 0) or 0)
+            editor_key = f"taetigkeiten_inline_editor_v4_{editor_nonce}"
+            editor_input_df = editor_df[editor_cols + ["Löschen"]].copy()
+            editor_row_by_pos: Dict[int, int] = {}
+            editor_row_by_index: Dict[Any, int] = {}
+            for row_pos, (row_index, row) in enumerate(editor_input_df.iterrows()):
+                exr = row.get("_excel_row")
+                if _missing_excel_row_value(exr):
+                    continue
+                try:
+                    row_excel = int(exr)
+                except Exception:
+                    continue
+                editor_row_by_pos[row_pos] = row_excel
+                editor_row_by_index[row_index] = row_excel
+
+            def _editor_state_row_pos(row_key: Any) -> Optional[int]:
+                try:
+                    return int(editor_input_df.index.get_loc(row_key))
+                except Exception:
+                    pass
+                try:
+                    numeric_key = int(row_key)
+                except Exception:
+                    return None
+                try:
+                    return int(editor_input_df.index.get_loc(numeric_key))
+                except Exception:
+                    pass
+                if 0 <= numeric_key < len(editor_input_df):
+                    return numeric_key
+                return None
+
+            editor_state_changed = False
+            editor_deleted_excel_rows: set[int] = set()
+            editor_state = st.session_state.get(editor_key)
+            if isinstance(editor_state, dict):
+                edited_rows = editor_state.get("edited_rows")
+                if isinstance(edited_rows, dict):
+                    for row_key, changes in edited_rows.items():
+                        if not isinstance(changes, dict):
+                            continue
+                        row_pos = _editor_state_row_pos(row_key)
+                        if row_pos is None:
+                            continue
+                        if 0 <= row_pos < len(editor_input_df):
+                            merged = editor_input_df.iloc[row_pos].to_dict()
+                            merged.update(changes)
+                            editor_state_changed = _set_row_value(
+                                changes,
+                                "Zahl",
+                                _calc_hours_display(
+                                    merged.get("Zeit von"),
+                                    merged.get("Zeit bis"),
+                                    merged.get("Pause_Min"),
+                                    merged.get("Zahl"),
+                                ),
+                            ) or editor_state_changed
+                            merged.update(changes)
+                            editor_state_changed = _set_row_value(
+                                changes,
+                                "Dauer",
+                                _calc_dauer_str(
+                                    merged.get("Zeit von"),
+                                    merged.get("Zeit bis"),
+                                    merged.get("Pause_Min"),
+                                    merged.get("Zahl"),
+                                ),
+                            ) or editor_state_changed
+                added_rows = editor_state.get("added_rows")
+                if isinstance(added_rows, list):
+                    for row in added_rows:
+                        if isinstance(row, dict):
+                            editor_state_changed = _apply_inline_defaults(row) or editor_state_changed
+                deleted_rows = editor_state.get("deleted_rows")
+                if isinstance(deleted_rows, list):
+                    for row_key in deleted_rows:
+                        row_pos = _editor_state_row_pos(row_key)
+                        if row_pos is not None and row_pos in editor_row_by_pos:
+                            editor_deleted_excel_rows.add(editor_row_by_pos[row_pos])
 
             edited_df = data_editor_fn(
-                editor_df[editor_cols + ["Löschen"]],
-                key="taetigkeiten_inline_editor",
+                editor_input_df,
+                key=editor_key,
                 use_container_width=True,
                 height=420,
                 num_rows="dynamic",
                 hide_index=True,
                 column_order=[c for c in editor_cols + ["Löschen"] if c != "_excel_row"],
-                disabled=["_excel_row", "Dauer"],
+                disabled=["_excel_row", "Zahl", "Dauer"],
                 column_config={
-                    "_excel_row": st.column_config.NumberColumn("ID",
-                                                                help="Technische ID (nicht ändern)"),
-                    "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
-                    "Projekt": st.column_config.SelectboxColumn("Projekt", options=projekte_opts),
-                    "Zeit von": st.column_config.TimeColumn("Zeit von", format="HH:mm"),
-                    "Zeit bis": st.column_config.TimeColumn("Zeit bis", format="HH:mm"),
-                    "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5),
-                    "Zahl": st.column_config.NumberColumn("Zeit (h)",
-                                                          help="Dezimalstunden für manuelle Angaben (z.B. Organisatorisches)",
-                                                          min_value=0.0, step=0.25, format="%.2f"),
+                    "_excel_row": None,
+                    "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY", default=today_default),
+                    "Projekt": st.column_config.SelectboxColumn("Projekt", options=projekte_opts,
+                                                                default=default_project or None),
+                    "Zeit von": st.column_config.TextColumn("Zeit von",
+                                                            help="Format HH:MM, z.B. 08:30",
+                                                            default="",
+                                                            validate=r"^$|^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$"),
+                    "Zeit bis": st.column_config.TextColumn("Zeit bis",
+                                                            help="Format HH:MM, z.B. 17:00",
+                                                            default="",
+                                                            validate=r"^$|^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$"),
+                    "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5,
+                                                               default=0),
+                    "Zahl": st.column_config.TextColumn("Zeit (h)",
+                                                        help="Automatisch aus Beginn, Ende und Pause berechnet",
+                                                        default="",
+                                                        width="small"),
                     "Dauer": st.column_config.TextColumn("Dauer",
                                                          help="Berechnet aus Zeit von/bis und Pause (oder Zeit h)",
                                                          width="small"),
-                    "km": st.column_config.NumberColumn("km", min_value=0, step=1),
-                    "Tätigkeit": st.column_config.SelectboxColumn("Tätigkeit", options=typen_opts),
-                    "Kodierung": st.column_config.SelectboxColumn("Kodierung (Aufgabe)", options=kod_opts),
-                    "Interne Projekte": st.column_config.SelectboxColumn("Interne Projekte", options=interne_opts),
-                    "Info": st.column_config.TextColumn("Leistungsbeschreibung", width="large"),
-                    "Abgerechnet": st.column_config.SelectboxColumn("Abgerechnet", options=[""] + ja_nein_opts),
-                    "eingetragen": st.column_config.SelectboxColumn("eingetragen", options=[""] + ja_nein_opts),
-                    "Löschen": st.column_config.CheckboxColumn("Löschen"),
+                    "km": st.column_config.NumberColumn("km", min_value=0, step=1, default=0),
+                    "Tätigkeit": st.column_config.SelectboxColumn("Tätigkeit", options=typen_opts,
+                                                                  default=default_type or None),
+                    "Kodierung": st.column_config.SelectboxColumn("Kodierung (Aufgabe)", options=kod_opts,
+                                                                 default=""),
+                    "Interne Projekte": st.column_config.SelectboxColumn("Interne Projekte", options=interne_opts,
+                                                                        default=""),
+                    "Info": st.column_config.TextColumn("Leistungsbeschreibung", width="large", default=""),
+                    "Abgerechnet": st.column_config.SelectboxColumn("Abgerechnet", options=[""] + ja_nein_opts,
+                                                                    default=""),
+                    "eingetragen": st.column_config.SelectboxColumn("eingetragen", options=[""] + ja_nein_opts,
+                                                                   default=""),
+                    "Löschen": st.column_config.CheckboxColumn("Löschen", default=False),
                 },
             )
 
@@ -3613,40 +3893,101 @@ def main() -> None:
                         _is_blank(r.get("Kodierung"))
                 )
 
-            if st.button("Tabellenänderungen speichern", key="save_inline_table"):
+            save_inline_clicked = st.button("Tabellenänderungen speichern", key="save_inline_table")
+            if save_inline_clicked:
+                def _inline_time_invalid(value: Any) -> bool:
+                    if _is_blank(value):
+                        return False
+                    if isinstance(value, str) and not re.fullmatch(r"\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?", value.strip()):
+                        return True
+                    return _to_time(value) is None
+
+                def _inline_number_key(value: Any) -> Optional[float]:
+                    if value is None or _is_blank(value):
+                        return None
+                    try:
+                        if pd.isna(value):
+                            return None
+                    except Exception:
+                        pass
+                    try:
+                        return round(float(value), 6)
+                    except Exception:
+                        return None
+
+                def _inline_record_key(rec: Dict[str, Any]) -> tuple:
+                    return (
+                        _format_date(rec.get("Datum")),
+                        _safe_str(rec.get("Projekt")).strip(),
+                        _format_time(rec.get("Zeit von")),
+                        _format_time(rec.get("Zeit bis")),
+                        int(rec.get("Pause_Min") or 0),
+                        _inline_number_key(rec.get("Zahl")),
+                        int(rec.get("km") or 0),
+                        _safe_str(rec.get("Tätigkeit")).strip(),
+                        _safe_str(rec.get("Kodierung")).strip(),
+                        _safe_str(rec.get("Interne Projekte")).strip(),
+                        _safe_str(rec.get("Info")),
+                        _normalize_yes_no(rec.get("Abgerechnet")) or _safe_str(rec.get("Abgerechnet")).strip(),
+                        _normalize_yes_no(rec.get("eingetragen")) or _safe_str(rec.get("eingetragen")).strip(),
+                    )
+
+                def _excel_row_from_editor(row_ref: Any, row: pd.Series, row_pos: int) -> Optional[int]:
+                    exr = row.get("_excel_row")
+                    if not _missing_excel_row_value(exr):
+                        try:
+                            return int(exr)
+                        except Exception:
+                            pass
+                    if row_ref in editor_row_by_index:
+                        return editor_row_by_index[row_ref]
+                    if not editor_deleted_excel_rows and row_pos in editor_row_by_pos:
+                        return editor_row_by_pos[row_pos]
+                    return None
+
                 orig_by_row = {}
-                original_excel_rows = set()
                 for _, r in editor_df.iterrows():
                     exr = r.get("_excel_row")
-                    if exr is None or (isinstance(exr, float) and pd.isna(exr)):
+                    if _missing_excel_row_value(exr):
                         continue
                     try:
                         row_idx = int(exr)
                         orig_by_row[row_idx] = _editor_row_to_record(r)
-                        original_excel_rows.add(row_idx)
                     except Exception:
                         continue
 
                 updates: List[Tuple[int, Dict[str, Any]]] = []
                 inserts: List[Dict[str, Any]] = []
-                deletes: List[int] = []
-                kept_excel_rows = set()
+                deletes: List[int] = list(sorted(editor_deleted_excel_rows))
+                time_errors: List[str] = []
 
-                for _, r in edited_df.iterrows():
-                    exr = r.get("_excel_row")
+                for row_pos, (row_ref, r) in enumerate(edited_df.iterrows()):
+                    row_excel = _excel_row_from_editor(row_ref, r, row_pos)
                     mark_delete = bool(r.get("Löschen", False))
-                    is_new = (exr is None) or (isinstance(exr, float) and pd.isna(exr))
+                    is_new = row_excel is None
+
+                    if row_excel in editor_deleted_excel_rows:
+                        continue
+
+                    row_label = "Neue Zeile" if is_new else f"Excel-Zeile {row_excel}"
+                    if not mark_delete:
+                        for time_col in ("Zeit von", "Zeit bis"):
+                            if _inline_time_invalid(r.get(time_col)):
+                                time_errors.append(f"{row_label}: {time_col} muss im Format HH:MM sein.")
 
                     if is_new:
                         if _is_editor_row_blank(r):
                             continue
                         rec = _editor_row_to_record(r)
+                        if not rec.get("Datum"):
+                            rec["Datum"] = today_default
+                        if not rec.get("Projekt") and default_project:
+                            rec["Projekt"] = default_project
+                        if not rec.get("Tätigkeit"):
+                            rec["Tätigkeit"] = default_type
                         if rec.get("Projekt") and rec.get("Datum"):
                             inserts.append(rec)
                         continue
-
-                    row_excel = int(exr)
-                    kept_excel_rows.add(row_excel)
 
                     if mark_delete:
                         deletes.append(row_excel)
@@ -3655,8 +3996,12 @@ def main() -> None:
                     new_rec = _editor_row_to_record(r)
                     old_rec = orig_by_row.get(row_excel)
 
-                    if old_rec is None or _key_for_import(new_rec) != _key_for_import(old_rec):
+                    if old_rec is None or _inline_record_key(new_rec) != _inline_record_key(old_rec):
                         updates.append((row_excel, new_rec))
+
+                if time_errors:
+                    st.error("Ungültige Uhrzeit:\n\n" + "\n".join(time_errors[:10]))
+                    st.stop()
 
                 coding_errors = _coding_required_errors(
                     inserts + [rec for _, rec in updates],
@@ -3665,10 +4010,6 @@ def main() -> None:
                 if coding_errors:
                     st.error("Kodierung fehlt:\n\n" + "\n".join(coding_errors[:10]))
                     st.stop()
-
-                for r_id in original_excel_rows:
-                    if r_id not in kept_excel_rows and r_id not in deletes:
-                        deletes.append(r_id)
 
                 def _mutator_inline(wb):
                     ws = wb[TAETIGKEITEN_SHEET]
@@ -3686,9 +4027,14 @@ def main() -> None:
                     st.success(
                         f"Gespeichert. Updates: {len(updates)}, Neu: {len(inserts)}, Gelöscht: {len(deletes)}. {msg}"
                     )
+                    st.session_state.pop(editor_key, None)
+                    st.session_state["_taetigkeiten_inline_editor_nonce"] = editor_nonce + 1
                     _refresh_after_workbook_change()
                 else:
                     st.error(msg)
+
+            if editor_state_changed and not save_inline_clicked:
+                st.rerun()
 
         st.markdown("---")
         st.caption("Neue Tätigkeiten und Änderungen bitte direkt in der Tabelle oben erfassen.")
@@ -4278,7 +4624,8 @@ def main() -> None:
         with b1:
             if st.button("Original in Excel öffnen", key="open_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
-                    data.path, int(r_year), int(r_month), r_project, action="open", report_df=report_df
+                    data.path, int(r_year), int(r_month), r_project, action="open", report_df=report_df,
+                    consultant=active_user
                 )
                 (st.success if ok else st.error)(msg)
 
@@ -4290,7 +4637,7 @@ def main() -> None:
 
                 ok, msg, exported_files = _excel_original_report_action(
                     data.path, int(r_year), int(r_month), r_project, action="pdf", pdf_output_path=pdf_target,
-                    report_df=report_df
+                    report_df=report_df, consultant=active_user
                 )
                 if ok:
                     st.success(msg)
@@ -4318,7 +4665,7 @@ def main() -> None:
 
                 ok, msg, exported_files = _excel_original_report_action(
                     data.path, int(r_year), int(r_month), r_project, action="xlsx", xlsx_output_path=xlsx_target,
-                    report_df=report_df
+                    report_df=report_df, consultant=active_user
                 )
                 if ok:
                     st.success(msg)
@@ -4341,7 +4688,8 @@ def main() -> None:
         with b4:
             if st.button("Original direkt drucken", key="print_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
-                    data.path, int(r_year), int(r_month), r_project, action="print", report_df=report_df
+                    data.path, int(r_year), int(r_month), r_project, action="print", report_df=report_df,
+                    consultant=active_user
                 )
                 (st.success if ok else st.error)(msg)
 

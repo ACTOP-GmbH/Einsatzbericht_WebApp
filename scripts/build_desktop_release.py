@@ -174,6 +174,16 @@ def _write_sanitized_seed_workbooks(app_dir: Path, seed_workbook: Path) -> None:
         _sanitize_distribution_workbook(seed_workbook, target)
 
 
+def _write_release_manifests(app_dir: Path, manifest: dict) -> None:
+    content = json.dumps(manifest, ensure_ascii=False, indent=2)
+    for manifest_path in [
+        app_dir / "release_manifest.json",
+        app_dir / "_internal" / "release_manifest.json",
+    ]:
+        if manifest_path.parent.exists():
+            manifest_path.write_text(content, encoding="utf-8")
+
+
 def _reset_distribution_data_dirs(app_dir: Path) -> None:
     for data_dir in [app_dir / "data", app_dir / "_internal" / "data"]:
         if data_dir.exists():
@@ -203,7 +213,7 @@ def build_release(platform_name: str, version: str, payload_dir: Path, output_di
     manifest["version"] = version
     manifest["release_asset_windows"] = _platform_asset_name("windows")
     manifest["release_asset_macos"] = _platform_asset_name("macos")
-    (app_dir / "release_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_release_manifests(app_dir, manifest)
 
     installer_source = _installer_source(platform_name)
     shutil.copy2(installer_source, staging_dir / _installer_name(platform_name))
