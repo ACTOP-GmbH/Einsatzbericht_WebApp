@@ -44,6 +44,7 @@ REPORT_DETAIL_START_ROW = 17
 REPORT_DETAIL_END_ROW = 35
 REPORT_DETAIL_COL_START = 1  # A
 REPORT_DETAIL_COL_END = 8  # H
+REPORT_CONSULTANT_CELL = "H9"
 REPORT_ROWS_PER_PAGE = REPORT_DETAIL_END_ROW - REPORT_DETAIL_START_ROW + 1
 MILESTONES_SHEET = "Meilensteine"
 MILESTONE_COLS = ["Projekt", "Meilenstein", "Datum", "Status", "Fortschritt", "Kommentar"]
@@ -602,10 +603,29 @@ def _clear_original_report_detail_area_com(ws) -> None:
     ws.Range(f"A{REPORT_DETAIL_START_ROW}:H{REPORT_DETAIL_END_ROW}").ClearContents()
 
 
-def _write_original_report_page_com(ws, page_df: pd.DataFrame, year: int, month: int, project: str) -> None:
+def _set_original_report_context_com(
+        ws,
+        year: int,
+        month: int,
+        project: str,
+        consultant: Optional[str] = None,
+) -> None:
     ws.Range("K2").Value = int(year)
     ws.Range("K3").Value = int(month)
     ws.Range("C12").Value = str(project)
+    if consultant is not None:
+        ws.Range(REPORT_CONSULTANT_CELL).Value = _safe_str(consultant).strip() or None
+
+
+def _write_original_report_page_com(
+        ws,
+        page_df: pd.DataFrame,
+        year: int,
+        month: int,
+        project: str,
+        consultant: Optional[str] = None,
+) -> None:
+    _set_original_report_context_com(ws, year, month, project, consultant)
 
     _clear_original_report_detail_area_com(ws)
 
@@ -632,10 +652,29 @@ def _prepare_report_formula_in_excel_sheet_openpyxl(ws) -> None:
     ws.cell(REPORT_DETAIL_START_ROW, 1).value = formula_en
 
 
-def _write_original_report_page_openpyxl(ws, page_df: pd.DataFrame, year: int, month: int, project: str) -> None:
+def _set_original_report_context_openpyxl(
+        ws,
+        year: int,
+        month: int,
+        project: str,
+        consultant: Optional[str] = None,
+) -> None:
     ws["K2"].value = int(year)
     ws["K3"].value = int(month)
     ws["C12"].value = str(project)
+    if consultant is not None:
+        ws[REPORT_CONSULTANT_CELL].value = _safe_str(consultant).strip() or None
+
+
+def _write_original_report_page_openpyxl(
+        ws,
+        page_df: pd.DataFrame,
+        year: int,
+        month: int,
+        project: str,
+        consultant: Optional[str] = None,
+) -> None:
+    _set_original_report_context_openpyxl(ws, year, month, project, consultant)
 
     for r in range(REPORT_DETAIL_START_ROW, REPORT_DETAIL_END_ROW + 1):
         for c in range(REPORT_DETAIL_COL_START, REPORT_DETAIL_COL_END + 1):
@@ -703,6 +742,7 @@ def _excel_original_report_action_com(
         pdf_output_path: Optional[Path] = None,
         xlsx_output_path: Optional[Path] = None,
         report_df: Optional[pd.DataFrame] = None,
+        consultant: Optional[str] = None,
 ) -> Tuple[bool, str, List[Path]]:
     """Original Windows-only COM automation path via pywin32."""
     try:
@@ -768,11 +808,9 @@ def _excel_original_report_action_com(
             exported_files: List[Path] = []
             for page_idx, page_df in enumerate(pages, start=1):
                 if report_df is not None:
-                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project))
+                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project), consultant)
                 else:
-                    ws.Range("K2").Value = int(year)
-                    ws.Range("K3").Value = int(month)
-                    ws.Range("C12").Value = str(project)
+                    _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                     _prepare_report_formula_in_excel_sheet_com(ws)
                 _recalc()
 
@@ -804,11 +842,9 @@ def _excel_original_report_action_com(
             exported_files: List[Path] = []
             for page_idx, page_df in enumerate(pages, start=1):
                 if report_df is not None:
-                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project))
+                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project), consultant)
                 else:
-                    ws.Range("K2").Value = int(year)
-                    ws.Range("K3").Value = int(month)
-                    ws.Range("C12").Value = str(project)
+                    _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                     _prepare_report_formula_in_excel_sheet_com(ws)
                 _recalc()
 
@@ -835,11 +871,9 @@ def _excel_original_report_action_com(
         if action == "print":
             for page_df in pages:
                 if report_df is not None:
-                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project))
+                    _write_original_report_page_com(ws, page_df, int(year), int(month), str(project), consultant)
                 else:
-                    ws.Range("K2").Value = int(year)
-                    ws.Range("K3").Value = int(month)
-                    ws.Range("C12").Value = str(project)
+                    _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                     _prepare_report_formula_in_excel_sheet_com(ws)
                 _recalc()
                 ws.PrintOut()
@@ -856,11 +890,9 @@ def _excel_original_report_action_com(
 
         if action == "open":
             if report_df is not None:
-                _write_original_report_page_com(ws, pages[0], int(year), int(month), str(project))
+                _write_original_report_page_com(ws, pages[0], int(year), int(month), str(project), consultant)
             else:
-                ws.Range("K2").Value = int(year)
-                ws.Range("K3").Value = int(month)
-                ws.Range("C12").Value = str(project)
+                _set_original_report_context_com(ws, int(year), int(month), str(project), consultant)
                 _prepare_report_formula_in_excel_sheet_com(ws)
             _recalc()
             excel.Visible = True
@@ -904,6 +936,7 @@ def _excel_original_report_action_fallback(
         pdf_output_path: Optional[Path] = None,
         xlsx_output_path: Optional[Path] = None,
         report_df: Optional[pd.DataFrame] = None,
+        consultant: Optional[str] = None,
         is_mac: bool = False,
 ) -> Tuple[bool, str, List[Path]]:
     """Cross-Platform Fallback (macOS / Linux / fallback for Windows without win32com)."""
@@ -933,11 +966,9 @@ def _excel_original_report_action_fallback(
 
         for page_idx, page_df in enumerate(pages, start=1):
             if report_df is not None:
-                _write_original_report_page_openpyxl(ws, page_df, year, month, project)
+                _write_original_report_page_openpyxl(ws, page_df, year, month, project, consultant)
             else:
-                ws["K2"].value = int(year)
-                ws["K3"].value = int(month)
-                ws["C12"].value = str(project)
+                _set_original_report_context_openpyxl(ws, year, month, project, consultant)
                 _prepare_report_formula_in_excel_sheet_openpyxl(ws)
 
             if action == "xlsx":
@@ -1024,6 +1055,7 @@ def _excel_original_report_action(
         pdf_output_path: Optional[Path] = None,
         xlsx_output_path: Optional[Path] = None,
         report_df: Optional[pd.DataFrame] = None,
+        consultant: Optional[str] = None,
 ) -> Tuple[bool, str, List[Path]]:
     """
     Main dispatcher: Uses COM on Windows if available. Otherwise, falls back
@@ -1035,7 +1067,7 @@ def _excel_original_report_action(
     if is_windows:
         try:
             return _excel_original_report_action_com(
-                xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df
+                xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df, consultant
             )
         except Exception as exc:
             if action == "pdf":
@@ -1045,7 +1077,7 @@ def _excel_original_report_action(
             # Opening and XLSX copy still have a useful openpyxl fallback.
 
     return _excel_original_report_action_fallback(
-        xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df, is_mac
+        xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df, consultant, is_mac
     )
 
 
@@ -4282,7 +4314,8 @@ def main() -> None:
         with b1:
             if st.button("Original in Excel öffnen", key="open_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
-                    data.path, int(r_year), int(r_month), r_project, action="open", report_df=report_df
+                    data.path, int(r_year), int(r_month), r_project, action="open", report_df=report_df,
+                    consultant=active_user
                 )
                 (st.success if ok else st.error)(msg)
 
@@ -4294,7 +4327,7 @@ def main() -> None:
 
                 ok, msg, exported_files = _excel_original_report_action(
                     data.path, int(r_year), int(r_month), r_project, action="pdf", pdf_output_path=pdf_target,
-                    report_df=report_df
+                    report_df=report_df, consultant=active_user
                 )
                 if ok:
                     st.success(msg)
@@ -4322,7 +4355,7 @@ def main() -> None:
 
                 ok, msg, exported_files = _excel_original_report_action(
                     data.path, int(r_year), int(r_month), r_project, action="xlsx", xlsx_output_path=xlsx_target,
-                    report_df=report_df
+                    report_df=report_df, consultant=active_user
                 )
                 if ok:
                     st.success(msg)
@@ -4345,7 +4378,8 @@ def main() -> None:
         with b4:
             if st.button("Original direkt drucken", key="print_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
-                    data.path, int(r_year), int(r_month), r_project, action="print", report_df=report_df
+                    data.path, int(r_year), int(r_month), r_project, action="print", report_df=report_df,
+                    consultant=active_user
                 )
                 (st.success if ok else st.error)(msg)
 
