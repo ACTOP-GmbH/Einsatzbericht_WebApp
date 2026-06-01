@@ -3520,6 +3520,9 @@ def main() -> None:
             st.info("Keine Tätigkeiten für den aktuellen Filter gefunden.")
         show_inline_editor = True
         if show_inline_editor:
+            today_default = dt.date.today()
+            default_type = "F" if "F" in typen_opts else (typen_opts[0] if typen_opts else "")
+            default_project = f_project if f_project in projekte_opts else ""
             editor_cols = [
                 "_excel_row",
                 "Datum",
@@ -3551,12 +3554,11 @@ def main() -> None:
                     editor_df[c] = None
 
             if editor_df.empty:
-                default_type = "F" if "F" in typen_opts else (typen_opts[0] if typen_opts else "")
                 placeholder = {c: None for c in editor_cols}
                 placeholder.update(
                     {
-                        "Datum": dt.date(int(f_year), int(f_month), 1),
-                        "Projekt": f_project or "",
+                        "Datum": today_default,
+                        "Projekt": default_project,
                         "Pause_Min": 0,
                         "km": 0,
                         "Tätigkeit": default_type,
@@ -3569,6 +3571,20 @@ def main() -> None:
             for time_col in ("Zeit von", "Zeit bis"):
                 editor_df[time_col] = editor_df[time_col].apply(_format_time)
 
+            for text_col in (
+                    "Projekt",
+                    "Kodierung",
+                    "Interne Projekte",
+                    "Info",
+                    "Abgerechnet",
+                    "eingetragen",
+            ):
+                editor_df[text_col] = editor_df[text_col].apply(lambda v: "" if _is_blank(v) else _safe_str(v))
+
+            for number_col in ("Pause_Min", "km"):
+                editor_df[number_col] = editor_df[number_col].apply(lambda v: 0 if _is_blank(v) else v)
+
+            editor_df["Tätigkeit"] = editor_df["Tätigkeit"].apply(lambda v: default_type if _is_blank(v) else _safe_str(v))
             editor_df["Löschen"] = False
 
             data_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
@@ -3586,43 +3602,131 @@ def main() -> None:
                 mins = int(round(h * 60))
                 return f"{mins // 60:02d}:{mins % 60:02d}"
 
+            def _missing_excel_row_value(value: Any) -> bool:
+                if value is None:
+                    return True
+                try:
+                    return bool(pd.isna(value))
+                except Exception:
+                    return False
+
+            def _inline_editor_index(row_pos: int, row: pd.Series) -> str:
+                exr = row.get("_excel_row")
+                if _missing_excel_row_value(exr):
+                    return f"new-{row_pos}"
+                try:
+                    return f"excel-{int(exr)}"
+                except Exception:
+                    return f"new-{row_pos}"
+
+            def _apply_inline_defaults(row: Dict[str, Any]) -> None:
+                if _is_blank(row.get("Datum")):
+                    row["Datum"] = today_default
+                if _is_blank(row.get("Projekt")) and default_project:
+                    row["Projekt"] = default_project
+                if _is_blank(row.get("Pause_Min")):
+                    row["Pause_Min"] = 0
+                if _is_blank(row.get("km")):
+                    row["km"] = 0
+                if _is_blank(row.get("Tätigkeit")):
+                    row["Tätigkeit"] = default_type
+                for text_col in (
+                        "Zeit von",
+                        "Zeit bis",
+                        "Kodierung",
+                        "Interne Projekte",
+                        "Info",
+                        "Abgerechnet",
+                        "eingetragen",
+                ):
+                    if row.get(text_col) is None:
+                        row[text_col] = ""
+                row["Dauer"] = _calc_dauer_str(row.get("Zeit von"), row.get("Zeit bis"), row.get("Pause_Min"),
+                                               row.get("Zahl"))
+
             editor_df["Dauer"] = editor_df.apply(
                 lambda r: _calc_dauer_str(r.get("Zeit von"), r.get("Zeit bis"), r.get("Pause_Min"), r.get("Zahl")),
                 axis=1
             )
+            editor_key = "taetigkeiten_inline_editor"
+            editor_input_df = editor_df[editor_cols + ["Löschen"]].copy()
+            editor_input_df.index = [
+                _inline_editor_index(row_pos, row)
+                for row_pos, (_, row) in enumerate(editor_input_df.iterrows())
+            ]
+
+            editor_state = st.session_state.get(editor_key)
+            if isinstance(editor_state, dict):
+                edited_rows = editor_state.get("edited_rows")
+                if isinstance(edited_rows, dict):
+                    for row_key, changes in edited_rows.items():
+                        if not isinstance(changes, dict):
+                            continue
+                        try:
+                            row_pos = editor_input_df.index.get_loc(row_key)
+                        except Exception:
+                            try:
+                                row_pos = int(row_key)
+                            except Exception:
+                                continue
+                        if 0 <= row_pos < len(editor_input_df):
+                            merged = editor_input_df.iloc[row_pos].to_dict()
+                            merged.update(changes)
+                            changes["Dauer"] = _calc_dauer_str(
+                                merged.get("Zeit von"),
+                                merged.get("Zeit bis"),
+                                merged.get("Pause_Min"),
+                                merged.get("Zahl"),
+                            )
+                added_rows = editor_state.get("added_rows")
+                if isinstance(added_rows, list):
+                    for row in added_rows:
+                        if isinstance(row, dict):
+                            _apply_inline_defaults(row)
 
             edited_df = data_editor_fn(
-                editor_df[editor_cols + ["Löschen"]],
-                key="taetigkeiten_inline_editor",
+                editor_input_df,
+                key=editor_key,
                 use_container_width=True,
                 height=420,
                 num_rows="dynamic",
                 hide_index=True,
-                column_order=editor_cols + ["Löschen"],
-                disabled=["_excel_row", "Dauer"],
+                column_order=[c for c in editor_cols + ["Löschen"] if c != "_excel_row"],
+                disabled=["Dauer"],
                 column_config={
-                    "_excel_row": st.column_config.NumberColumn("ID",
-                                                                help="Technische Excel-Zeile (nicht ändern)",
-                                                                width="small"),
-                    "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY"),
-                    "Projekt": st.column_config.SelectboxColumn("Projekt", options=projekte_opts),
-                    "Zeit von": st.column_config.TextColumn("Zeit von", help="Format HH:MM, z.B. 08:30"),
-                    "Zeit bis": st.column_config.TextColumn("Zeit bis", help="Format HH:MM, z.B. 17:00"),
-                    "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5),
+                    "_excel_row": None,
+                    "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY", default=today_default),
+                    "Projekt": st.column_config.SelectboxColumn("Projekt", options=projekte_opts,
+                                                                default=default_project or None),
+                    "Zeit von": st.column_config.TextColumn("Zeit von",
+                                                            help="Format HH:MM, z.B. 08:30",
+                                                            default="",
+                                                            validate=r"^$|^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$"),
+                    "Zeit bis": st.column_config.TextColumn("Zeit bis",
+                                                            help="Format HH:MM, z.B. 17:00",
+                                                            default="",
+                                                            validate=r"^$|^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$"),
+                    "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5,
+                                                               default=0),
                     "Zahl": st.column_config.NumberColumn("Zeit (h)",
                                                           help="Dezimalstunden für manuelle Angaben (z.B. Organisatorisches)",
                                                           min_value=0.0, step=0.25, format="%.2f"),
                     "Dauer": st.column_config.TextColumn("Dauer",
                                                          help="Berechnet aus Zeit von/bis und Pause (oder Zeit h)",
                                                          width="small"),
-                    "km": st.column_config.NumberColumn("km", min_value=0, step=1),
-                    "Tätigkeit": st.column_config.SelectboxColumn("Tätigkeit", options=typen_opts),
-                    "Kodierung": st.column_config.SelectboxColumn("Kodierung (Aufgabe)", options=kod_opts),
-                    "Interne Projekte": st.column_config.SelectboxColumn("Interne Projekte", options=interne_opts),
+                    "km": st.column_config.NumberColumn("km", min_value=0, step=1, default=0),
+                    "Tätigkeit": st.column_config.SelectboxColumn("Tätigkeit", options=typen_opts,
+                                                                  default=default_type or None),
+                    "Kodierung": st.column_config.SelectboxColumn("Kodierung (Aufgabe)", options=kod_opts,
+                                                                 default=""),
+                    "Interne Projekte": st.column_config.SelectboxColumn("Interne Projekte", options=interne_opts,
+                                                                        default=""),
                     "Info": st.column_config.TextColumn("Leistungsbeschreibung", width="large"),
-                    "Abgerechnet": st.column_config.SelectboxColumn("Abgerechnet", options=[""] + ja_nein_opts),
-                    "eingetragen": st.column_config.SelectboxColumn("eingetragen", options=[""] + ja_nein_opts),
-                    "Löschen": st.column_config.CheckboxColumn("Löschen"),
+                    "Abgerechnet": st.column_config.SelectboxColumn("Abgerechnet", options=[""] + ja_nein_opts,
+                                                                    default=""),
+                    "eingetragen": st.column_config.SelectboxColumn("eingetragen", options=[""] + ja_nein_opts,
+                                                                   default=""),
+                    "Löschen": st.column_config.CheckboxColumn("Löschen", default=False),
                 },
             )
 
@@ -3718,18 +3822,24 @@ def main() -> None:
                         _normalize_yes_no(rec.get("eingetragen")) or _safe_str(rec.get("eingetragen")).strip(),
                     )
 
-                def _missing_excel_row(value: Any) -> bool:
-                    if value is None:
-                        return True
-                    try:
-                        return bool(pd.isna(value))
-                    except Exception:
-                        return False
+                def _excel_row_from_editor(row_ref: Any, row: pd.Series) -> Optional[int]:
+                    exr = row.get("_excel_row")
+                    if not _missing_excel_row_value(exr):
+                        try:
+                            return int(exr)
+                        except Exception:
+                            pass
+                    if isinstance(row_ref, str) and row_ref.startswith("excel-"):
+                        try:
+                            return int(row_ref.removeprefix("excel-"))
+                        except Exception:
+                            pass
+                    return None
 
                 orig_by_row = {}
                 for _, r in editor_df.iterrows():
                     exr = r.get("_excel_row")
-                    if _missing_excel_row(exr):
+                    if _missing_excel_row_value(exr):
                         continue
                     try:
                         row_idx = int(exr)
@@ -3742,12 +3852,12 @@ def main() -> None:
                 deletes: List[int] = []
                 time_errors: List[str] = []
 
-                for _, r in edited_df.iterrows():
-                    exr = r.get("_excel_row")
+                for row_ref, r in edited_df.iterrows():
+                    row_excel = _excel_row_from_editor(row_ref, r)
                     mark_delete = bool(r.get("Löschen", False))
-                    is_new = _missing_excel_row(exr)
+                    is_new = row_excel is None
 
-                    row_label = "Neue Zeile" if is_new else f"ID {int(exr)}"
+                    row_label = "Neue Zeile" if is_new else f"Excel-Zeile {row_excel}"
                     if not mark_delete:
                         for time_col in ("Zeit von", "Zeit bis"):
                             if _inline_time_invalid(r.get(time_col)):
@@ -3757,11 +3867,15 @@ def main() -> None:
                         if _is_editor_row_blank(r):
                             continue
                         rec = _editor_row_to_record(r)
+                        if not rec.get("Datum"):
+                            rec["Datum"] = today_default
+                        if not rec.get("Projekt") and default_project:
+                            rec["Projekt"] = default_project
+                        if not rec.get("Tätigkeit"):
+                            rec["Tätigkeit"] = default_type
                         if rec.get("Projekt") and rec.get("Datum"):
                             inserts.append(rec)
                         continue
-
-                    row_excel = int(exr)
 
                     if mark_delete:
                         deletes.append(row_excel)
