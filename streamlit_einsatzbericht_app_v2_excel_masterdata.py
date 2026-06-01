@@ -1657,6 +1657,46 @@ def _report_consultant_name(active_user: Any) -> str:
     return _safe_str(os.getenv("USERNAME")).strip() or _safe_str(os.getenv("USER")).strip() or "Unbekannt"
 
 
+def _user_preferences_path() -> Path:
+    user_data_dir = _safe_str(os.environ.get("EINSATZBERICHT_USER_DATA_DIR")).strip()
+    if user_data_dir:
+        base = Path(user_data_dir)
+    else:
+        base = Path.home() / ".einsatzbericht-manager"
+    return base / "logs" / "user_preferences.json"
+
+
+def _load_user_preferences() -> Dict[str, Any]:
+    path = _user_preferences_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_user_preferences(preferences: Dict[str, Any]) -> None:
+    path = _user_preferences_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(preferences, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _remember_report_consultant_name(value: Any) -> None:
+    consultant = _safe_str(value).strip()
+    if not consultant:
+        return
+    preferences = _load_user_preferences()
+    if _safe_str(preferences.get("report_consultant_name")).strip() == consultant:
+        return
+    preferences["report_consultant_name"] = consultant
+    _save_user_preferences(preferences)
+
+
 def _user_is_controller(user_rights_df: pd.DataFrame, user_name: str) -> bool:
     if user_rights_df is None or user_rights_df.empty:
         return True
@@ -3543,6 +3583,15 @@ def main() -> None:
             view_mode = VIEW_MODE_EMPLOYEE
             st.caption("Ansichtsmodus: Mitarbeiter")
         is_controller_view = view_mode == VIEW_MODE_CONTROLLER
+        saved_report_consultant = _safe_str(_load_user_preferences().get("report_consultant_name")).strip()
+        if "report_consultant_name" not in st.session_state:
+            st.session_state["report_consultant_name"] = saved_report_consultant or _report_consultant_name(active_user)
+        report_consultant_name = st.text_input(
+            "Beratername für Einsatzbericht",
+            key="report_consultant_name",
+            help="Dieser Name wird im Original-Einsatzbericht im Feld 'Berater' eingetragen.",
+        ).strip() or _report_consultant_name(active_user)
+        _remember_report_consultant_name(report_consultant_name)
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(
         ["Tätigkeiten", "Einsatzbericht", "Stammdaten / Debug", "Visualisierung", "Team-Daten"])
@@ -4660,7 +4709,7 @@ def main() -> None:
         )
 
         b1, b2, b3, b4 = st.columns(4)
-        report_consultant = _report_consultant_name(active_user)
+        report_consultant = report_consultant_name
 
         with b1:
             if st.button("Original in Excel öffnen", key="open_original_excel"):
