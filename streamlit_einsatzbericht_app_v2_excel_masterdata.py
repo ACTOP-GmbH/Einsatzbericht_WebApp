@@ -474,9 +474,45 @@ def _runtime_default_excel_path() -> Optional[Path]:
     if not raw:
         return None
     try:
-        return Path(raw).expanduser().resolve()
+        return _repair_default_workbook_path(Path(raw).expanduser().resolve())
     except Exception:
-        return Path(raw).expanduser()
+        return _repair_default_workbook_path(Path(raw).expanduser())
+
+
+def _repair_mojibake_text(value: Any) -> str:
+    text = _safe_str(value)
+    if "Ã" not in text and "Â" not in text:
+        return text
+    try:
+        return text.encode("cp1252").decode("utf-8")
+    except Exception:
+        return text
+
+
+def _repair_default_workbook_path(path: Path) -> Path:
+    repaired_name = _repair_mojibake_text(path.name)
+    known_default_names = {
+        "Tätigkeiten_Überblick.xlsx",
+        "Taetigkeiten_Ueberblick.xlsx",
+    }
+    if repaired_name in known_default_names or path.name in known_default_names:
+        for candidate_name in ["Tätigkeiten_Überblick.xlsx", "Taetigkeiten_Ueberblick.xlsx", repaired_name]:
+            candidate = path.with_name(candidate_name)
+            try:
+                if candidate.exists():
+                    return candidate.resolve()
+            except Exception:
+                if candidate.exists():
+                    return candidate
+    if repaired_name != path.name:
+        candidate = path.with_name(repaired_name)
+        try:
+            if candidate.exists():
+                return candidate.resolve()
+        except Exception:
+            if candidate.exists():
+                return candidate
+    return path
 
 
 def _runtime_storage_dir(folder_name: str) -> Path:
@@ -527,7 +563,7 @@ def _resolve_excel_path(path_str: str) -> Path:
         p = Path(raw).expanduser()
         try:
             if p.exists():
-                return p.resolve()
+                return _repair_default_workbook_path(p.resolve())
         except Exception:
             pass
         candidates = [
@@ -536,8 +572,8 @@ def _resolve_excel_path(path_str: str) -> Path:
         ]
         for c in candidates:
             if c.exists():
-                return c.resolve()
-        return p.resolve()
+                return _repair_default_workbook_path(c.resolve())
+        return _repair_default_workbook_path(p.resolve())
     env_default = _runtime_default_excel_path()
     if env_default is not None and env_default.exists():
         return env_default
@@ -3483,7 +3519,7 @@ def main() -> None:
         try:
             remembered_resolved = _resolve_excel_path(remembered_path)
             if remembered_resolved.exists() and _is_valid_app_workbook_cached(remembered_resolved):
-                default_path = remembered_path
+                default_path = str(remembered_resolved)
         except Exception:
             default_path = ""
     if not default_path:
@@ -3507,6 +3543,8 @@ def main() -> None:
             _tmp_vis = _resolve_excel_path(_safe_str(st.session_state.get("excel_path_input", "")).strip())
             if not _tmp_vis.exists() or not _is_valid_app_workbook_cached(_tmp_vis):
                 st.session_state["excel_path_input"] = default_path
+            else:
+                st.session_state["excel_path_input"] = str(_tmp_vis)
         except Exception:
             st.session_state["excel_path_input"] = default_path
     else:

@@ -21,8 +21,8 @@ DEFAULT_MANIFEST: Dict[str, Any] = {
     "github_repo": "ACTOP-GmbH/Einsatzbericht_WebApp",
     "version": "dev",
     "main_script": "streamlit_einsatzbericht_app_v2_excel_masterdata.py",
-    "seed_workbook_relative_path": "data/Taetigkeiten_Ueberblick.xlsx",
-    "seed_workbook_name": "Taetigkeiten_Ueberblick.xlsx",
+    "seed_workbook_relative_path": "data/Tätigkeiten_Überblick.xlsx",
+    "seed_workbook_name": "Tätigkeiten_Überblick.xlsx",
     "release_asset_windows": "EinsatzberichtManager-windows.zip",
     "release_asset_macos": "EinsatzberichtManager-macos.zip",
     "github_branch": "master",
@@ -32,6 +32,16 @@ DEFAULT_MANIFEST: Dict[str, Any] = {
     "update_interval_hours": 12,
     "runtime_update_check_interval_minutes": 30,
 }
+
+
+def _repair_mojibake_text(value: Any) -> str:
+    text = str(value)
+    if "Ã" not in text and "Â" not in text:
+        return text
+    try:
+        return text.encode("cp1252").decode("utf-8")
+    except Exception:
+        return text
 
 
 def configure_streamlit_runtime() -> None:
@@ -82,6 +92,9 @@ def load_release_manifest(base_dir: Optional[Path] = None) -> Dict[str, Any]:
             manifest.update(json.loads(manifest_path.read_text(encoding="utf-8-sig")))
         except Exception:
             pass
+    for key, value in list(manifest.items()):
+        if isinstance(value, str):
+            manifest[key] = _repair_mojibake_text(value)
     return manifest
 
 
@@ -103,14 +116,18 @@ def _release_notes_path(user_root: Path) -> Path:
 
 
 def _seed_workbook_target(user_root: Path, manifest: Dict[str, Any]) -> Path:
-    workbook_name = str(manifest.get("seed_workbook_name") or DEFAULT_MANIFEST["seed_workbook_name"])
+    workbook_name = _repair_mojibake_text(
+        manifest.get("seed_workbook_name") or DEFAULT_MANIFEST["seed_workbook_name"]
+    )
     target_dir = user_root / "data"
     target_dir.mkdir(parents=True, exist_ok=True)
     return target_dir / workbook_name
 
 
 def _seed_workbook_source(base_dir: Path, manifest: Dict[str, Any]) -> Path:
-    rel_path = str(manifest.get("seed_workbook_relative_path") or DEFAULT_MANIFEST["seed_workbook_relative_path"])
+    rel_path = _repair_mojibake_text(
+        manifest.get("seed_workbook_relative_path") or DEFAULT_MANIFEST["seed_workbook_relative_path"]
+    )
     source = base_dir / rel_path
     if source.exists():
         return source
@@ -118,7 +135,7 @@ def _seed_workbook_source(base_dir: Path, manifest: Dict[str, Any]) -> Path:
         fallback = base_dir / "data" / fallback_name
         if fallback.exists():
             return fallback
-    return base_dir / "data" / "Taetigkeiten_Ueberblick.xlsx"
+    return base_dir / "data" / "Tätigkeiten_Überblick.xlsx"
 
 
 def prepare_runtime_environment(base_dir: Optional[Path] = None) -> Dict[str, Path]:
@@ -724,7 +741,7 @@ try {{
             continue
         }}
         try {{
-            $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+            $Manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
             $Manifest.version = $LatestVersion
             $Manifest | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
         }} catch {{
