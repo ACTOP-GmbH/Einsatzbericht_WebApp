@@ -1859,7 +1859,7 @@ def _render_runtime_update_notice() -> None:
         with c_update:
             if st.button("Update installieren und App neu starten", key=f"runtime_update_install_{latest_version}"):
                 with st.spinner("Update wird heruntergeladen und vorbereitet..."):
-                    ok, msg = start_update_from_info(update_info)
+                    ok, msg = start_update_from_info(update_info, exit_current_process=True)
                 if ok:
                     st.session_state["_runtime_update_installing"] = True
                     st.session_state["_runtime_update_installing_version"] = latest_version

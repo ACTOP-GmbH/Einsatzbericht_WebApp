@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -402,6 +403,10 @@ def _download_update_zip(url: str, user_root: Path, file_name: str = "update.zip
     return target
 
 
+def _powershell_single_quoted(value: Any) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def _write_windows_updater_script(base_dir: Path, zip_path: Path, manifest: Dict[str, Any], latest_version: str) -> Path:
     launcher_name = str(manifest.get("launcher_relative_path_windows") or DEFAULT_MANIFEST["launcher_relative_path_windows"])
     relaunch_path = base_dir / launcher_name
@@ -411,11 +416,11 @@ def _write_windows_updater_script(base_dir: Path, zip_path: Path, manifest: Dict
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "Continue"
 Start-Sleep -Seconds 2
-$ZipPath = {json.dumps(str(zip_path))}
-$InstallDir = {json.dumps(str(base_dir))}
-$Relaunch = {json.dumps(str(relaunch_path))}
-$LatestVersion = {json.dumps(str(latest_version))}
-$MainScriptName = {json.dumps(main_script)}
+$ZipPath = [System.IO.Path]::GetFullPath({_powershell_single_quoted(zip_path)})
+$InstallDir = [System.IO.Path]::GetFullPath({_powershell_single_quoted(base_dir)})
+$Relaunch = [System.IO.Path]::GetFullPath({_powershell_single_quoted(relaunch_path)})
+$LatestVersion = {_powershell_single_quoted(latest_version)}
+$MainScriptName = {_powershell_single_quoted(main_script)}
 $Stage = Join-Path $env:TEMP ("einsatzbericht_update_" + [guid]::NewGuid().ToString())
 $StatePath = Join-Path (Join-Path (Split-Path -Parent $InstallDir) "logs") "update_state.json"
 $script:UpdateActivity = "Einsatzbericht Manager Update"
@@ -464,10 +469,12 @@ function Set-UpdateStateValues {{
 
 function Get-InstalledAppProcessIds {{
     $InstallRoot = Split-Path -Parent $InstallDir
+    $InstallDirPrefix = $InstallDir.TrimEnd("\\") + "\\"
+    $InstallRootPrefix = $InstallRoot.TrimEnd("\\") + "\\"
     $processIds = New-Object "System.Collections.Generic.HashSet[int]"
 
     Get-Process -Name "run_app" -ErrorAction SilentlyContinue | ForEach-Object {{
-        if ((-not $_.Path) -or $_.Path.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)) {{
+        if ((-not $_.Path) -or $_.Path.StartsWith($InstallDirPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {{
             [void]$processIds.Add([int]$_.Id)
         }}
     }}
@@ -478,9 +485,9 @@ function Get-InstalledAppProcessIds {{
                 Where-Object {{
                     $cmd = [string]($_.CommandLine)
                     $exe = [string]($_.ExecutablePath)
-                    (($cmd -and $cmd.IndexOf($InstallDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                     ($cmd -and $cmd.IndexOf($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
-                     ($exe -and $exe.StartsWith($InstallDir, [System.StringComparison]::OrdinalIgnoreCase)))
+                    (($cmd -and $cmd.IndexOf($InstallDirPrefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                     ($cmd -and $cmd.IndexOf($InstallRootPrefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                     ($exe -and $exe.StartsWith($InstallDirPrefix, [System.StringComparison]::OrdinalIgnoreCase)))
                 }} |
                 ForEach-Object {{ [void]$processIds.Add([int]$_.ProcessId) }}
         }} catch {{
@@ -496,8 +503,21 @@ function Get-InstalledAppProcessIds {{
     return @($ids | Select-Object -Unique)
 }}
 
+function Stop-ProcessTree {{
+    param([int]$ProcessId)
+
+    if (-not $ProcessId -or $ProcessId -eq $PID) {{
+        return
+    }}
+    try {{
+        & "$env:SystemRoot\\System32\\taskkill.exe" /PID $ProcessId /T /F | Out-Null
+    }} catch {{
+        Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    }}
+}}
+
 function Stop-InstalledApp {{
-    $deadline = (Get-Date).AddSeconds(30)
+    $deadline = (Get-Date).AddSeconds(60)
 
     do {{
         $ids = @(Get-InstalledAppProcessIds)
@@ -506,7 +526,7 @@ function Stop-InstalledApp {{
         }}
 
         foreach ($processId in $ids) {{
-            Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
+            Stop-ProcessTree -ProcessId $processId
         }}
         try {{
             Wait-Process -Id $ids -Timeout 3 -ErrorAction SilentlyContinue
@@ -689,7 +709,7 @@ try {{
 
     Show-UpdateStep "Laufende App wird beendet"
     Stop-InstalledApp
-    Wait-InstallDirUnlocked -TimeoutSeconds 45
+    Wait-InstallDirUnlocked -TimeoutSeconds 90
 
     Show-UpdateStep "Neue App-Dateien werden kopiert"
     Copy-PayloadWithRetry -PayloadPath $Payload
@@ -938,6 +958,20 @@ def _launch_external_updater(base_dir: Path, zip_path: Path, manifest: Dict[str,
         subprocess.Popen(["/bin/sh", str(script_path)], close_fds=True)
 
 
+def _schedule_current_process_exit(delay_seconds: float = 1.0) -> None:
+    def _exit_now() -> None:
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
+
+    timer = threading.Timer(max(float(delay_seconds), 0.1), _exit_now)
+    timer.daemon = True
+    timer.start()
+
+
 def _runtime_update_interval_minutes(manifest: Dict[str, Any]) -> int:
     try:
         return max(int(manifest.get("runtime_update_check_interval_minutes", 30) or 30), 1)
@@ -1039,7 +1073,12 @@ def check_for_update_info(base_dir: Optional[Path] = None, *, force: bool = Fals
     return {"available": True, **payload}
 
 
-def start_update_from_info(update_info: Dict[str, Any], base_dir: Optional[Path] = None) -> tuple[bool, str]:
+def start_update_from_info(
+    update_info: Dict[str, Any],
+    base_dir: Optional[Path] = None,
+    *,
+    exit_current_process: bool = False,
+) -> tuple[bool, str]:
     resource_dir = base_dir or _resource_dir()
     install_dir = _install_dir()
     manifest = load_release_manifest(resource_dir)
@@ -1058,6 +1097,8 @@ def start_update_from_info(update_info: Dict[str, Any], base_dir: Optional[Path]
         _mark_pending_update_changelog(user_root, latest_version, changelog)
         _launch_external_updater(install_dir, zip_path, manifest, latest_version)
         _mark_update_started(user_root, latest_version)
+        if exit_current_process:
+            _schedule_current_process_exit()
     except Exception as exc:
         _mark_update_checked(user_root, last_update_result="failed", last_update_error=str(exc))
         return False, str(exc)
