@@ -4887,30 +4887,59 @@ def main() -> None:
             proj_defaults = dict(projekt_infos.get(proj_select, {}))
             original_project_name = proj_select
 
+        proj_form_scope = (
+            "new"
+            if proj_select == "<Neues Projekt>"
+            else f"existing_{projekte_sortiert.index(proj_select)}_{proj_select}"
+        )
         with st.form("projekt_stammdaten_form", clear_on_submit=False):
             pc1, pc2 = st.columns(2)
             with pc1:
-                p_name = st.text_input("Projekt (Kürzel/Name)", value=_safe_str(proj_defaults.get("Projekt")))
-                p_kunde = st.text_input("Kunde", value=_safe_str(proj_defaults.get("Kunde")))
-                p_ansp = st.text_input("Ansprechpartner", value=_safe_str(proj_defaults.get("Ansprechpartner")))
+                p_name = st.text_input(
+                    "Projekt (Kürzel/Name)",
+                    value=_safe_str(proj_defaults.get("Projekt")),
+                    key=f"proj_master_name_{proj_form_scope}",
+                )
+                p_kunde = st.text_input(
+                    "Kunde",
+                    value=_safe_str(proj_defaults.get("Kunde")),
+                    key=f"proj_master_customer_{proj_form_scope}",
+                )
+                p_ansp = st.text_input(
+                    "Ansprechpartner",
+                    value=_safe_str(proj_defaults.get("Ansprechpartner")),
+                    key=f"proj_master_contact_{proj_form_scope}",
+                )
                 p_addr_std = st.text_input("Projektadresse Standard",
-                                           value=_safe_str(proj_defaults.get("Projektadresse Standard")))
+                                           value=_safe_str(proj_defaults.get("Projektadresse Standard")),
+                                           key=f"proj_master_addr_std_{proj_form_scope}")
             with pc2:
-                p_str = st.text_input("Straße", value=_safe_str(proj_defaults.get("Straße")))
-                p_ort = st.text_input("Ort", value=_safe_str(proj_defaults.get("Ort")))
+                p_str = st.text_input(
+                    "Straße",
+                    value=_safe_str(proj_defaults.get("Straße")),
+                    key=f"proj_master_street_{proj_form_scope}",
+                )
+                p_ort = st.text_input(
+                    "Ort",
+                    value=_safe_str(proj_defaults.get("Ort")),
+                    key=f"proj_master_city_{proj_form_scope}",
+                )
                 p_addr_alt = st.text_input("Projektadresse Alternativ",
-                                           value=_safe_str(proj_defaults.get("Projektadresse Alternativ")))
+                                           value=_safe_str(proj_defaults.get("Projektadresse Alternativ")),
+                                           key=f"proj_master_addr_alt_{proj_form_scope}")
                 p_uses_coding = st.selectbox(
                     "Kodierung verwenden",
                     options=["ja", "nein"],
                     index=(0 if _normalize_yes_no(
                         proj_defaults.get("Kodierung verwenden")) != "nein" else 1),
+                    key=f"proj_master_uses_coding_{proj_form_scope}",
                 )
                 rename_taet = st.checkbox(
                     "Bei Projekt-Umbenennung auch Tätigkeiten aktualisieren",
                     value=False,
                     disabled=(not original_project_name),
                     help="Ändert Spalte 'Projekt' in 'Tätigkeiten' von altem auf neuen Projektnamen.",
+                    key=f"proj_master_rename_activities_{proj_form_scope}",
                 )
 
             save_proj = st.form_submit_button("Projekt-Stammdaten speichern")
