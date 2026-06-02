@@ -3644,6 +3644,11 @@ def main() -> None:
             today_default = dt.date.today()
             default_type = "F" if "F" in typen_opts else (typen_opts[0] if typen_opts else "")
             default_project = f_project if f_project in projekte_opts else ""
+            time_options = [""] + [
+                f"{hour:02d}:{minute:02d}"
+                for hour in range(24)
+                for minute in range(0, 60, 5)
+            ]
             editor_cols = [
                 "_excel_row",
                 "Datum",
@@ -3895,14 +3900,14 @@ def main() -> None:
                     "Datum": st.column_config.DateColumn("Datum", format="DD.MM.YYYY", default=today_default),
                     "Projekt": st.column_config.SelectboxColumn("Projekt", options=projekte_opts,
                                                                 default=default_project or None),
-                    "Zeit von": st.column_config.TextColumn("Zeit von",
-                                                            help="Format HH:MM, z.B. 08:30",
-                                                            default="",
-                                                            validate=r"^$|^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$"),
-                    "Zeit bis": st.column_config.TextColumn("Zeit bis",
-                                                            help="Format HH:MM, z.B. 17:00",
-                                                            default="",
-                                                            validate=r"^$|^\d{1,2}:\d{2}(:\d{2}(\.\d+)?)?$"),
+                    "Zeit von": st.column_config.SelectboxColumn("Zeit von",
+                                                                 help="Auswahl in 5-Minuten-Schritten",
+                                                                 options=time_options,
+                                                                 default=""),
+                    "Zeit bis": st.column_config.SelectboxColumn("Zeit bis",
+                                                                 help="Auswahl in 5-Minuten-Schritten",
+                                                                 options=time_options,
+                                                                 default=""),
                     "Pause_Min": st.column_config.NumberColumn("Pause (Min)", min_value=0, max_value=600, step=5,
                                                                default=0),
                     "Zahl": st.column_config.TextColumn("Zeit (h)",
