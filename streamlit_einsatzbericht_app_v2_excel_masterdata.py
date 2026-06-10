@@ -2985,22 +2985,11 @@ def _render_visualisierung_tab(
             help=mitarbeiter_help,
         )
         include_abg = st.checkbox("abgerechnete einschließen", value=True, key="viz_include_abg")
-        include_internal = st.checkbox("interne Tätigkeiten (I) einschließen", value=True, key="viz_include_internal")
-
-    x_scope = base.copy()
-    x_scope = x_scope[(x_scope["Year"] >= int(y_from)) & (x_scope["Year"] <= int(y_to))]
-    if sel_mitarbeiter:
-        x_scope = x_scope[x_scope["Mitarbeiter"].isin(sel_mitarbeiter)]
-    if False and (not include_abg):
-        x_scope = x_scope[x_scope["Abgerechnet"] != "ja"]
-        x_scope = x_scope[x_scope["TÃ¤tigkeit"] != "I"]
-    if not include_internal:
-        x_scope = x_scope[x_scope["Tätigkeit"] != "I"]
-    x = x_scope.copy()
-    if sel_projects:
-        x = x[x["Projekt"].isin(sel_projects)]
-    if not include_internal:
-        x = x[x["Tätigkeit"] != "I"]
+        include_internal = st.checkbox(
+            "interne Tätigkeiten (I) in Gesamtcharts einschließen",
+            value=True,
+            key="viz_include_internal",
+        )
 
     x_scope = base.copy()
     x_scope = x_scope[(x_scope["Year"] >= int(y_from)) & (x_scope["Year"] <= int(y_to))]
@@ -3014,15 +3003,22 @@ def _render_visualisierung_tab(
     if sel_projects:
         x = x[x["Projekt"].isin(sel_projects)]
 
+    internal_scope = x_scope.copy()
+    if sel_projects:
+        internal_scope = internal_scope[internal_scope["Projekt"].isin(sel_projects)]
+    internal_scope = internal_scope[internal_scope["Tätigkeit"] == "I"].copy()
+
     if not include_internal:
         x_scope = x_scope[x_scope["Tätigkeit"] != "I"]
         x = x[x["Tätigkeit"] != "I"]
 
-    if x_scope.empty:
+    if x_scope.empty and internal_scope.empty:
         st.warning("Keine Daten für diese Auswahl.")
         return
 
-    if x.empty:
+    if x_scope.empty:
+        st.info("Keine Daten für die Gesamtcharts. Interne Arbeitszeit wird separat angezeigt.")
+    elif x.empty:
         st.info("Keine Detaildaten für den aktuellen Projektfilter. Monatssummen über alle Projekte werden trotzdem angezeigt.")
 
     st.markdown("---")
@@ -3474,8 +3470,20 @@ def _render_visualisierung_tab(
         extra_tooltip_fields=[{"field": "Total_Hours", "type": "quantitative", "title": "Gesamt", "format": ".2f"}],
     )
 
-    internal_df = x[x["Tätigkeit"] == "I"].copy()
-    if not internal_df.empty:
+    internal_df = internal_scope.copy()
+    st.markdown("### Interne Arbeitszeit (Typ I)")
+    st.caption(
+        "Diese Übersicht nutzt die aktuelle Mitarbeiter-/Jahres-/Projekt-Auswahl und zeigt nur Tätigkeiten mit Typ I."
+    )
+
+    if internal_df.empty:
+        internal_monthly = pd.DataFrame(columns=["YM_dt", "YM", "Hours", "Bereiche", "Einträge"])
+        internal_weekly = pd.DataFrame(columns=["WeekStart", "KW", "Hours", "Bereiche", "Einträge"])
+        internal_area_df = pd.DataFrame(columns=["Interner Bereich", "Hours"])
+        internal_total = 0.0
+        internal_avg_month = 0.0
+        internal_avg_week = 0.0
+    else:
         internal_df["Interner Bereich"] = internal_df["Interne Projekte"].fillna("").astype(str).str.strip()
         fallback_project = internal_df["Projekt"].fillna("").astype(str).str.strip()
         internal_df.loc[internal_df["Interner Bereich"] == "", "Interner Bereich"] = fallback_project
@@ -3516,16 +3524,15 @@ def _render_visualisierung_tab(
         internal_avg_month = internal_total / max(1, len(internal_monthly))
         internal_avg_week = internal_total / max(1, len(internal_weekly))
 
-        st.markdown("### Interne Arbeitszeit (Typ I)")
-        st.caption(
-            "Diese Übersicht nutzt die aktuelle Mitarbeiter-/Jahres-/Projekt-Auswahl und zeigt nur Tätigkeiten mit Typ I."
-        )
-        i1, i2, i3, i4 = st.columns(4)
-        i1.metric("Interne Stunden", f"{internal_total:.2f} h")
-        i2.metric("Ø pro Monat mit Einträgen", f"{internal_avg_month:.2f} h")
-        i3.metric("Ø pro Woche mit Einträgen", f"{internal_avg_week:.2f} h")
-        i4.metric("Einträge", f"{len(internal_df)}")
+    i1, i2, i3, i4 = st.columns(4)
+    i1.metric("Interne Stunden", f"{internal_total:.2f} h")
+    i2.metric("Ø pro Monat mit Einträgen", f"{internal_avg_month:.2f} h")
+    i3.metric("Ø pro Woche mit Einträgen", f"{internal_avg_week:.2f} h")
+    i4.metric("Einträge", f"{len(internal_df)}")
 
+    if internal_df.empty:
+        st.info("Keine internen Tätigkeiten (Typ I) für die aktuelle Auswahl.")
+    else:
         ic1, ic2 = st.columns(2)
         with ic1:
             _render_chart_block(
@@ -3586,8 +3593,6 @@ def _render_visualisierung_tab(
                 hide_index=True,
                 height=300,
             )
-    elif include_internal:
-        st.caption("Keine internen Tätigkeiten (Typ I) für die aktuelle Auswahl.")
 
     cA, cB, cC = st.columns(3)
 
