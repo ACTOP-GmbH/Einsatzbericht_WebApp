@@ -1964,6 +1964,45 @@ def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: i
          "km", "Abgerechnet"]].reset_index(drop=True)
 
 
+def _build_internal_time_report(df: pd.DataFrame, year: int, month: int, project: str,
+                                include_abgerechnet: bool) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    x = df.copy()
+    x["Datum_dt"] = pd.to_datetime(x["Datum"], errors="coerce")
+    x = x[x["Datum_dt"].notna()]
+    x = x[x["Datum_dt"].dt.year == int(year)]
+    x = x[x["Datum_dt"].dt.month == int(month)]
+    x = x[x["Projekt"].astype(str) == str(project)]
+    x = x[x["Tätigkeit"].astype(str).str.strip().str.upper() == "I"]
+
+    if not include_abgerechnet:
+        x = x[x["Abgerechnet"].fillna("").astype(str).str.strip().str.lower() != "ja"]
+
+    if x.empty:
+        return pd.DataFrame()
+
+    x = x.copy()
+    if "Interne Projekte" not in x.columns:
+        x["Interne Projekte"] = ""
+    x["Datum"] = x["Datum"].apply(_format_date)
+    x["Beginn"] = x["Zeit von"].apply(_format_time)
+    x["Ende"] = x["Zeit bis"].apply(_format_time)
+    x["Pause"] = x["Pause"].apply(_format_time)
+    x["Zeit (h)"] = x["Zahl"].apply(lambda v: round(float(v), 2) if v is not None and not pd.isna(v) else None)
+    x["Interne Projekte"] = x["Interne Projekte"].fillna("").astype(str).str.strip()
+    x["Beschreibung"] = x["Info"].fillna("")
+
+    x["_sort_date"] = pd.to_datetime(x["Datum"], format="%d.%m.%Y", errors="coerce")
+    x["_sort_start"] = x["Zeit von"].apply(lambda t: _time_to_minutes(t) if t else -1)
+    x = x.sort_values(["_sort_date", "_sort_start", "_excel_row"]).drop(columns=["_sort_date", "_sort_start"])
+
+    return x[
+        ["_excel_row", "Datum", "Beginn", "Ende", "Pause", "Zeit (h)", "Interne Projekte", "Beschreibung",
+         "Abgerechnet"]].reset_index(drop=True)
+
+
 def _summaries_from_report(report_df: pd.DataFrame) -> Dict[str, float]:
     if report_df.empty:
         return {"F": 0.0, "R": 0.0, "K": 0.0, "gesamt": 0.0}
@@ -2674,7 +2713,7 @@ def _viz_base_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(
             columns=["Datum_dt", "Year", "Month", "YM", "YM_dt", "Projekt", "Tätigkeit", "Hours", "Abgerechnet", "km",
-                     "Kodierung", "Info", "Mitarbeiter"])
+                     "Kodierung", "Info", "Interne Projekte", "Mitarbeiter"])
 
     x = df.copy()
     x["Datum_dt"] = pd.to_datetime(x["Datum"], errors="coerce")
@@ -2704,6 +2743,9 @@ def _viz_base_df(df: pd.DataFrame) -> pd.DataFrame:
         x["Kodierung"] = ""
     if "Info" not in x.columns:
         x["Info"] = ""
+    if "Interne Projekte" not in x.columns:
+        x["Interne Projekte"] = ""
+    x["Interne Projekte"] = x["Interne Projekte"].fillna("").astype(str).str.strip()
     if "Mitarbeiter" not in x.columns:
         x["Mitarbeiter"] = "Ich (Eigene)"
     x["Mitarbeiter"] = x["Mitarbeiter"].fillna("Unbekannt")
@@ -3432,6 +3474,121 @@ def _render_visualisierung_tab(
         extra_tooltip_fields=[{"field": "Total_Hours", "type": "quantitative", "title": "Gesamt", "format": ".2f"}],
     )
 
+    internal_df = x[x["Tätigkeit"] == "I"].copy()
+    if not internal_df.empty:
+        internal_df["Interner Bereich"] = internal_df["Interne Projekte"].fillna("").astype(str).str.strip()
+        fallback_project = internal_df["Projekt"].fillna("").astype(str).str.strip()
+        internal_df.loc[internal_df["Interner Bereich"] == "", "Interner Bereich"] = fallback_project
+        internal_df.loc[internal_df["Interner Bereich"] == "", "Interner Bereich"] = "Ohne Zuordnung"
+        internal_df["WeekStart"] = (
+            internal_df["Datum_dt"] - pd.to_timedelta(internal_df["Datum_dt"].dt.weekday, unit="D")
+        ).dt.normalize()
+        iso_week = internal_df["Datum_dt"].dt.isocalendar()
+        internal_df["KW"] = (
+            iso_week["year"].astype(str) + "-KW" + iso_week["week"].astype(int).map(lambda week: f"{week:02d}")
+        )
+
+        internal_monthly = (
+            internal_df.groupby(["YM_dt", "YM"], as_index=False)
+            .agg(
+                Hours=("Hours", "sum"),
+                Bereiche=("Interner Bereich", "nunique"),
+                Einträge=("Hours", "size"),
+            )
+            .sort_values("YM_dt")
+        )
+        internal_weekly = (
+            internal_df.groupby(["WeekStart", "KW"], as_index=False)
+            .agg(
+                Hours=("Hours", "sum"),
+                Bereiche=("Interner Bereich", "nunique"),
+                Einträge=("Hours", "size"),
+            )
+            .sort_values("WeekStart")
+        )
+        internal_area_df = (
+            internal_df.groupby("Interner Bereich", as_index=False)["Hours"]
+            .sum()
+            .sort_values("Hours", ascending=False)
+        )
+
+        internal_total = float(internal_df["Hours"].sum() or 0.0)
+        internal_avg_month = internal_total / max(1, len(internal_monthly))
+        internal_avg_week = internal_total / max(1, len(internal_weekly))
+
+        st.markdown("### Interne Arbeitszeit (Typ I)")
+        st.caption(
+            "Diese Übersicht nutzt die aktuelle Mitarbeiter-/Jahres-/Projekt-Auswahl und zeigt nur Tätigkeiten mit Typ I."
+        )
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("Interne Stunden", f"{internal_total:.2f} h")
+        i2.metric("Ø pro Monat mit Einträgen", f"{internal_avg_month:.2f} h")
+        i3.metric("Ø pro Woche mit Einträgen", f"{internal_avg_week:.2f} h")
+        i4.metric("Einträge", f"{len(internal_df)}")
+
+        ic1, ic2 = st.columns(2)
+        with ic1:
+            _render_chart_block(
+                title="Intern monatlich",
+                df=internal_monthly,
+                key_prefix="viz_internal_monthly",
+                default_kind="Bar",
+                allowed_kinds=["Bar", "Line", "Area"],
+                x_field="YM_dt",
+                y_field="Hours",
+                color_field=None,
+                x_type="temporal",
+                stacked_default=False,
+                pie_ok=False,
+                extra_tooltip_fields=[
+                    {"field": "Bereiche", "type": "quantitative", "title": "Bereiche", "format": ".0f"},
+                    {"field": "Einträge", "type": "quantitative", "title": "Einträge", "format": ".0f"},
+                ],
+            )
+        with ic2:
+            _render_chart_block(
+                title="Intern wöchentlich",
+                df=internal_weekly,
+                key_prefix="viz_internal_weekly",
+                default_kind="Bar",
+                allowed_kinds=["Bar", "Line", "Area"],
+                x_field="WeekStart",
+                y_field="Hours",
+                color_field=None,
+                x_type="temporal",
+                stacked_default=False,
+                pie_ok=False,
+                extra_tooltip_fields=[
+                    {"field": "KW", "type": "nominal", "title": "KW"},
+                    {"field": "Einträge", "type": "quantitative", "title": "Einträge", "format": ".0f"},
+                ],
+            )
+
+        _render_chart_block(
+            title="Interne Arbeitszeit nach Bereich/Projekt",
+            df=internal_area_df,
+            key_prefix="viz_internal_area",
+            default_kind="Bar",
+            allowed_kinds=["Bar", "Pie", "Donut"],
+            x_field="Interner Bereich",
+            y_field="Hours",
+            color_field=None,
+            x_type="nominal",
+            stacked_default=False,
+            pie_ok=True,
+        )
+        with st.expander("Interne Arbeitszeit als Tabelle"):
+            st.dataframe(
+                internal_df[
+                    ["Mitarbeiter", "Datum_dt", "Projekt", "Interner Bereich", "Hours", "Info", "Abgerechnet"]
+                ].sort_values(["Datum_dt", "Mitarbeiter"], ascending=[False, True]),
+                use_container_width=True,
+                hide_index=True,
+                height=300,
+            )
+    elif include_internal:
+        st.caption("Keine internen Tätigkeiten (Typ I) für die aktuelle Auswahl.")
+
     cA, cB, cC = st.columns(3)
 
     with cA:
@@ -3498,8 +3655,8 @@ def _render_visualisierung_tab(
 
     st.markdown("### Detail (optional)")
     with st.expander("Rohdaten anzeigen"):
-        show_cols = ["Mitarbeiter", "Datum_dt", "Projekt", "Tätigkeit", "Hours", "km", "Kodierung", "Info",
-                     "Abgerechnet"]
+        show_cols = ["Mitarbeiter", "Datum_dt", "Projekt", "Tätigkeit", "Hours", "km", "Kodierung",
+                     "Interne Projekte", "Info", "Abgerechnet"]
         show_cols = [c for c in show_cols if c in x.columns]
         st.dataframe(x[show_cols].sort_values(["Datum_dt", "Mitarbeiter"], ascending=[False, True]),
                      use_container_width=True, height=420)
@@ -4670,6 +4827,9 @@ def main() -> None:
 
         report_df = _build_report(df, lookups, int(r_year), int(r_month), r_project, include_abgerechnet)
         sums = _summaries_from_report(report_df)
+        internal_report_df = _build_internal_time_report(
+            df, int(r_year), int(r_month), r_project, include_abgerechnet
+        )
         ytd_df = pd.concat(
             [
                 _build_report(df, lookups, int(r_year), month, r_project, include_abgerechnet)
@@ -4678,6 +4838,21 @@ def main() -> None:
             ignore_index=True,
         ) if int(r_month) >= 1 else pd.DataFrame()
         ytd_sums = _summaries_from_report(ytd_df)
+        internal_ytd_df = pd.concat(
+            [
+                _build_internal_time_report(df, int(r_year), month, r_project, include_abgerechnet)
+                for month in range(1, int(r_month) + 1)
+            ],
+            ignore_index=True,
+        ) if int(r_month) >= 1 else pd.DataFrame()
+        internal_month_hours = (
+            float(pd.to_numeric(internal_report_df.get("Zeit (h)", pd.Series(dtype=float)), errors="coerce").sum())
+            if not internal_report_df.empty else 0.0
+        )
+        internal_ytd_hours = (
+            float(pd.to_numeric(internal_ytd_df.get("Zeit (h)", pd.Series(dtype=float)), errors="coerce").sum())
+            if not internal_ytd_df.empty else 0.0
+        )
 
         info = lookups.get("projekt_infos", {}).get(r_project, {})
         p1, p2 = st.columns(2)
@@ -4701,6 +4876,23 @@ def main() -> None:
         m2.metric("Reisezeit (R)", f"{sums['R']:.2f} h")
         m3.metric("Kulanz (K)", f"{sums['K']:.2f} h")
         m4.metric("Gesamt", f"{sums['gesamt']:.2f} h")
+
+        if not internal_report_df.empty or not internal_ytd_df.empty:
+            st.markdown("#### Interne Arbeitszeit (nicht im offiziellen Einsatzbericht)")
+            i1, i2, i3 = st.columns(3)
+            i1.metric("Intern im Monat", f"{internal_month_hours:.2f} h")
+            i2.metric("Intern YTD", f"{internal_ytd_hours:.2f} h")
+            i3.metric("Interne Einträge im Monat", f"{len(internal_report_df)}")
+            with st.expander("Interne Tätigkeiten anzeigen"):
+                if internal_report_df.empty:
+                    st.caption("Keine internen Tätigkeiten im ausgewählten Monat.")
+                else:
+                    st.dataframe(
+                        internal_report_df.drop(columns=["_excel_row"]),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=220,
+                    )
 
         st.markdown("#### Kumuliert im Jahr (YTD)")
         y1, y2, y3, y4 = st.columns(4)
