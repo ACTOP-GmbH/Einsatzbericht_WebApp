@@ -13,6 +13,10 @@ import hashlib
 import time
 import warnings
 import zipfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1168,6 +1172,191 @@ def _excel_original_report_action(
     return _excel_original_report_action_fallback(
         xlsx_path, year, month, project, action, pdf_output_path, xlsx_output_path, report_df, consultant, is_mac
     )
+
+
+# ------------------------- IMS submission -------------------------
+
+def _env_default(name: str) -> str:
+    return _safe_str(os.environ.get(name, "")).strip()
+
+
+def _derive_infor_token_url(tenant: str, region: str = "eu1") -> str:
+    tenant = _safe_str(tenant).strip().strip("/")
+    region = _safe_str(region).strip() or "eu1"
+    if not tenant:
+        return ""
+    return f"https://mingle-sso.{region}.inforcloudsuite.com:443/{tenant}/as/token.oauth2"
+
+
+def _derive_ims_multipart_url(tenant: str, region: str = "eu1") -> str:
+    tenant = _safe_str(tenant).strip().strip("/")
+    region = _safe_str(region).strip() or "eu1"
+    if not tenant:
+        return ""
+    return f"https://mingle-ionapi.{region}.inforcloudsuite.com/{tenant}/CustomerApi/AOM/ims/v3/message/multipart"
+
+
+def _truncate_response_text(text: str, max_len: int = 1200) -> str:
+    text = _safe_str(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len] + "..."
+
+
+def _read_http_error_body(exc: urllib.error.HTTPError) -> str:
+    try:
+        return exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _retrieve_infor_oauth_token(
+        *,
+        token_url: str,
+        client_id: str,
+        client_secret: str,
+        grant_type: str = "client_credentials",
+        username: str = "",
+        password: str = "",
+        timeout_seconds: int = 30,
+) -> Tuple[bool, str, Optional[str]]:
+    token_url = _safe_str(token_url).strip()
+    client_id = _safe_str(client_id).strip()
+    client_secret = _safe_str(client_secret).strip()
+    grant_type = _safe_str(grant_type).strip() or "client_credentials"
+
+    missing = []
+    if not token_url:
+        missing.append("Token-URL")
+    if not client_id:
+        missing.append("Client ID")
+    if not client_secret:
+        missing.append("Client Secret")
+    if grant_type == "password":
+        if not username:
+            missing.append("Username")
+        if not password:
+            missing.append("Password")
+    if missing:
+        return False, "IMS OAuth2 unvollständig: " + ", ".join(missing), None
+
+    form_fields = {
+        "grant_type": grant_type,
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    if grant_type == "password":
+        form_fields["username"] = username
+        form_fields["password"] = password
+
+    payload = urllib.parse.urlencode(form_fields).encode("utf-8")
+    request = urllib.request.Request(
+        token_url,
+        data=payload,
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body = _truncate_response_text(_read_http_error_body(exc))
+        return False, f"OAuth2 Token konnte nicht abgerufen werden (HTTP {exc.code}): {body}", None
+    except urllib.error.URLError as exc:
+        return False, f"OAuth2 Token konnte nicht abgerufen werden: {exc.reason}", None
+    except Exception as exc:
+        return False, f"OAuth2 Token konnte nicht abgerufen werden: {exc}", None
+
+    try:
+        token_payload = json.loads(body)
+    except Exception:
+        return False, f"OAuth2 Antwort ist kein JSON: {_truncate_response_text(body)}", None
+
+    access_token = _safe_str(token_payload.get("access_token")).strip()
+    if not access_token:
+        return False, f"OAuth2 Antwort enthält kein access_token: {_truncate_response_text(body)}", None
+    return True, "OAuth2 Token abgerufen.", access_token
+
+
+def _encode_ims_multipart_payload(file_path: Path, field_name: str = "MessagePayload") -> Tuple[bytes, str]:
+    boundary = f"----ActopEinsatzbericht{uuid.uuid4().hex}"
+    file_name = Path(file_path).name
+    file_bytes = Path(file_path).read_bytes()
+    head = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field_name}"; filename="{file_name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode("utf-8")
+    tail = f"\r\n--{boundary}--\r\n".encode("utf-8")
+    return head + file_bytes + tail, f"multipart/form-data; boundary={boundary}"
+
+
+def _submit_file_to_ims(
+        *,
+        endpoint_url: str,
+        access_token: str,
+        file_path: Path,
+        from_logical_id: str,
+        document_name: str,
+        encoding: str = "NONE",
+        timeout_seconds: int = 60,
+) -> Tuple[bool, str]:
+    endpoint_url = _safe_str(endpoint_url).strip()
+    access_token = _safe_str(access_token).strip()
+    file_path = Path(file_path)
+    from_logical_id = _safe_str(from_logical_id).strip()
+    document_name = _safe_str(document_name).strip()
+    encoding = _safe_str(encoding).strip() or "NONE"
+
+    missing = []
+    if not endpoint_url:
+        missing.append("IMS Endpoint-URL")
+    if not access_token:
+        missing.append("Access Token")
+    if not from_logical_id:
+        missing.append("From Logical ID")
+    if not document_name:
+        missing.append("Document Name")
+    if not file_path.exists():
+        missing.append("Payload-Datei")
+    if missing:
+        return False, "IMS Einreichung unvollständig: " + ", ".join(missing)
+
+    payload, content_type = _encode_ims_multipart_payload(file_path)
+    request = urllib.request.Request(
+        endpoint_url,
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": content_type,
+            "X-Infor-ION-fromLogicalId": from_logical_id,
+            "X-Infor-ION-documentName": document_name,
+            "X-Infor-ION-encoding": encoding,
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            status = getattr(response, "status", None) or response.getcode()
+    except urllib.error.HTTPError as exc:
+        body = _truncate_response_text(_read_http_error_body(exc))
+        return False, f"IMS Einreichung fehlgeschlagen (HTTP {exc.code}) für {file_path.name}: {body}"
+    except urllib.error.URLError as exc:
+        return False, f"IMS Einreichung fehlgeschlagen für {file_path.name}: {exc.reason}"
+    except Exception as exc:
+        return False, f"IMS Einreichung fehlgeschlagen für {file_path.name}: {exc}"
+
+    response_hint = _truncate_response_text(body.strip())
+    if response_hint:
+        return True, f"IMS Einreichung OK (HTTP {status}) für {file_path.name}: {response_hint}"
+    return True, f"IMS Einreichung OK (HTTP {status}) für {file_path.name}."
 
 
 def load_workbook_data(path_str: str) -> WorkbookData:
@@ -4825,6 +5014,171 @@ def main() -> None:
                     consultant=report_consultant
                 )
                 (st.success if ok else st.error)(msg)
+
+        with st.expander("IMS-Einreichung", expanded=False):
+            st.caption(
+                "Reicht den aktuell ausgewählten Einsatzbericht über die Infor IMS-Schnittstelle ein. "
+                "Credentials werden nicht in der Excel-Datei gespeichert."
+            )
+
+            ims_col1, ims_col2, ims_col3 = st.columns(3)
+            with ims_col1:
+                ims_region = st.text_input(
+                    "Infor Region",
+                    value=_env_default("IMS_REGION") or "eu1",
+                    key="ims_region",
+                    help="Beispiel: eu1",
+                )
+                ims_token_tenant = st.text_input(
+                    "SSO Tenant / TI",
+                    value=_env_default("IMS_TOKEN_TENANT"),
+                    key="ims_token_tenant",
+                    placeholder="z. B. HYS..._PRD",
+                )
+                ims_api_tenant = st.text_input(
+                    "ION API Tenant / TI",
+                    value=_env_default("IMS_API_TENANT"),
+                    key="ims_api_tenant",
+                    placeholder="Leer = SSO Tenant verwenden",
+                )
+            with ims_col2:
+                ims_use_derived_urls = st.checkbox(
+                    "URLs aus Tenant/Region ableiten",
+                    value=not (_env_default("IMS_TOKEN_URL") or _env_default("IMS_ENDPOINT_URL")),
+                    key="ims_use_derived_urls",
+                )
+                derived_token_url = _derive_infor_token_url(ims_token_tenant, ims_region)
+                derived_endpoint_url = _derive_ims_multipart_url(ims_api_tenant or ims_token_tenant, ims_region)
+                if ims_use_derived_urls:
+                    ims_token_url = derived_token_url
+                    ims_endpoint_url = derived_endpoint_url
+                    st.text_input("OAuth2 Token URL", value=ims_token_url, disabled=True, key="ims_token_url_preview")
+                    st.text_input("IMS Endpoint URL", value=ims_endpoint_url, disabled=True, key="ims_endpoint_url_preview")
+                else:
+                    ims_token_url = st.text_input(
+                        "OAuth2 Token URL",
+                        value=_env_default("IMS_TOKEN_URL") or derived_token_url,
+                        key="ims_token_url",
+                    )
+                    ims_endpoint_url = st.text_input(
+                        "IMS Endpoint URL",
+                        value=_env_default("IMS_ENDPOINT_URL") or derived_endpoint_url,
+                        key="ims_endpoint_url",
+                    )
+            with ims_col3:
+                ims_grant_type = st.selectbox(
+                    "OAuth2 Grant Type",
+                    options=["client_credentials", "password"],
+                    index=0 if (_env_default("IMS_GRANT_TYPE") or "client_credentials") == "client_credentials" else 1,
+                    key="ims_grant_type",
+                    help="Die Postman-Collection nutzt client_credentials.",
+                )
+                ims_client_id = st.text_input(
+                    "Client ID",
+                    value=_env_default("IMS_CLIENT_ID"),
+                    key="ims_client_id",
+                )
+                ims_client_secret = st.text_input(
+                    "Client Secret",
+                    value=_env_default("IMS_CLIENT_SECRET"),
+                    type="password",
+                    key="ims_client_secret",
+                )
+
+            ims_auth_col1, ims_auth_col2, ims_head_col1, ims_head_col2 = st.columns(4)
+            with ims_auth_col1:
+                ims_username = st.text_input(
+                    "Username",
+                    value=_env_default("IMS_USERNAME"),
+                    key="ims_username",
+                    disabled=(ims_grant_type != "password"),
+                    help="Nur für Grant Type password relevant.",
+                )
+            with ims_auth_col2:
+                ims_password = st.text_input(
+                    "Password",
+                    value=_env_default("IMS_PASSWORD"),
+                    type="password",
+                    key="ims_password",
+                    disabled=(ims_grant_type != "password"),
+                    help="Nur für Grant Type password relevant.",
+                )
+            with ims_head_col1:
+                ims_from_lid = st.text_input(
+                    "X-Infor-ION-fromLogicalId",
+                    value=_env_default("IMS_FROM_LOGICAL_ID"),
+                    key="ims_from_logical_id",
+                    placeholder="lid://infor.ims....",
+                )
+            with ims_head_col2:
+                ims_document_name = st.text_input(
+                    "X-Infor-ION-documentName",
+                    value=_env_default("IMS_DOCUMENT_NAME") or "poDeposition",
+                    key="ims_document_name",
+                )
+                ims_encoding = st.text_input(
+                    "X-Infor-ION-encoding",
+                    value=_env_default("IMS_ENCODING") or "NONE",
+                    key="ims_encoding",
+                )
+
+            submit_disabled = report_df.empty
+            if submit_disabled:
+                st.info("Einreichung ist deaktiviert, solange der aktuelle Einsatzbericht keine Positionen enthält.")
+
+            if st.button(
+                    "Einsatzbericht via IMS einreichen",
+                    key="submit_report_ims",
+                    type="primary",
+                    disabled=submit_disabled,
+            ):
+                ims_xlsx_target = export_dir / f"{base_export_name}_ims.xlsx"
+                with st.spinner("Einsatzbericht wird vorbereitet und via IMS eingereicht..."):
+                    ok_export, export_msg, ims_payload_files = _excel_original_report_action(
+                        data.path,
+                        int(r_year),
+                        int(r_month),
+                        r_project,
+                        action="xlsx",
+                        xlsx_output_path=ims_xlsx_target,
+                        report_df=report_df,
+                        consultant=report_consultant,
+                    )
+
+                    if not ok_export:
+                        st.error(f"Einsatzbericht konnte nicht vorbereitet werden: {export_msg}")
+                    else:
+                        ok_token, token_msg, access_token = _retrieve_infor_oauth_token(
+                            token_url=ims_token_url,
+                            client_id=ims_client_id,
+                            client_secret=ims_client_secret,
+                            grant_type=ims_grant_type,
+                            username=ims_username,
+                            password=ims_password,
+                        )
+                        if not ok_token or not access_token:
+                            st.error(token_msg)
+                        else:
+                            submit_results = []
+                            all_ok = True
+                            for payload_file in ims_payload_files:
+                                ok_submit, submit_msg = _submit_file_to_ims(
+                                    endpoint_url=ims_endpoint_url,
+                                    access_token=access_token,
+                                    file_path=payload_file,
+                                    from_logical_id=ims_from_lid,
+                                    document_name=ims_document_name,
+                                    encoding=ims_encoding,
+                                )
+                                submit_results.append(submit_msg)
+                                all_ok = all_ok and ok_submit
+
+                            if all_ok:
+                                st.success(f"IMS Einreichung abgeschlossen. {export_msg}")
+                            else:
+                                st.error("IMS Einreichung nicht vollständig erfolgreich.")
+                            for result_msg in submit_results:
+                                st.write(result_msg)
 
         if report_df.empty:
             st.warning("Keine Einträge für diesen Einsatzbericht gefunden.")
