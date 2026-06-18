@@ -1924,16 +1924,48 @@ def _render_periodic_runtime_update_check() -> None:
 
 # ------------------------- reporting logic -------------------------
 
-def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: int, project: str,
-                  include_abgerechnet: bool) -> pd.DataFrame:
+def _month_date_range(year: int, month: int) -> Tuple[dt.date, dt.date]:
+    start = dt.date(int(year), int(month), 1)
+    if int(month) == 12:
+        end = dt.date(int(year), 12, 31)
+    else:
+        end = dt.date(int(year), int(month) + 1, 1) - dt.timedelta(days=1)
+    return start, end
+
+
+def _iso_weeks_in_year(year: int) -> int:
+    return int(dt.date(int(year), 12, 28).isocalendar().week)
+
+
+def _iso_week_date_range(year: int, week: int) -> Tuple[dt.date, dt.date]:
+    start = dt.date.fromisocalendar(int(year), int(week), 1)
+    return start, start + dt.timedelta(days=6)
+
+
+def _format_report_period_label(period_mode: str, year: int, month: int, week: int) -> str:
+    if period_mode == "Kalenderwoche":
+        week_start, week_end = _iso_week_date_range(year, week)
+        return f"KW {int(week):02d}/{int(year)} ({week_start.strftime('%d.%m.%Y')} - {week_end.strftime('%d.%m.%Y')})"
+    return f"{int(month):02d}/{int(year)}"
+
+
+def _build_report_for_date_range(
+        df: pd.DataFrame,
+        lookups: Dict[str, Any],
+        start_date: dt.date,
+        end_date: dt.date,
+        project: str,
+        include_abgerechnet: bool,
+) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
 
     x = df.copy()
     x["Datum_dt"] = pd.to_datetime(x["Datum"], errors="coerce")
     x = x[x["Datum_dt"].notna()]
-    x = x[x["Datum_dt"].dt.year == int(year)]
-    x = x[x["Datum_dt"].dt.month == int(month)]
+    start_ts = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    x = x[(x["Datum_dt"] >= start_ts) & (x["Datum_dt"] <= end_ts)]
     x = x[x["Projekt"].astype(str) == str(project)]
 
     x = x[x["Tätigkeit"].astype(str).str.upper() != "I"]
@@ -1962,6 +1994,12 @@ def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: i
     return x[
         ["_excel_row", "Datum", "Beginn", "Ende", "Pause", "Zeit (h)", "Art", "Kodierung EB", "Leistungsbeschreibung",
          "km", "Abgerechnet"]].reset_index(drop=True)
+
+
+def _build_report(df: pd.DataFrame, lookups: Dict[str, Any], year: int, month: int, project: str,
+                  include_abgerechnet: bool) -> pd.DataFrame:
+    start_date, end_date = _month_date_range(year, month)
+    return _build_report_for_date_range(df, lookups, start_date, end_date, project, include_abgerechnet)
 
 
 def _summaries_from_report(report_df: pd.DataFrame) -> Dict[str, float]:
@@ -4647,7 +4685,7 @@ def main() -> None:
     with tab2:
         st.subheader("Einsatzbericht (Web-Ansicht)")
 
-        rep_col1, rep_col2, rep_col3, rep_col4 = st.columns([1, 1, 2, 1])
+        rep_col0, rep_col1, rep_col2, rep_col3, rep_col4 = st.columns([1.2, 1, 1, 2, 1])
         rep_projects = sorted(list(dict.fromkeys([p for p in (lookups.get("projekte") or []) if p] + [p for p in
                                                                                                       df.get("Projekt",
                                                                                                              pd.Series(
@@ -4655,12 +4693,42 @@ def main() -> None:
                                                                                                           str).tolist()
                                                                                                       if p])))
         y_default, m_default = _project_defaults(df)
+        latest_default_date = dt.date(int(y_default), int(m_default), 1)
+        with rep_col0:
+            report_period_mode = st.selectbox(
+                "Zeitraum",
+                options=["Monat", "Kalenderwoche"],
+                index=0,
+                key="rep_period_mode",
+            )
         with rep_col1:
             r_year = st.number_input("Jahr", min_value=2000, max_value=2100, value=int(y_default), step=1,
                                      key="rep_year")
         with rep_col2:
-            r_month = st.selectbox("Monat", options=list(range(1, 13)), index=max(0, min(11, int(m_default) - 1)),
-                                   key="rep_month")
+            max_iso_week = _iso_weeks_in_year(int(r_year))
+            default_week = max(1, min(max_iso_week, int(latest_default_date.isocalendar().week)))
+            if report_period_mode == "Kalenderwoche":
+                if "rep_week" in st.session_state:
+                    try:
+                        st.session_state["rep_week"] = max(1, min(max_iso_week, int(st.session_state["rep_week"])))
+                    except Exception:
+                        st.session_state["rep_week"] = default_week
+                r_week = st.number_input(
+                    "KW",
+                    min_value=1,
+                    max_value=max_iso_week,
+                    value=default_week,
+                    step=1,
+                    key="rep_week",
+                )
+                week_start, week_end = _iso_week_date_range(int(r_year), int(r_week))
+                r_month = int(week_start.month)
+                st.caption(f"{week_start.strftime('%d.%m.%Y')} - {week_end.strftime('%d.%m.%Y')}")
+            else:
+                r_month = st.selectbox("Monat", options=list(range(1, 13)), index=max(0, min(11, int(m_default) - 1)),
+                                       key="rep_month")
+                r_week = int(dt.date(int(r_year), int(r_month), 1).isocalendar().week)
+                week_start, week_end = _month_date_range(int(r_year), int(r_month))
         with rep_col3:
             default_project = "ABS" if "ABS" in rep_projects else (rep_projects[0] if rep_projects else "")
             r_project = st.selectbox("Projekt", options=rep_projects if rep_projects else [""], index=(
@@ -4668,15 +4736,31 @@ def main() -> None:
         with rep_col4:
             include_abgerechnet = st.checkbox("abgerechnete einschließen", value=False)
 
-        report_df = _build_report(df, lookups, int(r_year), int(r_month), r_project, include_abgerechnet)
+        if report_period_mode == "Kalenderwoche":
+            report_start, report_end = _iso_week_date_range(int(r_year), int(r_week))
+            report_context_month = int(report_start.month)
+            report_period_label = _format_report_period_label(report_period_mode, int(r_year), int(r_month), int(r_week))
+            report_period_slug = f"{int(r_year)}-KW{int(r_week):02d}"
+            report_df = _build_report_for_date_range(
+                df, lookups, report_start, report_end, r_project, include_abgerechnet
+            )
+            ytd_df = _build_report_for_date_range(
+                df, lookups, dt.date(int(r_year), 1, 1), report_end, r_project, include_abgerechnet
+            )
+        else:
+            report_start, report_end = _month_date_range(int(r_year), int(r_month))
+            report_context_month = int(r_month)
+            report_period_label = _format_report_period_label(report_period_mode, int(r_year), int(r_month), int(r_week))
+            report_period_slug = f"{int(r_year)}-{int(r_month):02d}"
+            report_df = _build_report(df, lookups, int(r_year), int(r_month), r_project, include_abgerechnet)
+            ytd_df = pd.concat(
+                [
+                    _build_report(df, lookups, int(r_year), month, r_project, include_abgerechnet)
+                    for month in range(1, int(r_month) + 1)
+                ],
+                ignore_index=True,
+            ) if int(r_month) >= 1 else pd.DataFrame()
         sums = _summaries_from_report(report_df)
-        ytd_df = pd.concat(
-            [
-                _build_report(df, lookups, int(r_year), month, r_project, include_abgerechnet)
-                for month in range(1, int(r_month) + 1)
-            ],
-            ignore_index=True,
-        ) if int(r_month) >= 1 else pd.DataFrame()
         ytd_sums = _summaries_from_report(ytd_df)
 
         info = lookups.get("projekt_infos", {}).get(r_project, {})
@@ -4690,7 +4774,7 @@ def main() -> None:
         with p2:
             st.markdown("#### Report-Kontext")
             st.write(f"**Projekt:** {r_project}")
-            st.write(f"**Monat/Jahr:** {int(r_month):02d}/{int(r_year)}")
+            st.write(f"**Zeitraum:** {report_period_label}")
             st.write(f"**Projektadresse (Standard):** {_safe_str(info.get('Projektadresse Standard')) or '-'}")
             alt = _safe_str(info.get('Projektadresse Alternativ'))
             if alt:
@@ -4732,7 +4816,7 @@ def main() -> None:
         export_dir = data.path.parent / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
 
-        base_export_name = f"Einsatzbericht_{r_project}_{int(r_year)}-{int(r_month):02d}"
+        base_export_name = f"Einsatzbericht_{r_project}_{report_period_slug}"
         default_pdf_name = f"{base_export_name}.pdf"
         default_xlsx_name = f"{base_export_name}.xlsx"
 
@@ -4741,14 +4825,14 @@ def main() -> None:
             "PDF-Ausgabepfad",
             value=str((export_dir / default_pdf_name)),
             help="Relativer oder absoluter Pfad. (Aktualisiert sich automatisch bei Projekt-/Datumswechsel)",
-            key=f"pdf_path_{r_project}_{r_year}_{r_month}",
+            key=f"pdf_path_{r_project}_{report_period_slug}",
         )
 
         xlsx_rel_or_abs = st.text_input(
             "Excel-Kopie-Ausgabepfad",
             value=str((export_dir / default_xlsx_name)),
             help="Speichert eine vorbereitete Kopie der Excel.",
-            key=f"xlsx_path_{r_project}_{r_year}_{r_month}",
+            key=f"xlsx_path_{r_project}_{report_period_slug}",
         )
 
         b1, b2, b3, b4 = st.columns(4)
@@ -4757,7 +4841,7 @@ def main() -> None:
         with b1:
             if st.button("Original in Excel öffnen", key="open_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
-                    data.path, int(r_year), int(r_month), r_project, action="open", report_df=report_df,
+                    data.path, int(r_year), report_context_month, r_project, action="open", report_df=report_df,
                     consultant=report_consultant
                 )
                 (st.success if ok else st.error)(msg)
@@ -4769,7 +4853,7 @@ def main() -> None:
                     pdf_target = (Path.cwd() / pdf_target).resolve()
 
                 ok, msg, exported_files = _excel_original_report_action(
-                    data.path, int(r_year), int(r_month), r_project, action="pdf", pdf_output_path=pdf_target,
+                    data.path, int(r_year), report_context_month, r_project, action="pdf", pdf_output_path=pdf_target,
                     report_df=report_df, consultant=report_consultant
                 )
                 if ok:
@@ -4797,7 +4881,7 @@ def main() -> None:
                     xlsx_target = (Path.cwd() / xlsx_target).resolve()
 
                 ok, msg, exported_files = _excel_original_report_action(
-                    data.path, int(r_year), int(r_month), r_project, action="xlsx", xlsx_output_path=xlsx_target,
+                    data.path, int(r_year), report_context_month, r_project, action="xlsx", xlsx_output_path=xlsx_target,
                     report_df=report_df, consultant=report_consultant
                 )
                 if ok:
@@ -4821,7 +4905,7 @@ def main() -> None:
         with b4:
             if st.button("Original direkt drucken", key="print_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
-                    data.path, int(r_year), int(r_month), r_project, action="print", report_df=report_df,
+                    data.path, int(r_year), report_context_month, r_project, action="print", report_df=report_df,
                     consultant=report_consultant
                 )
                 (st.success if ok else st.error)(msg)
@@ -4836,7 +4920,7 @@ def main() -> None:
             st.download_button(
                 "Tabelle als CSV exportieren",
                 data=csv_bytes,
-                file_name=f"Einsatzbericht_{r_project}_{r_year}-{int(r_month):02d}.csv",
+                file_name=f"Einsatzbericht_{r_project}_{report_period_slug}.csv",
                 mime="text/csv",
                 key="dl_csv_export"
             )
