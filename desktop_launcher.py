@@ -248,6 +248,7 @@ def _apply_streamlit_options() -> None:
         "global.developmentMode": False,
         "server.headless": True,
         "server.showEmailPrompt": False,
+        "server.fileWatcherType": "none",
         "browser.gatherUsageStats": False,
     }.items():
         try:
@@ -283,9 +284,16 @@ def run_streamlit_child() -> int:
     runtime = None
     try:
         configure_streamlit_runtime()
+        os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
         os.chdir(_current_dir())
         runtime = prepare_runtime_environment()
         _log_startup_event(runtime, "child runtime prepared")
+
+        try:
+            import numpy  # noqa: F401
+            _log_startup_event(runtime, "numpy preloaded")
+        except Exception as exc:
+            _log_startup_event(runtime, f"numpy preload skipped: {exc}")
 
         import_start = time.perf_counter()
         import streamlit.web.cli as stcli
@@ -305,6 +313,7 @@ def run_streamlit_child() -> int:
             f"--server.address={LOCAL_CONNECT_HOST}",
             f"--server.port={port}",
             "--server.showEmailPrompt=false",
+            "--server.fileWatcherType=none",
             "--browser.gatherUsageStats=false",
         ]
         _log_startup_event(runtime, "calling streamlit cli main")
