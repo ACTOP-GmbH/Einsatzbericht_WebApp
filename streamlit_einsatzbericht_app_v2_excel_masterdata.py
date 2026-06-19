@@ -2131,10 +2131,22 @@ def _iso_week_date_range(year: int, week: int) -> Tuple[dt.date, dt.date]:
     return start, start + dt.timedelta(days=6)
 
 
-def _format_report_period_label(period_mode: str, year: int, month: int, week: int) -> str:
+def _format_report_period_label(
+        period_mode: str,
+        year: int,
+        month: int,
+        week: int,
+        start_date: Optional[dt.date] = None,
+        end_date: Optional[dt.date] = None,
+        billing_year: Optional[int] = None,
+) -> str:
     if period_mode == "Kalenderwoche":
-        week_start, week_end = _iso_week_date_range(year, week)
-        return f"KW {int(week):02d}/{int(year)} ({week_start.strftime('%d.%m.%Y')} - {week_end.strftime('%d.%m.%Y')})"
+        shown_start, shown_end = (start_date, end_date) if start_date and end_date else _iso_week_date_range(year, week)
+        billing_year = int(billing_year or shown_start.year)
+        return (
+            f"KW {int(week):02d}/{int(year)} - Abrechnung {int(month):02d}/{billing_year} "
+            f"({shown_start.strftime('%d.%m.%Y')} - {shown_end.strftime('%d.%m.%Y')})"
+        )
     return f"{int(month):02d}/{int(year)}"
 
 
@@ -5048,7 +5060,7 @@ def main() -> None:
     with tab2:
         st.subheader("Einsatzbericht (Web-Ansicht)")
 
-        rep_col0, rep_col1, rep_col2, rep_col3, rep_col4 = st.columns([1.2, 1, 1, 2, 1])
+        rep_col0, rep_col1, rep_col2, rep_col3, rep_col4, rep_col5 = st.columns([1.2, 1, 1, 1.4, 2, 1])
         rep_projects = sorted(list(dict.fromkeys([p for p in (lookups.get("projekte") or []) if p] + [p for p in
                                                                                                       df.get("Projekt",
                                                                                                              pd.Series(
@@ -5085,7 +5097,6 @@ def main() -> None:
                     key="rep_week",
                 )
                 week_start, week_end = _iso_week_date_range(int(r_year), int(r_week))
-                r_month = int(week_start.month)
                 st.caption(f"{week_start.strftime('%d.%m.%Y')} - {week_end.strftime('%d.%m.%Y')}")
             else:
                 r_month = st.selectbox("Monat", options=list(range(1, 13)), index=max(0, min(11, int(m_default) - 1)),
@@ -5093,25 +5104,56 @@ def main() -> None:
                 r_week = int(dt.date(int(r_year), int(r_month), 1).isocalendar().week)
                 week_start, week_end = _month_date_range(int(r_year), int(r_month))
         with rep_col3:
+            if report_period_mode == "Kalenderwoche":
+                touched_months = list(dict.fromkeys([(week_start.year, week_start.month), (week_end.year, week_end.month)]))
+                default_billing_month = (
+                    (int(y_default), int(m_default))
+                    if (int(y_default), int(m_default)) in touched_months
+                    else (week_start.year, week_start.month)
+                )
+                billing_year, r_month = st.selectbox(
+                    "Abrechnungsmonat",
+                    options=touched_months,
+                    index=touched_months.index(default_billing_month),
+                    key=f"rep_billing_month_{int(r_year)}_{int(r_week)}",
+                    format_func=lambda ym: f"{int(ym[1]):02d}/{int(ym[0])}",
+                    help="KW-Berichte werden auf diesen Monat begrenzt und laufen nicht über Monatsenden hinweg.",
+                )
+            else:
+                billing_year = int(r_year)
+                st.caption("Monatsbericht")
+        with rep_col4:
             default_project = "ABS" if "ABS" in rep_projects else (rep_projects[0] if rep_projects else "")
             r_project = st.selectbox("Projekt", options=rep_projects if rep_projects else [""], index=(
                 rep_projects.index(default_project) if default_project in rep_projects else 0), key="rep_project")
-        with rep_col4:
+        with rep_col5:
             include_abgerechnet = st.checkbox("abgerechnete einschließen", value=False)
 
         if report_period_mode == "Kalenderwoche":
-            report_start, report_end = _iso_week_date_range(int(r_year), int(r_week))
-            report_context_month = int(report_start.month)
-            report_period_label = _format_report_period_label(report_period_mode, int(r_year), int(r_month), int(r_week))
-            report_period_slug = f"{int(r_year)}-KW{int(r_week):02d}"
+            month_start, month_end = _month_date_range(int(billing_year), int(r_month))
+            report_start = max(week_start, month_start)
+            report_end = min(week_end, month_end)
+            report_context_year = int(billing_year)
+            report_context_month = int(r_month)
+            report_period_label = _format_report_period_label(
+                report_period_mode,
+                int(r_year),
+                int(r_month),
+                int(r_week),
+                start_date=report_start,
+                end_date=report_end,
+                billing_year=report_context_year,
+            )
+            report_period_slug = f"{int(r_year)}-KW{int(r_week):02d}_{report_context_year}-{int(r_month):02d}"
             report_df = _build_report_for_date_range(
                 df, lookups, report_start, report_end, r_project, include_abgerechnet
             )
             ytd_df = _build_report_for_date_range(
-                df, lookups, dt.date(int(r_year), 1, 1), report_end, r_project, include_abgerechnet
+                df, lookups, dt.date(report_context_year, 1, 1), report_end, r_project, include_abgerechnet
             )
         else:
             report_start, report_end = _month_date_range(int(r_year), int(r_month))
+            report_context_year = int(r_year)
             report_context_month = int(r_month)
             report_period_label = _format_report_period_label(report_period_mode, int(r_year), int(r_month), int(r_week))
             report_period_slug = f"{int(r_year)}-{int(r_month):02d}"
@@ -5235,7 +5277,7 @@ def main() -> None:
         with b1:
             if st.button("Original in Excel öffnen", key="open_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
-                    data.path, int(r_year), report_context_month, r_project, action="open", report_df=report_df,
+                    data.path, report_context_year, report_context_month, r_project, action="open", report_df=report_df,
                     consultant=report_consultant
                 )
                 (st.success if ok else st.error)(msg)
@@ -5247,7 +5289,7 @@ def main() -> None:
                     pdf_target = (Path.cwd() / pdf_target).resolve()
 
                 ok, msg, exported_files = _excel_original_report_action(
-                    data.path, int(r_year), report_context_month, r_project, action="pdf", pdf_output_path=pdf_target,
+                    data.path, report_context_year, report_context_month, r_project, action="pdf", pdf_output_path=pdf_target,
                     report_df=report_df, consultant=report_consultant
                 )
                 if ok:
@@ -5275,7 +5317,7 @@ def main() -> None:
                     xlsx_target = (Path.cwd() / xlsx_target).resolve()
 
                 ok, msg, exported_files = _excel_original_report_action(
-                    data.path, int(r_year), report_context_month, r_project, action="xlsx", xlsx_output_path=xlsx_target,
+                    data.path, report_context_year, report_context_month, r_project, action="xlsx", xlsx_output_path=xlsx_target,
                     report_df=report_df, consultant=report_consultant
                 )
                 if ok:
@@ -5299,7 +5341,7 @@ def main() -> None:
         with b4:
             if st.button("Original direkt drucken", key="print_original_excel"):
                 ok, msg, _ = _excel_original_report_action(
-                    data.path, int(r_year), report_context_month, r_project, action="print", report_df=report_df,
+                    data.path, report_context_year, report_context_month, r_project, action="print", report_df=report_df,
                     consultant=report_consultant
                 )
                 (st.success if ok else st.error)(msg)
@@ -5425,7 +5467,7 @@ def main() -> None:
                 with st.spinner("Einsatzbericht wird vorbereitet und via IMS eingereicht..."):
                     ok_export, export_msg, ims_payload_files = _excel_original_report_action(
                         data.path,
-                        int(r_year),
+                        report_context_year,
                         report_context_month,
                         r_project,
                         action="xlsx",
