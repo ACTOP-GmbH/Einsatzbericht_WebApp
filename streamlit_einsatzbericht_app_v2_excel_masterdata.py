@@ -1033,11 +1033,6 @@ def _excel_original_report_action_fallback(
 ) -> Tuple[bool, str, List[Path]]:
     """Cross-Platform Fallback (macOS / Linux / fallback for Windows without win32com)."""
     try:
-        wb = openpyxl.load_workbook(xlsx_path)
-        if "Einsatzbericht" not in wb.sheetnames:
-            return False, "Blatt 'Einsatzbericht' nicht gefunden.", []
-        ws = wb["Einsatzbericht"]
-
         pages = _split_report_pages(report_df)
         if not pages:
             pages = [pd.DataFrame()]
@@ -1058,25 +1053,60 @@ def _excel_original_report_action_fallback(
             xlsx_output_path.parent.mkdir(parents=True, exist_ok=True)
 
         for page_idx, page_df in enumerate(pages, start=1):
-            if report_df is not None:
-                _write_original_report_page_openpyxl(ws, page_df, year, month, project, consultant, report_km_total)
-            else:
-                _set_original_report_context_openpyxl(ws, year, month, project, consultant)
-                _prepare_report_formula_in_excel_sheet_openpyxl(ws)
+            wb = openpyxl.load_workbook(xlsx_path)
+            try:
+                if "Einsatzbericht" not in wb.sheetnames:
+                    return False, "Blatt 'Einsatzbericht' nicht gefunden.", []
+                ws = wb["Einsatzbericht"]
 
-            if action == "xlsx":
-                if page_count > 1:
-                    out_path = xlsx_output_path.with_name(
-                        f"{xlsx_output_path.stem}_{page_idx:02d}{xlsx_output_path.suffix}")
+                if report_df is not None:
+                    _write_original_report_page_openpyxl(ws, page_df, year, month, project, consultant, report_km_total)
                 else:
-                    out_path = xlsx_output_path
-                wb.save(out_path)
-                exported_files.append(out_path)
+                    _set_original_report_context_openpyxl(ws, year, month, project, consultant)
+                    _prepare_report_formula_in_excel_sheet_openpyxl(ws)
 
-            elif action == "open":
-                tmp_dir = Path(tempfile.gettempdir())
-                tmp_file = tmp_dir / f"Einsatzbericht_Temp_{project}_{year}-{int(month):02d}_{page_idx:02d}.xlsx"
-                wb.save(tmp_file)
+                if action == "xlsx":
+                    if page_count > 1:
+                        out_path = xlsx_output_path.with_name(
+                            f"{xlsx_output_path.stem}_{page_idx:02d}{xlsx_output_path.suffix}")
+                    else:
+                        out_path = xlsx_output_path
+                    wb.save(out_path)
+                    exported_files.append(out_path)
+
+                elif action == "open":
+                    tmp_dir = Path(tempfile.gettempdir())
+                    tmp_file = tmp_dir / f"Einsatzbericht_Temp_{project}_{year}-{int(month):02d}_{page_idx:02d}.xlsx"
+                    wb.save(tmp_file)
+
+                elif action == "pdf":
+                    if not is_mac:
+                        return False, "Direkter PDF-Export erfordert Windows (pywin32) oder macOS (AppleScript).", []
+
+                    if page_count > 1:
+                        out_path = pdf_output_path.with_name(
+                            f"{pdf_output_path.stem}_{page_idx:02d}{pdf_output_path.suffix}")
+                    else:
+                        out_path = pdf_output_path
+
+                    tmp_file = Path(tempfile.gettempdir()) / f"tmp_pdf_export_{page_idx}.xlsx"
+                    wb.save(tmp_file)
+
+                elif action == "print":
+                    if not is_mac:
+                        return False, "Direkter Druck erfordert Windows (pywin32) oder macOS (AppleScript).", []
+                    tmp_file = Path(tempfile.gettempdir()) / f"tmp_print_export_{page_idx}.xlsx"
+                    wb.save(tmp_file)
+
+                else:
+                    return False, f"Unbekannte Aktion: {action}", []
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+
+            if action == "open":
                 if is_mac:
                     subprocess.call(["open", str(tmp_file)])
                 elif sys.platform == "win32":
@@ -1086,18 +1116,6 @@ def _excel_original_report_action_fallback(
                 exported_files.append(tmp_file)
 
             elif action == "pdf":
-                if not is_mac:
-                    return False, "Direkter PDF-Export erfordert Windows (pywin32) oder macOS (AppleScript).", []
-
-                if page_count > 1:
-                    out_path = pdf_output_path.with_name(
-                        f"{pdf_output_path.stem}_{page_idx:02d}{pdf_output_path.suffix}")
-                else:
-                    out_path = pdf_output_path
-
-                tmp_file = Path(tempfile.gettempdir()) / f"tmp_pdf_export_{page_idx}.xlsx"
-                wb.save(tmp_file)
-
                 script = f'''
                 tell application "Microsoft Excel"
                     open (POSIX file "{tmp_file.resolve()}")
@@ -1109,10 +1127,6 @@ def _excel_original_report_action_fallback(
                 exported_files.append(out_path)
 
             elif action == "print":
-                if not is_mac:
-                    return False, "Direkter Druck erfordert Windows (pywin32) oder macOS (AppleScript).", []
-                tmp_file = Path(tempfile.gettempdir()) / f"tmp_print_export_{page_idx}.xlsx"
-                wb.save(tmp_file)
                 script = f'''
                 tell application "Microsoft Excel"
                     open (POSIX file "{tmp_file.resolve()}")
@@ -1124,10 +1138,14 @@ def _excel_original_report_action_fallback(
 
         if action == "pdf":
             msg = f"{page_count} PDFs exportiert" if page_count > 1 else "PDF exportiert"
-            return True, f"{msg}", exported_files
+            if page_count > 1:
+                msg += f" ({REPORT_ROWS_PER_PAGE} Positionen pro Formularseite)"
+            return True, msg, exported_files
         elif action == "xlsx":
             msg = f"{page_count} Excel-Kopien exportiert" if page_count > 1 else "Excel-Kopie exportiert"
-            return True, f"{msg}", exported_files
+            if page_count > 1:
+                msg += f" ({REPORT_ROWS_PER_PAGE} Positionen pro Formularseite)"
+            return True, msg, exported_files
         elif action == "open":
             return True, f"Datei(en) geöffnet ({len(exported_files)} Seite(n) vorbereitet).", exported_files
         elif action == "print":
