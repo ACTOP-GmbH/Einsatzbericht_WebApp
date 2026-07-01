@@ -26,6 +26,7 @@ USER_DATA_SHEETS = [
     "Meilensteine",
     "Benutzerrechte",
     "Projektrollen",
+    "Stundenanteile",
 ]
 DASHBOARD_SHEET = "Dashboard"
 REPORT_SHEET = "Einsatzbericht"

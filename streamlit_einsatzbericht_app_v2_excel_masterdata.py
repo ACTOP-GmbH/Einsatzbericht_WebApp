@@ -58,6 +58,9 @@ USER_RIGHTS_SHEET = "Benutzerrechte"
 PROJECT_ROLES_SHEET = "Projektrollen"
 USER_RIGHTS_COLS = ["Mitarbeiter", "Ansicht"]
 PROJECT_ROLE_COLS = ["Mitarbeiter", "Projekt", "Rolle"]
+HOUR_ALLOCATIONS_SHEET = "Stundenanteile"
+HOUR_ALLOCATION_COLS = ["Tätigkeit_ID", "Mitarbeiter", "Stunden", "Kommentar"]
+HOUR_ALLOCATION_ACTIVITY_ID_ALIASES = ["Tätigkeit_ID", "Taetigkeit_ID", "TÃ¤tigkeit_ID", "T?tigkeit_ID"]
 VIEW_MODE_EMPLOYEE = "Mitarbeiter"
 VIEW_MODE_CONTROLLER = "Controller"
 PROJECT_USES_CODING_COL = 15
@@ -97,6 +100,7 @@ class WorkbookData:
     milestones_df: pd.DataFrame
     user_rights_df: pd.DataFrame
     project_roles_df: pd.DataFrame
+    hour_allocations_df: pd.DataFrame
 
 
 # ------------------------- parsing helpers -------------------------
@@ -1389,9 +1393,10 @@ def load_workbook_data(path_str: str) -> WorkbookData:
         milestones_df = _read_milestones_df(wb)
         user_rights_df = _read_user_rights_df(wb)
         project_roles_df = _read_project_roles_df(wb)
+        hour_allocations_df = _read_hour_allocations_df(wb)
         return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, team_df=team_df, lookups=lookups,
                             milestones_df=milestones_df, user_rights_df=user_rights_df,
-                            project_roles_df=project_roles_df)
+                            project_roles_df=project_roles_df, hour_allocations_df=hour_allocations_df)
     finally:
         try:
             wb.close()
@@ -1410,6 +1415,7 @@ def _cached_load_workbook_data(path_str: str, modified_time: float, refresh_nonc
         data.milestones_df,
         data.user_rights_df,
         data.project_roles_df,
+        data.hour_allocations_df,
     )
 
 
@@ -1422,6 +1428,7 @@ def _workbook_data_from_cached_payload(payload: tuple) -> WorkbookData:
         milestones_df,
         user_rights_df,
         project_roles_df,
+        hour_allocations_df,
     ) = payload
     return WorkbookData(
         path=Path(path_str),
@@ -1431,6 +1438,7 @@ def _workbook_data_from_cached_payload(payload: tuple) -> WorkbookData:
         milestones_df=milestones_df,
         user_rights_df=user_rights_df,
         project_roles_df=project_roles_df,
+        hour_allocations_df=hour_allocations_df,
     )
 
 
@@ -1858,10 +1866,84 @@ def _read_project_roles_df(wb: openpyxl.Workbook) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=PROJECT_ROLE_COLS)
 
 
+def _hour_allocation_activity_id_column(df: pd.DataFrame) -> Optional[str]:
+    if df is None:
+        return None
+    for column in HOUR_ALLOCATION_ACTIVITY_ID_ALIASES:
+        if column in df.columns:
+            return column
+    return None
+
+
+def _read_hour_allocations_df(wb: openpyxl.Workbook) -> pd.DataFrame:
+    if HOUR_ALLOCATIONS_SHEET not in wb.sheetnames:
+        return pd.DataFrame(columns=HOUR_ALLOCATION_COLS)
+
+    ws = wb[HOUR_ALLOCATIONS_SHEET]
+    rows: List[Dict[str, Any]] = []
+    for row in ws.iter_rows(min_row=2, max_col=4, values_only=True):
+        try:
+            activity_id = int(float(_row_value(row, 1)))
+        except Exception:
+            continue
+        mitarbeiter = _safe_str(_row_value(row, 2)).strip()
+        hours = _to_float_or_none(_row_value(row, 3))
+        kommentar = _safe_str(_row_value(row, 4)).strip()
+        if not mitarbeiter or hours is None or hours <= 0:
+            continue
+        rows.append({
+            "Tätigkeit_ID": activity_id,
+            "Mitarbeiter": mitarbeiter,
+            "Stunden": round(float(hours), 4),
+            "Kommentar": kommentar,
+        })
+    return pd.DataFrame(rows, columns=HOUR_ALLOCATION_COLS)
+
+
+def _write_hour_allocations(wb: openpyxl.Workbook, rows: List[Dict[str, Any]]) -> None:
+    cleaned_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            activity_id = int(float(row.get("Tätigkeit_ID")))
+        except Exception:
+            continue
+        mitarbeiter = _safe_str(row.get("Mitarbeiter")).strip()
+        hours = _to_float_or_none(row.get("Stunden"))
+        kommentar = _safe_str(row.get("Kommentar")).strip()
+        if not mitarbeiter or hours is None or hours <= 0:
+            continue
+        cleaned_rows.append({
+            "Tätigkeit_ID": activity_id,
+            "Mitarbeiter": mitarbeiter,
+            "Stunden": round(float(hours), 4),
+            "Kommentar": kommentar,
+        })
+
+    ws = _ensure_table_sheet(wb, HOUR_ALLOCATIONS_SHEET, HOUR_ALLOCATION_COLS)
+    _rewrite_table_sheet(ws, HOUR_ALLOCATION_COLS, cleaned_rows)
+
+
+def _remove_hour_allocations_for_activity_ids(wb: openpyxl.Workbook, activity_ids: List[int]) -> None:
+    if HOUR_ALLOCATIONS_SHEET not in wb.sheetnames:
+        return
+    remove_ids = {int(value) for value in activity_ids}
+    existing_rows = _read_hour_allocations_df(wb).to_dict("records")
+    kept_rows = []
+    for row in existing_rows:
+        try:
+            activity_id = int(float(row.get("Tätigkeit_ID") or 0))
+        except Exception:
+            activity_id = 0
+        if activity_id not in remove_ids:
+            kept_rows.append(row)
+    _write_hour_allocations(wb, kept_rows)
+
+
 def _collect_known_users(
         user_rights_df: pd.DataFrame,
         project_roles_df: pd.DataFrame,
         team_df: pd.DataFrame,
+        hour_allocations_df: Optional[pd.DataFrame],
         fallback_user: str,
 ) -> List[str]:
     names: List[str] = []
@@ -1877,6 +1959,8 @@ def _collect_known_users(
     _extend_from_df(user_rights_df, "Mitarbeiter")
     _extend_from_df(project_roles_df, "Mitarbeiter")
     _extend_from_df(team_df, "Mitarbeiter")
+    if hour_allocations_df is not None:
+        _extend_from_df(hour_allocations_df, "Mitarbeiter")
 
     explicit_fallback = _safe_str(fallback_user).strip()
     if explicit_fallback and explicit_fallback.casefold() != "ich":
@@ -2982,7 +3066,7 @@ def _viz_base_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(
             columns=["Datum_dt", "Year", "Month", "YM", "YM_dt", "Projekt", "Tätigkeit", "Hours", "Abgerechnet", "km",
-                     "Kodierung", "Info", "Interne Projekte", "Mitarbeiter"])
+                     "Kodierung", "Info", "Interne Projekte", "Mitarbeiter", "_excel_row"])
 
     x = df.copy()
     x["Datum_dt"] = pd.to_datetime(x["Datum"], errors="coerce")
@@ -3018,7 +3102,87 @@ def _viz_base_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Mitarbeiter" not in x.columns:
         x["Mitarbeiter"] = "Ich (Eigene)"
     x["Mitarbeiter"] = x["Mitarbeiter"].fillna("Unbekannt")
+    if "Stundenquelle" not in x.columns:
+        x["Stundenquelle"] = "Fakturiert"
+    if "Fakturiert unter" not in x.columns:
+        x["Fakturiert unter"] = x["Mitarbeiter"]
+    if "Stundenanteil Kommentar" not in x.columns:
+        x["Stundenanteil Kommentar"] = ""
 
+    return x
+
+
+def _apply_hour_allocations_to_viz_base(
+        base: pd.DataFrame,
+        hour_allocations_df: pd.DataFrame,
+        owner_name: str,
+) -> pd.DataFrame:
+    if base is None or base.empty or hour_allocations_df is None or hour_allocations_df.empty:
+        return base
+    if "_excel_row" not in base.columns:
+        return base
+
+    owner_name = _safe_str(owner_name).strip() or "Ich"
+    allocations = hour_allocations_df.copy()
+    activity_id_col = _hour_allocation_activity_id_column(allocations)
+    if activity_id_col is None:
+        return base
+    if activity_id_col != "Tätigkeit_ID":
+        allocations["Tätigkeit_ID"] = allocations[activity_id_col]
+    allocations["Tätigkeit_ID"] = pd.to_numeric(allocations["Tätigkeit_ID"], errors="coerce")
+    allocations["Stunden"] = pd.to_numeric(allocations.get("Stunden"), errors="coerce")
+    allocations = allocations.dropna(subset=["Tätigkeit_ID", "Stunden"])
+    allocations = allocations[allocations["Stunden"] > 0].copy()
+    if allocations.empty:
+        return base
+    allocations["Tätigkeit_ID"] = allocations["Tätigkeit_ID"].astype(int)
+    allocations["Mitarbeiter"] = allocations["Mitarbeiter"].fillna("").astype(str).str.strip()
+    allocations = allocations[allocations["Mitarbeiter"] != ""]
+    if allocations.empty:
+        return base
+
+    x = base.copy()
+    x["_excel_row_num"] = pd.to_numeric(x["_excel_row"], errors="coerce")
+    new_rows: List[pd.Series] = []
+
+    for activity_id, group in allocations.groupby("Tätigkeit_ID", sort=False):
+        matches = x[
+            (x["_excel_row_num"] == int(activity_id))
+            & (x["Mitarbeiter"].astype(str).str.strip() == owner_name)
+        ]
+        if matches.empty:
+            continue
+        source_idx = matches.index[0]
+        source_hours = float(x.at[source_idx, "Hours"] or 0.0)
+        if source_hours <= 0:
+            continue
+
+        remaining = source_hours
+        allocated_total = 0.0
+        for _, allocation in group.iterrows():
+            allocation_hours = min(float(allocation.get("Stunden") or 0.0), remaining)
+            if allocation_hours <= 0:
+                continue
+            remaining -= allocation_hours
+            allocated_total += allocation_hours
+
+            new_row = x.loc[source_idx].copy()
+            new_row["Hours"] = round(allocation_hours, 4)
+            new_row["Mitarbeiter"] = _safe_str(allocation.get("Mitarbeiter")).strip()
+            new_row["Stundenquelle"] = "Stundenanteil"
+            new_row["Fakturiert unter"] = owner_name
+            new_row["Stundenanteil Kommentar"] = _safe_str(allocation.get("Kommentar")).strip()
+            new_rows.append(new_row)
+
+        if allocated_total > 0:
+            x.at[source_idx, "Hours"] = round(max(source_hours - allocated_total, 0.0), 4)
+            x.at[source_idx, "Stundenquelle"] = "Fakturiert Rest"
+            x.at[source_idx, "Fakturiert unter"] = owner_name
+
+    x = x.drop(columns=["_excel_row_num"])
+    if new_rows:
+        additions = pd.DataFrame(new_rows).drop(columns=["_excel_row_num"], errors="ignore")
+        x = pd.concat([x, additions], ignore_index=True)
     return x
 
 
@@ -3180,6 +3344,7 @@ def _render_chart_block(
 def _render_visualisierung_tab(
         df: pd.DataFrame,
         team_df: pd.DataFrame,
+        hour_allocations_df: pd.DataFrame,
         lookups: Dict[str, Any],
         xlsx_path: Path,
         milestones_df: pd.DataFrame,
@@ -3199,7 +3364,27 @@ def _render_visualisierung_tab(
     else:
         combined_df = my_df
 
-    base = _viz_base_df(combined_df)
+    billed_base = _viz_base_df(combined_df)
+    if hour_allocations_df is not None and not hour_allocations_df.empty:
+        hour_view = st.radio(
+            "Stundensicht",
+            options=["Leistungssicht", "Fakturierte Sicht"],
+            index=0,
+            horizontal=True,
+            help=(
+                "Leistungssicht verteilt gepflegte Stundenanteile auf die tatsächlichen Mitarbeiter. "
+                "Fakturierte Sicht zeigt die Daten so, wie sie im Einsatzbericht abgerechnet werden."
+            ),
+            key=f"viz_hour_view_{'controller' if is_controller else 'employee'}_{own_label}",
+        )
+    else:
+        hour_view = "Fakturierte Sicht"
+
+    if hour_view == "Leistungssicht":
+        base = _apply_hour_allocations_to_viz_base(billed_base, hour_allocations_df, own_label)
+    else:
+        base = billed_base
+
     if base.empty:
         st.info("Keine Daten vorhanden.")
         return
@@ -3930,6 +4115,7 @@ def _render_visualisierung_tab(
     st.markdown("### Detail (optional)")
     with st.expander("Rohdaten anzeigen"):
         show_cols = ["Mitarbeiter", "Datum_dt", "Projekt", "Tätigkeit", "Hours", "km", "Kodierung",
+                     "Stundenquelle", "Fakturiert unter", "Stundenanteil Kommentar",
                      "Interne Projekte", "Info", "Abgerechnet"]
         show_cols = [c for c in show_cols if c in x.columns]
         st.dataframe(x[show_cols].sort_values(["Datum_dt", "Mitarbeiter"], ascending=[False, True]),
@@ -4021,6 +4207,7 @@ def main() -> None:
         user_rights_df=user_rights_df,
         project_roles_df=project_roles_df,
         team_df=team_df,
+        hour_allocations_df=data.hour_allocations_df,
         fallback_user=_safe_str(st.session_state.get("active_user_name", "")),
     )
     remembered_user = _safe_str(st.session_state.get("active_user_name", "")).strip()
@@ -4578,6 +4765,8 @@ def main() -> None:
                     ws = wb[TAETIGKEITEN_SHEET]
                     for r in deletes:
                         _clear_taetigkeit_row(ws, r)
+                    if deletes:
+                        _remove_hour_allocations_for_activity_ids(wb, deletes)
                     for r, rec in updates:
                         _write_taetigkeit_row(ws, r, rec)
                     row_idx = _find_next_write_row(ws, key_cols=KEY_COLS_FOR_EMPTY_CHECK)
@@ -4601,6 +4790,143 @@ def main() -> None:
 
         st.markdown("---")
         st.caption("Neue Tätigkeiten und Änderungen bitte direkt in der Tabelle oben erfassen.")
+
+        st.markdown("### Stundenanteile")
+        st.caption(
+            "Diese Zuordnung beeinflusst nur Visualisierung/Controlling. "
+            "Der Einsatzbericht und die Abrechnung bleiben unverändert."
+        )
+        allocation_source_df = filtered.copy()
+        if not allocation_source_df.empty and "_excel_row" in allocation_source_df.columns:
+            allocation_source_df = allocation_source_df[allocation_source_df["_excel_row"].notna()].copy()
+        if allocation_source_df.empty:
+            st.info("Keine gespeicherten Tätigkeiten im aktuellen Filter für Stundenanteile verfügbar.")
+        else:
+            allocation_source_df["_label"] = allocation_source_df.apply(
+                lambda r: (
+                    f"{int(r.get('_excel_row'))} | {_format_date(r.get('Datum')) or '-'} | "
+                    f"{_safe_str(r.get('Projekt')).strip() or '-'} | "
+                    f"{_format_time(r.get('Zeit von')) or '--:--'}-{_format_time(r.get('Zeit bis')) or '--:--'} | "
+                    f"{float(r.get('Zahl') or 0):.2f} h | {_safe_str(r.get('Info')).strip()[:80]}"
+                ),
+                axis=1,
+            )
+            allocation_options = allocation_source_df["_label"].tolist()
+            selected_allocation_label = st.selectbox(
+                "Tätigkeit für Stundenanteile",
+                options=allocation_options,
+                key="hour_allocation_activity_select",
+            )
+            selected_activity_row = allocation_source_df[
+                allocation_source_df["_label"] == selected_allocation_label
+            ].iloc[0]
+            selected_activity_id = int(selected_activity_row["_excel_row"])
+            selected_activity_hours = float(selected_activity_row.get("Zahl") or 0.0)
+
+            existing_allocations = data.hour_allocations_df.copy()
+            if existing_allocations.empty:
+                existing_allocations = pd.DataFrame(columns=HOUR_ALLOCATION_COLS)
+            existing_selected = existing_allocations[
+                pd.to_numeric(existing_allocations.get("Tätigkeit_ID"), errors="coerce") == selected_activity_id
+            ].copy()
+
+            allocation_editor_df = existing_selected[["Mitarbeiter", "Stunden", "Kommentar"]].copy()
+            if allocation_editor_df.empty:
+                allocation_editor_df = pd.DataFrame(columns=["Mitarbeiter", "Stunden", "Kommentar"])
+            allocation_editor_df["Löschen"] = False
+
+            allocation_user_options = sorted(list(dict.fromkeys(
+                [u for u in known_users if _safe_str(u).strip()]
+                + [u for u in existing_allocations.get("Mitarbeiter", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                   if _safe_str(u).strip()]
+            )))
+
+            allocation_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
+            edited_allocations = allocation_editor_fn(
+                allocation_editor_df[["Mitarbeiter", "Stunden", "Kommentar", "Löschen"]],
+                key=f"hour_allocations_editor_{selected_activity_id}",
+                use_container_width=True,
+                height=180,
+                num_rows="dynamic",
+                hide_index=True,
+                column_config={
+                    "Mitarbeiter": st.column_config.SelectboxColumn(
+                        "Mitarbeiter",
+                        options=allocation_user_options or [""],
+                        required=True,
+                    ),
+                    "Stunden": st.column_config.NumberColumn(
+                        "Stunden",
+                        min_value=0.0,
+                        step=0.25,
+                        format="%.2f",
+                        required=True,
+                    ),
+                    "Kommentar": st.column_config.TextColumn("Kommentar", width="large"),
+                    "Löschen": st.column_config.CheckboxColumn("Löschen", default=False),
+                },
+            )
+
+            allocated_sum = float(
+                pd.to_numeric(
+                    edited_allocations.loc[~edited_allocations["Löschen"].fillna(False), "Stunden"],
+                    errors="coerce",
+                ).fillna(0).sum()
+            ) if not edited_allocations.empty else 0.0
+            st.caption(
+                f"Tätigkeit gesamt: {selected_activity_hours:.2f} h | "
+                f"zugeordnet: {allocated_sum:.2f} h | "
+                f"Rest beim fakturierten Mitarbeiter: {max(selected_activity_hours - allocated_sum, 0):.2f} h"
+            )
+
+            if st.button("Stundenanteile speichern", key=f"save_hour_allocations_{selected_activity_id}"):
+                new_rows_for_activity: List[Dict[str, Any]] = []
+                errors: List[str] = []
+                for _, row in edited_allocations.iterrows():
+                    if bool(row.get("Löschen", False)):
+                        continue
+                    mitarbeiter = _safe_str(row.get("Mitarbeiter")).strip()
+                    hours = _to_float_or_none(row.get("Stunden"))
+                    kommentar = _safe_str(row.get("Kommentar")).strip()
+                    if not mitarbeiter and (hours is None or hours <= 0) and not kommentar:
+                        continue
+                    if not mitarbeiter:
+                        errors.append("Mitarbeiter fehlt.")
+                        continue
+                    if hours is None or hours <= 0:
+                        errors.append(f"Stunden für {mitarbeiter} müssen größer 0 sein.")
+                        continue
+                    new_rows_for_activity.append({
+                        "Tätigkeit_ID": selected_activity_id,
+                        "Mitarbeiter": mitarbeiter,
+                        "Stunden": round(float(hours), 4),
+                        "Kommentar": kommentar,
+                    })
+
+                total_new_hours = sum(float(row["Stunden"]) for row in new_rows_for_activity)
+                if total_new_hours > selected_activity_hours + 0.0001:
+                    errors.append(
+                        f"Zuordnung ({total_new_hours:.2f} h) ist größer als die Tätigkeit ({selected_activity_hours:.2f} h)."
+                    )
+                if errors:
+                    st.error("\n".join(errors))
+                    st.stop()
+
+                kept_rows = [
+                    row for row in existing_allocations.to_dict("records")
+                    if int(float(row.get("Tätigkeit_ID") or 0)) != selected_activity_id
+                ]
+                all_allocation_rows = kept_rows + new_rows_for_activity
+
+                def _mutator_hour_allocations(wb):
+                    _write_hour_allocations(wb, all_allocation_rows)
+
+                ok, msg = _save_workbook(data.path, _mutator_hour_allocations)
+                if ok:
+                    st.success(f"Stundenanteile gespeichert. {msg}")
+                    _refresh_after_workbook_change()
+                else:
+                    st.error(msg)
 
         st.markdown("---")
         st.markdown("### Schnellaktion")
@@ -5847,6 +6173,7 @@ def main() -> None:
         _render_visualisierung_tab(
             df,
             team_df,
+            data.hour_allocations_df,
             lookups,
             data.path,
             data.milestones_df,
