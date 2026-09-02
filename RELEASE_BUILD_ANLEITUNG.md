@@ -84,6 +84,14 @@ dann fehlt PyInstaller in der lokalen `.venv`. Einmalig installieren:
 .\.venv\Scripts\python.exe -m pip install pyinstaller
 ```
 
+Vor einem Windows-Release die komplette Laufzeitumgebung installieren bzw. aktualisieren:
+
+```bat
+.\.venv\Scripts\python.exe -m pip install streamlit pandas pytz openpyxl pywin32 pyinstaller
+```
+
+`pytz` muss dabei explizit vorhanden sein. Pandas prueft die Versionsmetadaten dieses Pakets auch dann, wenn nur Zeitzonendaten benoetigt werden.
+
 ## Release bauen
 
 ### Variante A: Bisheriger CMD-Ablauf mit globalem PyInstaller
