@@ -8,8 +8,13 @@ datas = [
 ]
 datas += collect_data_files("streamlit")
 datas += copy_metadata("streamlit")
+# pandas checks the optional pytz package at runtime. Bundle the package and
+# its distribution metadata together so frozen builds do not expose only data.
+datas += collect_data_files("pytz")
+datas += copy_metadata("pytz")
 
 hiddenimports = [
+    "pytz",
     "streamlit.runtime.scriptrunner.magic_funcs",
     "tkinter",
     "tkinter.messagebox",
