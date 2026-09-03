@@ -6263,7 +6263,10 @@ def main() -> None:
 
             rights_editor_df = user_rights_df.copy()
             if rights_editor_df.empty:
-                rights_editor_df = pd.DataFrame(columns=USER_RIGHTS_COLS)
+                rights_editor_df = pd.DataFrame([{
+                    "Mitarbeiter": _safe_str(active_user).strip() or _report_consultant_name(""),
+                    "Ansicht": VIEW_MODE_CONTROLLER,
+                }], columns=USER_RIGHTS_COLS)
             for c in USER_RIGHTS_COLS:
                 if c not in rights_editor_df.columns:
                     rights_editor_df[c] = ""
@@ -6301,7 +6304,9 @@ def main() -> None:
                         "Ansicht": _normalize_view_mode(r.get("Ansicht")),
                     })
 
-                if rights_rows and not any(r["Ansicht"] == VIEW_MODE_CONTROLLER for r in rights_rows):
+                if not rights_rows:
+                    st.error("Mindestens ein Benutzer muss gespeichert werden.")
+                elif not any(r["Ansicht"] == VIEW_MODE_CONTROLLER for r in rights_rows):
                     st.error("Mindestens ein Benutzer muss im Controller-Modus bleiben.")
                 else:
                     def _mutator_user_rights(wb):
