@@ -61,6 +61,10 @@ PROJECT_ROLE_COLS = ["Mitarbeiter", "Projekt", "Rolle"]
 HOUR_ALLOCATIONS_SHEET = "Stundenanteile"
 HOUR_ALLOCATION_COLS = ["Tätigkeit_ID", "Mitarbeiter", "Stunden", "Kommentar"]
 HOUR_ALLOCATION_ACTIVITY_ID_ALIASES = ["Tätigkeit_ID", "Taetigkeit_ID", "TÃ¤tigkeit_ID", "T?tigkeit_ID"]
+MONTHLY_HOUR_ALLOCATIONS_SHEET = "Pauschale Fremdstunden"
+MONTHLY_HOUR_ALLOCATION_COLS = [
+    "Jahr", "Monat", "Projekt", "Mitarbeiter", "Stunden", "Kommentar", "Fakturiert unter"
+]
 VIEW_MODE_EMPLOYEE = "Mitarbeiter"
 VIEW_MODE_CONTROLLER = "Controller"
 PROJECT_USES_CODING_COL = 15
@@ -101,6 +105,7 @@ class WorkbookData:
     user_rights_df: pd.DataFrame
     project_roles_df: pd.DataFrame
     hour_allocations_df: pd.DataFrame
+    monthly_hour_allocations_df: pd.DataFrame
 
 
 # ------------------------- parsing helpers -------------------------
@@ -1394,9 +1399,11 @@ def load_workbook_data(path_str: str) -> WorkbookData:
         user_rights_df = _read_user_rights_df(wb)
         project_roles_df = _read_project_roles_df(wb)
         hour_allocations_df = _read_hour_allocations_df(wb)
+        monthly_hour_allocations_df = _read_monthly_hour_allocations_df(wb)
         return WorkbookData(path=path, taetigkeiten_df=taetigkeiten_df, team_df=team_df, lookups=lookups,
                             milestones_df=milestones_df, user_rights_df=user_rights_df,
-                            project_roles_df=project_roles_df, hour_allocations_df=hour_allocations_df)
+                            project_roles_df=project_roles_df, hour_allocations_df=hour_allocations_df,
+                            monthly_hour_allocations_df=monthly_hour_allocations_df)
     finally:
         try:
             wb.close()
@@ -1416,6 +1423,7 @@ def _cached_load_workbook_data(path_str: str, modified_time: float, refresh_nonc
         data.user_rights_df,
         data.project_roles_df,
         data.hour_allocations_df,
+        data.monthly_hour_allocations_df,
     )
 
 
@@ -1429,6 +1437,7 @@ def _workbook_data_from_cached_payload(payload: tuple) -> WorkbookData:
         user_rights_df,
         project_roles_df,
         hour_allocations_df,
+        monthly_hour_allocations_df,
     ) = payload
     return WorkbookData(
         path=Path(path_str),
@@ -1439,6 +1448,7 @@ def _workbook_data_from_cached_payload(payload: tuple) -> WorkbookData:
         user_rights_df=user_rights_df,
         project_roles_df=project_roles_df,
         hour_allocations_df=hour_allocations_df,
+        monthly_hour_allocations_df=monthly_hour_allocations_df,
     )
 
 
@@ -1923,6 +1933,70 @@ def _write_hour_allocations(wb: openpyxl.Workbook, rows: List[Dict[str, Any]]) -
     _rewrite_table_sheet(ws, HOUR_ALLOCATION_COLS, cleaned_rows)
 
 
+def _read_monthly_hour_allocations_df(wb: openpyxl.Workbook) -> pd.DataFrame:
+    if MONTHLY_HOUR_ALLOCATIONS_SHEET not in wb.sheetnames:
+        return pd.DataFrame(columns=MONTHLY_HOUR_ALLOCATION_COLS)
+
+    ws = wb[MONTHLY_HOUR_ALLOCATIONS_SHEET]
+    rows: List[Dict[str, Any]] = []
+    for row in ws.iter_rows(min_row=2, max_col=len(MONTHLY_HOUR_ALLOCATION_COLS), values_only=True):
+        try:
+            year = int(float(_row_value(row, 1)))
+            month = int(float(_row_value(row, 2)))
+        except Exception:
+            continue
+        project = _safe_str(_row_value(row, 3)).strip()
+        mitarbeiter = _safe_str(_row_value(row, 4)).strip()
+        hours = _to_float_or_none(_row_value(row, 5))
+        kommentar = _safe_str(_row_value(row, 6)).strip()
+        billed_under = _safe_str(_row_value(row, 7)).strip()
+        if not (2000 <= year <= 2100) or not (1 <= month <= 12):
+            continue
+        if not project or not mitarbeiter or hours is None or hours <= 0:
+            continue
+        rows.append({
+            "Jahr": year,
+            "Monat": month,
+            "Projekt": project,
+            "Mitarbeiter": mitarbeiter,
+            "Stunden": round(float(hours), 4),
+            "Kommentar": kommentar,
+            "Fakturiert unter": billed_under,
+        })
+    return pd.DataFrame(rows, columns=MONTHLY_HOUR_ALLOCATION_COLS)
+
+
+def _write_monthly_hour_allocations(wb: openpyxl.Workbook, rows: List[Dict[str, Any]]) -> None:
+    cleaned_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            year = int(float(row.get("Jahr")))
+            month = int(float(row.get("Monat")))
+        except Exception:
+            continue
+        project = _safe_str(row.get("Projekt")).strip()
+        mitarbeiter = _safe_str(row.get("Mitarbeiter")).strip()
+        hours = _to_float_or_none(row.get("Stunden"))
+        kommentar = _safe_str(row.get("Kommentar")).strip()
+        billed_under = _safe_str(row.get("Fakturiert unter")).strip()
+        if not (2000 <= year <= 2100) or not (1 <= month <= 12):
+            continue
+        if not project or not mitarbeiter or hours is None or hours <= 0:
+            continue
+        cleaned_rows.append({
+            "Jahr": year,
+            "Monat": month,
+            "Projekt": project,
+            "Mitarbeiter": mitarbeiter,
+            "Stunden": round(float(hours), 4),
+            "Kommentar": kommentar,
+            "Fakturiert unter": billed_under,
+        })
+
+    ws = _ensure_table_sheet(wb, MONTHLY_HOUR_ALLOCATIONS_SHEET, MONTHLY_HOUR_ALLOCATION_COLS)
+    _rewrite_table_sheet(ws, MONTHLY_HOUR_ALLOCATION_COLS, cleaned_rows)
+
+
 def _remove_hour_allocations_for_activity_ids(wb: openpyxl.Workbook, activity_ids: List[int]) -> None:
     if HOUR_ALLOCATIONS_SHEET not in wb.sheetnames:
         return
@@ -1944,6 +2018,7 @@ def _collect_known_users(
         project_roles_df: pd.DataFrame,
         team_df: pd.DataFrame,
         hour_allocations_df: Optional[pd.DataFrame],
+        monthly_hour_allocations_df: Optional[pd.DataFrame],
         fallback_user: str,
 ) -> List[str]:
     names: List[str] = []
@@ -1961,6 +2036,9 @@ def _collect_known_users(
     _extend_from_df(team_df, "Mitarbeiter")
     if hour_allocations_df is not None:
         _extend_from_df(hour_allocations_df, "Mitarbeiter")
+    if monthly_hour_allocations_df is not None:
+        _extend_from_df(monthly_hour_allocations_df, "Mitarbeiter")
+        _extend_from_df(monthly_hour_allocations_df, "Fakturiert unter")
 
     explicit_fallback = _safe_str(fallback_user).strip()
     if explicit_fallback and explicit_fallback.casefold() != "ich":
@@ -3186,6 +3264,92 @@ def _apply_hour_allocations_to_viz_base(
     return x
 
 
+def _apply_monthly_hour_allocations_to_viz_base(
+        base: pd.DataFrame,
+        monthly_hour_allocations_df: pd.DataFrame,
+        owner_name: str,
+) -> pd.DataFrame:
+    """Move a monthly project total to another employee for visualisation only."""
+    if base is None or base.empty or monthly_hour_allocations_df is None or monthly_hour_allocations_df.empty:
+        return base
+
+    owner_name = _safe_str(owner_name).strip() or "Ich"
+    allocations = monthly_hour_allocations_df.copy()
+    required_cols = {"Jahr", "Monat", "Projekt", "Mitarbeiter", "Stunden"}
+    if not required_cols.issubset(allocations.columns):
+        return base
+
+    allocations["Jahr"] = pd.to_numeric(allocations["Jahr"], errors="coerce")
+    allocations["Monat"] = pd.to_numeric(allocations["Monat"], errors="coerce")
+    allocations["Stunden"] = pd.to_numeric(allocations["Stunden"], errors="coerce")
+    allocations["Projekt"] = allocations["Projekt"].fillna("").astype(str).str.strip()
+    allocations["Mitarbeiter"] = allocations["Mitarbeiter"].fillna("").astype(str).str.strip()
+    if "Fakturiert unter" not in allocations.columns:
+        allocations["Fakturiert unter"] = ""
+    allocations["Fakturiert unter"] = allocations["Fakturiert unter"].fillna("").astype(str).str.strip()
+    allocations["Fakturiert unter"] = allocations["Fakturiert unter"].replace("", owner_name)
+    allocations = allocations.dropna(subset=["Jahr", "Monat", "Stunden"])
+    allocations = allocations[
+        (allocations["Jahr"] >= 2000)
+        & (allocations["Jahr"] <= 2100)
+        & (allocations["Monat"] >= 1)
+        & (allocations["Monat"] <= 12)
+        & (allocations["Stunden"] > 0)
+        & (allocations["Projekt"] != "")
+        & (allocations["Mitarbeiter"] != "")
+    ].copy()
+    if allocations.empty:
+        return base
+
+    allocations["Jahr"] = allocations["Jahr"].astype(int)
+    allocations["Monat"] = allocations["Monat"].astype(int)
+    x = base.copy()
+    x["_monthly_hours"] = pd.to_numeric(x.get("Hours"), errors="coerce").fillna(0.0)
+    new_rows: List[pd.Series] = []
+
+    for _, allocation in allocations.iterrows():
+        source_name = _safe_str(allocation.get("Fakturiert unter")).strip() or owner_name
+        remaining = float(allocation.get("Stunden") or 0.0)
+        matches = x[
+            (pd.to_numeric(x.get("Year"), errors="coerce") == int(allocation["Jahr"]))
+            & (pd.to_numeric(x.get("Month"), errors="coerce") == int(allocation["Monat"]))
+            & (x["Projekt"].fillna("").astype(str).str.strip() == _safe_str(allocation["Projekt"]).strip())
+            & (x["Mitarbeiter"].fillna("").astype(str).str.strip() == source_name)
+            & (x["_monthly_hours"] > 0)
+        ].copy()
+        sort_cols = [col for col in ["Datum_dt", "_excel_row"] if col in matches.columns]
+        if sort_cols:
+            matches = matches.sort_values(sort_cols, na_position="last")
+
+        for source_idx in matches.index.tolist():
+            if remaining <= 0:
+                break
+            available = float(x.at[source_idx, "_monthly_hours"] or 0.0)
+            moved_hours = min(available, remaining)
+            if moved_hours <= 0:
+                continue
+
+            new_row = x.loc[source_idx].copy()
+            new_row["Hours"] = round(moved_hours, 4)
+            new_row["Mitarbeiter"] = _safe_str(allocation.get("Mitarbeiter")).strip()
+            new_row["Stundenquelle"] = "Pauschale Fremdstunden"
+            new_row["Fakturiert unter"] = source_name
+            new_row["Stundenanteil Kommentar"] = _safe_str(allocation.get("Kommentar")).strip()
+            new_rows.append(new_row)
+
+            x.at[source_idx, "_monthly_hours"] = round(available - moved_hours, 4)
+            x.at[source_idx, "Hours"] = round(available - moved_hours, 4)
+            x.at[source_idx, "Stundenquelle"] = "Fakturiert Rest"
+            x.at[source_idx, "Fakturiert unter"] = source_name
+            remaining -= moved_hours
+
+    x = x[x["_monthly_hours"] > 0.000001].drop(columns=["_monthly_hours"])
+    if new_rows:
+        additions = pd.DataFrame(new_rows).drop(columns=["_monthly_hours"], errors="ignore")
+        x = pd.concat([x, additions], ignore_index=True)
+    return x
+
+
 def _vega_spec_for_chart(
         kind: str,
         x_field: str,
@@ -3345,6 +3509,7 @@ def _render_visualisierung_tab(
         df: pd.DataFrame,
         team_df: pd.DataFrame,
         hour_allocations_df: pd.DataFrame,
+        monthly_hour_allocations_df: pd.DataFrame,
         lookups: Dict[str, Any],
         xlsx_path: Path,
         milestones_df: pd.DataFrame,
@@ -3365,14 +3530,16 @@ def _render_visualisierung_tab(
         combined_df = my_df
 
     billed_base = _viz_base_df(combined_df)
-    if hour_allocations_df is not None and not hour_allocations_df.empty:
+    has_hour_allocations = hour_allocations_df is not None and not hour_allocations_df.empty
+    has_monthly_allocations = monthly_hour_allocations_df is not None and not monthly_hour_allocations_df.empty
+    if has_hour_allocations or has_monthly_allocations:
         hour_view = st.radio(
             "Stundensicht",
             options=["Leistungssicht", "Fakturierte Sicht"],
             index=0,
             horizontal=True,
             help=(
-                "Leistungssicht verteilt gepflegte Stundenanteile auf die tatsächlichen Mitarbeiter. "
+                "Leistungssicht verteilt gepflegte Fremdstunden auf die tatsächlichen Mitarbeiter. "
                 "Fakturierte Sicht zeigt die Daten so, wie sie im Einsatzbericht abgerechnet werden."
             ),
             key=f"viz_hour_view_{'controller' if is_controller else 'employee'}_{own_label}",
@@ -3382,6 +3549,7 @@ def _render_visualisierung_tab(
 
     if hour_view == "Leistungssicht":
         base = _apply_hour_allocations_to_viz_base(billed_base, hour_allocations_df, own_label)
+        base = _apply_monthly_hour_allocations_to_viz_base(base, monthly_hour_allocations_df, own_label)
     else:
         base = billed_base
 
@@ -4208,6 +4376,7 @@ def main() -> None:
         project_roles_df=project_roles_df,
         team_df=team_df,
         hour_allocations_df=data.hour_allocations_df,
+        monthly_hour_allocations_df=data.monthly_hour_allocations_df,
         fallback_user=_safe_str(st.session_state.get("active_user_name", "")),
     )
     remembered_user = _safe_str(st.session_state.get("active_user_name", "")).strip()
@@ -4791,142 +4960,180 @@ def main() -> None:
         st.markdown("---")
         st.caption("Neue Tätigkeiten und Änderungen bitte direkt in der Tabelle oben erfassen.")
 
-        st.markdown("### Stundenanteile")
+        st.markdown("### Pauschale Fremdstunden")
         st.caption(
-            "Diese Zuordnung beeinflusst nur Visualisierung/Controlling. "
-            "Der Einsatzbericht und die Abrechnung bleiben unverändert."
+            "Ordne für ein Projekt und einen Monat Stunden einem anderen Mitarbeiter zu. "
+            "Die Zuordnung wirkt nur in Visualisierung/Controlling, nicht im Einsatzbericht oder in der Abrechnung."
         )
-        allocation_source_df = filtered.copy()
-        if not allocation_source_df.empty and "_excel_row" in allocation_source_df.columns:
-            allocation_source_df = allocation_source_df[allocation_source_df["_excel_row"].notna()].copy()
-        if allocation_source_df.empty:
-            st.info("Keine gespeicherten Tätigkeiten im aktuellen Filter für Stundenanteile verfügbar.")
-        else:
-            allocation_source_df["_label"] = allocation_source_df.apply(
-                lambda r: (
-                    f"{int(r.get('_excel_row'))} | {_format_date(r.get('Datum')) or '-'} | "
-                    f"{_safe_str(r.get('Projekt')).strip() or '-'} | "
-                    f"{_format_time(r.get('Zeit von')) or '--:--'}-{_format_time(r.get('Zeit bis')) or '--:--'} | "
-                    f"{float(r.get('Zahl') or 0):.2f} h | {_safe_str(r.get('Info')).strip()[:80]}"
-                ),
-                axis=1,
+        if data.hour_allocations_df is not None and not data.hour_allocations_df.empty:
+            st.info("Bestehende Einzelzuordnungen werden weiterhin in der Leistungssicht berücksichtigt.")
+
+        existing_monthly_allocations = data.monthly_hour_allocations_df.copy()
+        if existing_monthly_allocations.empty:
+            existing_monthly_allocations = pd.DataFrame(columns=MONTHLY_HOUR_ALLOCATION_COLS)
+        for column in MONTHLY_HOUR_ALLOCATION_COLS:
+            if column not in existing_monthly_allocations.columns:
+                existing_monthly_allocations[column] = ""
+        active_user_key = _safe_str(active_user).strip() or "Ich"
+        allocation_owner = existing_monthly_allocations["Fakturiert unter"].fillna("").astype(str).str.strip()
+        own_allocation_mask = allocation_owner.isin(["", active_user_key])
+
+        allocation_projects = sorted(list(dict.fromkeys(
+            [p for p in projekte_available if _safe_str(p).strip()]
+            + [p for p in existing_monthly_allocations["Projekt"].dropna().astype(str).tolist() if p.strip()]
+        )))
+        allocation_users = sorted(list(dict.fromkeys(
+            [u for u in known_users if _safe_str(u).strip()]
+            + [u for u in existing_monthly_allocations["Mitarbeiter"].dropna().astype(str).tolist() if u.strip()]
+        )))
+
+        def _monthly_allocation_errors(rows: List[Dict[str, Any]]) -> List[str]:
+            source_base = _viz_base_df(df.assign(Mitarbeiter=active_user_key))
+            source_base = _apply_hour_allocations_to_viz_base(
+                source_base, data.hour_allocations_df, active_user_key
             )
-            allocation_options = allocation_source_df["_label"].tolist()
-            selected_allocation_label = st.selectbox(
-                "Tätigkeit für Stundenanteile",
-                options=allocation_options,
-                key="hour_allocation_activity_select",
-            )
-            selected_activity_row = allocation_source_df[
-                allocation_source_df["_label"] == selected_allocation_label
-            ].iloc[0]
-            selected_activity_id = int(selected_activity_row["_excel_row"])
-            selected_activity_hours = float(selected_activity_row.get("Zahl") or 0.0)
-
-            existing_allocations = data.hour_allocations_df.copy()
-            if existing_allocations.empty:
-                existing_allocations = pd.DataFrame(columns=HOUR_ALLOCATION_COLS)
-            existing_selected = existing_allocations[
-                pd.to_numeric(existing_allocations.get("Tätigkeit_ID"), errors="coerce") == selected_activity_id
-            ].copy()
-
-            allocation_editor_df = existing_selected[["Mitarbeiter", "Stunden", "Kommentar"]].copy()
-            if allocation_editor_df.empty:
-                allocation_editor_df = pd.DataFrame(columns=["Mitarbeiter", "Stunden", "Kommentar"])
-            allocation_editor_df["Löschen"] = False
-
-            allocation_user_options = sorted(list(dict.fromkeys(
-                [u for u in known_users if _safe_str(u).strip()]
-                + [u for u in existing_allocations.get("Mitarbeiter", pd.Series(dtype=str)).dropna().astype(str).tolist()
-                   if _safe_str(u).strip()]
-            )))
-
-            allocation_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
-            edited_allocations = allocation_editor_fn(
-                allocation_editor_df[["Mitarbeiter", "Stunden", "Kommentar", "Löschen"]],
-                key=f"hour_allocations_editor_{selected_activity_id}",
-                use_container_width=True,
-                height=180,
-                num_rows="dynamic",
-                hide_index=True,
-                column_config={
-                    "Mitarbeiter": st.column_config.SelectboxColumn(
-                        "Mitarbeiter",
-                        options=allocation_user_options or [""],
-                        required=True,
-                    ),
-                    "Stunden": st.column_config.NumberColumn(
-                        "Stunden",
-                        min_value=0.0,
-                        step=0.25,
-                        format="%.2f",
-                        required=True,
-                    ),
-                    "Kommentar": st.column_config.TextColumn("Kommentar", width="large"),
-                    "Löschen": st.column_config.CheckboxColumn("Löschen", default=False),
-                },
-            )
-
-            allocated_sum = float(
-                pd.to_numeric(
-                    edited_allocations.loc[~edited_allocations["Löschen"].fillna(False), "Stunden"],
-                    errors="coerce",
-                ).fillna(0).sum()
-            ) if not edited_allocations.empty else 0.0
-            st.caption(
-                f"Tätigkeit gesamt: {selected_activity_hours:.2f} h | "
-                f"zugeordnet: {allocated_sum:.2f} h | "
-                f"Rest beim fakturierten Mitarbeiter: {max(selected_activity_hours - allocated_sum, 0):.2f} h"
-            )
-
-            if st.button("Stundenanteile speichern", key=f"save_hour_allocations_{selected_activity_id}"):
-                new_rows_for_activity: List[Dict[str, Any]] = []
-                errors: List[str] = []
-                for _, row in edited_allocations.iterrows():
-                    if bool(row.get("Löschen", False)):
-                        continue
-                    mitarbeiter = _safe_str(row.get("Mitarbeiter")).strip()
-                    hours = _to_float_or_none(row.get("Stunden"))
-                    kommentar = _safe_str(row.get("Kommentar")).strip()
-                    if not mitarbeiter and (hours is None or hours <= 0) and not kommentar:
-                        continue
-                    if not mitarbeiter:
-                        errors.append("Mitarbeiter fehlt.")
-                        continue
-                    if hours is None or hours <= 0:
-                        errors.append(f"Stunden für {mitarbeiter} müssen größer 0 sein.")
-                        continue
-                    new_rows_for_activity.append({
-                        "Tätigkeit_ID": selected_activity_id,
-                        "Mitarbeiter": mitarbeiter,
-                        "Stunden": round(float(hours), 4),
-                        "Kommentar": kommentar,
-                    })
-
-                total_new_hours = sum(float(row["Stunden"]) for row in new_rows_for_activity)
-                if total_new_hours > selected_activity_hours + 0.0001:
+            source_base["Hours"] = pd.to_numeric(source_base.get("Hours"), errors="coerce").fillna(0.0)
+            available = source_base[source_base["Mitarbeiter"] == active_user_key].groupby(
+                ["Year", "Month", "Projekt"], as_index=False
+            )["Hours"].sum()
+            available_by_key = {
+                (int(row["Year"]), int(row["Month"]), _safe_str(row["Projekt"]).strip()): float(row["Hours"])
+                for _, row in available.iterrows()
+            }
+            assigned: Dict[Tuple[int, int, str], float] = {}
+            errors: List[str] = []
+            for row in rows:
+                owner = _safe_str(row.get("Fakturiert unter")).strip() or active_user_key
+                if owner != active_user_key:
+                    continue
+                try:
+                    year = int(float(row.get("Jahr")))
+                    month = int(float(row.get("Monat")))
+                except Exception:
+                    continue
+                project = _safe_str(row.get("Projekt")).strip()
+                hours = _to_float_or_none(row.get("Stunden"))
+                if not project or hours is None or hours <= 0:
+                    continue
+                key = (year, month, project)
+                assigned[key] = assigned.get(key, 0.0) + float(hours)
+            for (year, month, project), assigned_hours in assigned.items():
+                available_hours = available_by_key.get((year, month, project), 0.0)
+                if assigned_hours > available_hours + 0.0001:
                     errors.append(
-                        f"Zuordnung ({total_new_hours:.2f} h) ist größer als die Tätigkeit ({selected_activity_hours:.2f} h)."
+                        f"{project}, {month:02d}/{year}: {assigned_hours:.2f} h Fremdstunden sind größer als "
+                        f"deine verfügbaren {available_hours:.2f} h."
                     )
-                if errors:
-                    st.error("\n".join(errors))
-                    st.stop()
+            return errors
 
-                kept_rows = [
-                    row for row in existing_allocations.to_dict("records")
-                    if int(float(row.get("Tätigkeit_ID") or 0)) != selected_activity_id
-                ]
-                all_allocation_rows = kept_rows + new_rows_for_activity
+        project_options = [""] + allocation_projects
+        project_index = project_options.index(f_project) if f_project in project_options else 0
+        recipient_options = [""] + allocation_users
+        with st.form("monthly_foreign_hours_form", clear_on_submit=True):
+            form_cols = st.columns([1, 1, 2, 2, 1])
+            with form_cols[0]:
+                allocation_year = st.number_input(
+                    "Jahr", min_value=2000, max_value=2100, value=int(f_year), step=1
+                )
+            with form_cols[1]:
+                allocation_month = st.selectbox(
+                    "Monat", options=list(range(1, 13)), index=max(0, min(11, int(f_month) - 1))
+                )
+            with form_cols[2]:
+                allocation_project = st.selectbox(
+                    "Kunde / Projekt", options=project_options, index=project_index,
+                    format_func=lambda value: "Projekt auswählen" if value == "" else value,
+                )
+            with form_cols[3]:
+                allocation_recipient = st.selectbox(
+                    "Mitarbeiter", options=recipient_options, index=0,
+                    format_func=lambda value: "Mitarbeiter auswählen" if value == "" else value,
+                )
+            with form_cols[4]:
+                allocation_hours = st.number_input("Stunden", min_value=0.25, step=0.25, value=0.25, format="%.2f")
+            allocation_comment = st.text_input("Kommentar (optional)")
+            add_monthly_allocation = st.form_submit_button("Fremdstunden zuordnen")
 
-                def _mutator_hour_allocations(wb):
-                    _write_hour_allocations(wb, all_allocation_rows)
+        if add_monthly_allocation:
+            allocation_project = _safe_str(allocation_project).strip()
+            allocation_recipient = _safe_str(allocation_recipient).strip()
+            errors: List[str] = []
+            if not allocation_project:
+                errors.append("Bitte ein Projekt auswählen.")
+            if not allocation_recipient:
+                errors.append("Bitte einen Mitarbeiter auswählen.")
+            if allocation_recipient == active_user_key:
+                errors.append("Fremdstunden müssen einem anderen Mitarbeiter zugeordnet werden.")
+            new_row = {
+                "Jahr": int(allocation_year),
+                "Monat": int(allocation_month),
+                "Projekt": allocation_project,
+                "Mitarbeiter": allocation_recipient,
+                "Stunden": round(float(allocation_hours), 4),
+                "Kommentar": _safe_str(allocation_comment).strip(),
+                "Fakturiert unter": active_user_key,
+            }
+            all_rows = existing_monthly_allocations.to_dict("records") + [new_row]
+            errors.extend(_monthly_allocation_errors(all_rows))
+            if errors:
+                st.error("\n".join(errors))
+            else:
+                def _mutator_monthly_hour_allocations(wb):
+                    _write_monthly_hour_allocations(wb, all_rows)
 
-                ok, msg = _save_workbook(data.path, _mutator_hour_allocations)
+                ok, msg = _save_workbook(data.path, _mutator_monthly_hour_allocations)
                 if ok:
-                    st.success(f"Stundenanteile gespeichert. {msg}")
+                    st.success(f"Fremdstunden zugeordnet. {msg}")
                     _refresh_after_workbook_change()
                 else:
                     st.error(msg)
+
+        own_monthly_allocations = existing_monthly_allocations.loc[own_allocation_mask].copy()
+        own_monthly_indices = own_monthly_allocations.index.tolist()
+        if own_monthly_allocations.empty:
+            st.caption("Noch keine pauschalen Fremdstunden für deinen Benutzer erfasst.")
+        else:
+            st.markdown("#### Gespeicherte Fremdstunden")
+            deletion_editor = own_monthly_allocations[
+                ["Jahr", "Monat", "Projekt", "Mitarbeiter", "Stunden", "Kommentar"]
+            ].copy()
+            deletion_editor["Löschen"] = False
+            allocation_editor_fn = getattr(st, "data_editor", None) or getattr(st, "experimental_data_editor")
+            edited_monthly_allocations = allocation_editor_fn(
+                deletion_editor,
+                key="monthly_foreign_hours_delete_editor",
+                use_container_width=True,
+                hide_index=True,
+                disabled=["Jahr", "Monat", "Projekt", "Mitarbeiter", "Stunden", "Kommentar"],
+                column_config={
+                    "Monat": st.column_config.NumberColumn("Monat", format="%d"),
+                    "Stunden": st.column_config.NumberColumn("Stunden", format="%.2f"),
+                    "Löschen": st.column_config.CheckboxColumn("Löschen", default=False),
+                },
+            )
+            if st.button("Ausgewählte Fremdstunden löschen", key="delete_monthly_foreign_hours"):
+                delete_indices = {
+                    own_monthly_indices[pos]
+                    for pos, (_, row) in enumerate(edited_monthly_allocations.iterrows())
+                    if bool(row.get("Löschen", False)) and pos < len(own_monthly_indices)
+                }
+                if not delete_indices:
+                    st.info("Bitte mindestens eine Zuordnung zum Löschen auswählen.")
+                else:
+                    remaining_rows = [
+                        row for idx, row in enumerate(existing_monthly_allocations.to_dict("records"))
+                        if idx not in delete_indices
+                    ]
+
+                    def _mutator_delete_monthly_hour_allocations(wb):
+                        _write_monthly_hour_allocations(wb, remaining_rows)
+
+                    ok, msg = _save_workbook(data.path, _mutator_delete_monthly_hour_allocations)
+                    if ok:
+                        st.success(f"{len(delete_indices)} Fremdstunden-Zuordnung(en) gelöscht. {msg}")
+                        _refresh_after_workbook_change()
+                    else:
+                        st.error(msg)
 
         st.markdown("---")
         st.markdown("### Schnellaktion")
@@ -6174,6 +6381,7 @@ def main() -> None:
             df,
             team_df,
             data.hour_allocations_df,
+            data.monthly_hour_allocations_df,
             lookups,
             data.path,
             data.milestones_df,
