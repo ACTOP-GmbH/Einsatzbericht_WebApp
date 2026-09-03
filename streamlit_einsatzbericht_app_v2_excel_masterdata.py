@@ -6272,12 +6272,58 @@ def main() -> None:
                     rights_editor_df[c] = ""
             rights_editor_df["Löschen"] = False
 
+            with st.form("user_rights_upsert_form", clear_on_submit=True):
+                user_form_cols = st.columns([2, 1])
+                with user_form_cols[0]:
+                    new_user_name = st.text_input("Mitarbeitername")
+                with user_form_cols[1]:
+                    new_user_view = st.selectbox(
+                        "Ansicht",
+                        options=[VIEW_MODE_EMPLOYEE, VIEW_MODE_CONTROLLER],
+                        index=0,
+                    )
+                upsert_user_clicked = st.form_submit_button("Mitarbeiter anlegen / aktualisieren")
+
+            if upsert_user_clicked:
+                cleaned_user_name = _safe_str(new_user_name).strip()
+                if not cleaned_user_name:
+                    st.error("Bitte einen Mitarbeiternamen eingeben.")
+                else:
+                    upserted_rights = rights_editor_df[USER_RIGHTS_COLS].to_dict("records")
+                    matched_user = False
+                    for row in upserted_rights:
+                        if _safe_str(row.get("Mitarbeiter")).strip().casefold() == cleaned_user_name.casefold():
+                            row["Mitarbeiter"] = cleaned_user_name
+                            row["Ansicht"] = _normalize_view_mode(new_user_view)
+                            matched_user = True
+                            break
+                    if not matched_user:
+                        upserted_rights.append({
+                            "Mitarbeiter": cleaned_user_name,
+                            "Ansicht": _normalize_view_mode(new_user_view),
+                        })
+
+                    if not any(row["Ansicht"] == VIEW_MODE_CONTROLLER for row in upserted_rights):
+                        st.error("Mindestens ein Benutzer muss im Controller-Modus bleiben.")
+                    else:
+                        def _mutator_upsert_user_rights(wb):
+                            ws = _ensure_table_sheet(wb, USER_RIGHTS_SHEET, USER_RIGHTS_COLS)
+                            _rewrite_table_sheet(ws, USER_RIGHTS_COLS, upserted_rights)
+
+                        ok, msg = _save_workbook(data.path, _mutator_upsert_user_rights)
+                        if ok:
+                            st.success(f"Mitarbeiter '{cleaned_user_name}' gespeichert. {msg}")
+                            _refresh_after_workbook_change()
+                        else:
+                            st.error(msg)
+
+            st.caption("Bestehende Benutzer können in der Tabelle bearbeitet oder gelöscht werden.")
             edited_rights_df = controller_data_editor(
                 rights_editor_df[USER_RIGHTS_COLS + ["Löschen"]],
                 key="user_rights_editor",
                 use_container_width=True,
                 height=240,
-                num_rows="dynamic",
+                num_rows="fixed",
                 hide_index=True,
                 column_config={
                     "Mitarbeiter": st.column_config.TextColumn("Mitarbeiter", width="medium"),
@@ -6334,12 +6380,79 @@ def main() -> None:
                 [p for p in role_editor_df.get("Projekt", pd.Series(dtype=str)).dropna().astype(str).tolist() if p]
             )))
 
+            role_user_options = sorted(list(dict.fromkeys(
+                [u for u in known_users if _safe_str(u).strip()]
+                + [u for u in rights_editor_df.get("Mitarbeiter", pd.Series(dtype=str)).dropna().astype(str).tolist()
+                   if _safe_str(u).strip()]
+            )))
+            with st.form("project_role_upsert_form", clear_on_submit=True):
+                role_form_cols = st.columns([2, 2, 2])
+                with role_form_cols[0]:
+                    role_user = st.selectbox(
+                        "Mitarbeiter",
+                        options=[""] + role_user_options,
+                        format_func=lambda value: "Mitarbeiter auswählen" if value == "" else value,
+                    )
+                with role_form_cols[1]:
+                    role_project = st.selectbox(
+                        "Projekt",
+                        options=[""] + role_project_options,
+                        format_func=lambda value: "Projekt auswählen" if value == "" else value,
+                    )
+                with role_form_cols[2]:
+                    role_name = st.text_input("Rolle")
+                upsert_role_clicked = st.form_submit_button("Projektrolle zuweisen / aktualisieren")
+
+            if upsert_role_clicked:
+                cleaned_role_user = _safe_str(role_user).strip()
+                cleaned_role_project = _safe_str(role_project).strip()
+                cleaned_role_name = _safe_str(role_name).strip()
+                role_errors: List[str] = []
+                if not cleaned_role_user:
+                    role_errors.append("Bitte einen Mitarbeiter auswählen.")
+                if not cleaned_role_project:
+                    role_errors.append("Bitte ein Projekt auswählen.")
+                if role_errors:
+                    st.error("\n".join(role_errors))
+                else:
+                    upserted_roles = role_editor_df[PROJECT_ROLE_COLS].to_dict("records")
+                    matched_role = False
+                    for row in upserted_roles:
+                        same_user = _safe_str(row.get("Mitarbeiter")).strip().casefold() == cleaned_role_user.casefold()
+                        same_project = _safe_str(row.get("Projekt")).strip().casefold() == cleaned_role_project.casefold()
+                        if same_user and same_project:
+                            row["Mitarbeiter"] = cleaned_role_user
+                            row["Projekt"] = cleaned_role_project
+                            row["Rolle"] = cleaned_role_name
+                            matched_role = True
+                            break
+                    if not matched_role:
+                        upserted_roles.append({
+                            "Mitarbeiter": cleaned_role_user,
+                            "Projekt": cleaned_role_project,
+                            "Rolle": cleaned_role_name,
+                        })
+
+                    def _mutator_upsert_project_role(wb):
+                        ws = _ensure_table_sheet(wb, PROJECT_ROLES_SHEET, PROJECT_ROLE_COLS)
+                        _rewrite_table_sheet(ws, PROJECT_ROLE_COLS, upserted_roles)
+
+                    ok, msg = _save_workbook(data.path, _mutator_upsert_project_role)
+                    if ok:
+                        st.success(
+                            f"Projektrolle für '{cleaned_role_user}' bei '{cleaned_role_project}' gespeichert. {msg}"
+                        )
+                        _refresh_after_workbook_change()
+                    else:
+                        st.error(msg)
+
+            st.caption("Bestehende Projektrollen können in der Tabelle bearbeitet oder gelöscht werden.")
             edited_roles_df = controller_data_editor(
                 role_editor_df[PROJECT_ROLE_COLS + ["Löschen"]],
                 key="project_roles_editor",
                 use_container_width=True,
                 height=280,
-                num_rows="dynamic",
+                num_rows="fixed",
                 hide_index=True,
                 column_config={
                     "Mitarbeiter": st.column_config.TextColumn("Mitarbeiter", width="medium"),
