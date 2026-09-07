@@ -3350,6 +3350,24 @@ def _apply_monthly_hour_allocations_to_viz_base(
     return x
 
 
+def _months_for_running_average(
+        monthly_scope_view: pd.DataFrame,
+        selected_year: int,
+        today: dt.date,
+) -> int:
+    if selected_year < today.year:
+        return 12
+
+    observed_month = (
+        int(monthly_scope_view["YM_dt"].dt.month.max())
+        if not monthly_scope_view.empty
+        else 1
+    )
+    if selected_year == today.year:
+        return max(1, min(int(today.month), observed_month))
+    return max(1, observed_month)
+
+
 def _vega_spec_for_chart(
         kind: str,
         x_field: str,
@@ -3498,10 +3516,18 @@ def _render_chart_block(
         st.session_state[spec_key] = json.dumps(default_spec, ensure_ascii=False, indent=2)
         spec = default_spec
 
+    try:
+        data_hash = hashlib.sha256(
+            pd.util.hash_pandas_object(df, index=True, categorize=True).values.tobytes()
+        ).hexdigest()[:12]
+    except Exception:
+        data_hash = hashlib.sha256(df.to_json(default_handler=str).encode("utf-8")).hexdigest()[:12]
+
     st.vega_lite_chart(
         data=df,
         spec=spec,
         use_container_width=True,
+        key=f"{key_prefix}_chart_{data_hash}",
     )
 
 
@@ -4024,15 +4050,15 @@ def _render_visualisierung_tab(
         avg_label = "Durchschnitt sichtbar"
     else:
         total_year_hours = float(monthly_scope_view["Hours"].sum() or 0.0)
+        months_so_far = _months_for_running_average(monthly_scope_view, selected_year_int, today)
         if selected_year_int < today.year:
-            months_so_far = 12
             avg_caption = f"Berechnet ueber das vollstaendige Jahr {selected_year_int} (12 Monate)."
         elif selected_year_int == today.year:
-            months_so_far = int(today.month)
-            avg_caption = f"Berechnet bisher fuer {selected_year_int} bis einschliesslich Monat {months_so_far:02d}."
+            avg_caption = (
+                f"Berechnet bisher fuer {selected_year_int} bis zum letzten Monat mit Eintraegen "
+                f"({months_so_far:02d}/{selected_year_int})."
+            )
         else:
-            observed_month = int(monthly_scope_view["YM_dt"].dt.month.max()) if not monthly_scope_view.empty else 1
-            months_so_far = max(1, observed_month)
             avg_caption = f"Berechnet bis zum letzten vorhandenen Monat {months_so_far:02d}/{selected_year_int}."
         avg_hours = total_year_hours / max(1, months_so_far)
         avg_label = "Durchschnitt bisher"
@@ -4043,6 +4069,13 @@ def _render_visualisierung_tab(
 
     st.markdown("### Monatssumme (projektübergreifend)")
     st.caption("Diese Ansicht ignoriert den Projektfilter und summiert die Stunden pro Monat über alle Projekte der aktuellen Auswahl.")
+    if sel_mitarbeiter:
+        st.caption(f"Mitarbeiterbasis: {', '.join(sel_mitarbeiter)}.")
+    else:
+        st.caption(
+            "Mitarbeiterbasis: alle Mitarbeiter. In der Leistungssicht werden Fremdstunden zwischen Mitarbeitern "
+            "verschoben; die Gesamtsumme bleibt deshalb unverändert. Für den Eigenanteil bitte einen Mitarbeiter auswählen."
+        )
     ms1, ms2, ms3, ms4 = st.columns(4)
     ms1.metric("Jahr", monthly_selected_year)
     ms2.metric("Stunden gesamt", f"{float(monthly_scope_view['Hours'].sum() or 0.0):.2f} h")
