@@ -4546,8 +4546,8 @@ def main() -> None:
                         "Pause_Min": 0,
                         "km": 0,
                         "Tätigkeit": default_type,
-                        "Abgerechnet": "",
-                        "eingetragen": "",
+                        "Abgerechnet": "nein",
+                        "eingetragen": "ja",
                     }
                 )
                 editor_df = pd.DataFrame([placeholder], columns=editor_cols)
@@ -4618,6 +4618,7 @@ def main() -> None:
 
             def _apply_inline_defaults(row: Dict[str, Any]) -> bool:
                 changed = False
+                is_new_row = _missing_excel_row_value(row.get("_excel_row"))
                 if _is_blank(row.get("Datum")):
                     changed = _set_row_value(row, "Datum", today_default) or changed
                 if _is_blank(row.get("Projekt")) and default_project:
@@ -4628,6 +4629,10 @@ def main() -> None:
                     changed = _set_row_value(row, "km", 0) or changed
                 if _is_blank(row.get("Tätigkeit")):
                     changed = _set_row_value(row, "Tätigkeit", default_type) or changed
+                if is_new_row and _is_blank(row.get("Abgerechnet")):
+                    changed = _set_row_value(row, "Abgerechnet", "nein") or changed
+                if is_new_row and _is_blank(row.get("eingetragen")):
+                    changed = _set_row_value(row, "eingetragen", "ja") or changed
                 for text_col in (
                         "Zeit von",
                         "Zeit bis",
@@ -4666,6 +4671,23 @@ def main() -> None:
             editor_nonce = int(st.session_state.get("_taetigkeiten_inline_editor_nonce", 0) or 0)
             editor_key = f"taetigkeiten_inline_editor_v4_{editor_nonce}"
             editor_input_df = editor_df[editor_cols + ["Löschen"]].copy()
+            editor_scope = (int(f_year), int(f_month), _safe_str(f_project), bool(f_include_abg))
+            editor_override_key = "_taetigkeiten_inline_editor_override"
+            editor_pending_deletes_key = "_taetigkeiten_inline_pending_deletes"
+            editor_override = st.session_state.get(editor_override_key)
+            if (
+                    isinstance(editor_override, dict)
+                    and editor_override.get("scope") == editor_scope
+                    and isinstance(editor_override.get("data"), pd.DataFrame)
+            ):
+                editor_input_df = editor_override["data"].copy()
+                for column in editor_cols + ["Löschen"]:
+                    if column not in editor_input_df.columns:
+                        editor_input_df[column] = False if column == "Löschen" else None
+                editor_input_df = editor_input_df[editor_cols + ["Löschen"]]
+            elif editor_override is not None:
+                st.session_state.pop(editor_override_key, None)
+                st.session_state.pop(editor_pending_deletes_key, None)
             editor_row_by_pos: Dict[int, int] = {}
             editor_row_by_index: Dict[Any, int] = {}
             for row_pos, (row_index, row) in enumerate(editor_input_df.iterrows()):
@@ -4696,53 +4718,67 @@ def main() -> None:
                     return numeric_key
                 return None
 
-            editor_state_changed = False
-            editor_deleted_excel_rows: set[int] = set()
+            editor_deleted_excel_rows: set[int] = set(
+                int(value)
+                for value in st.session_state.get(editor_pending_deletes_key, [])
+                if not _missing_excel_row_value(value)
+            )
             editor_state = st.session_state.get(editor_key)
             if isinstance(editor_state, dict):
                 edited_rows = editor_state.get("edited_rows")
-                if isinstance(edited_rows, dict):
+                added_rows = editor_state.get("added_rows")
+                deleted_rows = editor_state.get("deleted_rows")
+                has_editor_changes = (
+                    bool(edited_rows) or bool(added_rows) or bool(deleted_rows)
+                )
+                if has_editor_changes:
+                    materialized_df = editor_input_df.copy()
+                if has_editor_changes and isinstance(edited_rows, dict):
                     for row_key, changes in edited_rows.items():
                         if not isinstance(changes, dict):
                             continue
                         row_pos = _editor_state_row_pos(row_key)
                         if row_pos is None:
                             continue
-                        if 0 <= row_pos < len(editor_input_df):
-                            merged = editor_input_df.iloc[row_pos].to_dict()
+                        if 0 <= row_pos < len(materialized_df):
+                            merged = materialized_df.iloc[row_pos].to_dict()
                             merged.update(changes)
-                            editor_state_changed = _set_row_value(
-                                changes,
-                                "Zahl",
-                                _calc_hours_display(
-                                    merged.get("Zeit von"),
-                                    merged.get("Zeit bis"),
-                                    merged.get("Pause_Min"),
-                                    merged.get("Zahl"),
-                                ),
-                            ) or editor_state_changed
-                            merged.update(changes)
-                            editor_state_changed = _set_row_value(
-                                changes,
-                                "Dauer",
-                                _calc_dauer_str(
-                                    merged.get("Zeit von"),
-                                    merged.get("Zeit bis"),
-                                    merged.get("Pause_Min"),
-                                    merged.get("Zahl"),
-                                ),
-                            ) or editor_state_changed
-                added_rows = editor_state.get("added_rows")
-                if isinstance(added_rows, list):
+                            _apply_inline_defaults(merged)
+                            for column in editor_cols + ["Löschen"]:
+                                materialized_df.iat[row_pos, materialized_df.columns.get_loc(column)] = merged.get(column)
+                if has_editor_changes and isinstance(added_rows, list):
                     for row in added_rows:
                         if isinstance(row, dict):
-                            editor_state_changed = _apply_inline_defaults(row) or editor_state_changed
-                deleted_rows = editor_state.get("deleted_rows")
-                if isinstance(deleted_rows, list):
+                            new_row = {column: None for column in editor_cols + ["Löschen"]}
+                            new_row.update(row)
+                            new_row["Löschen"] = bool(new_row.get("Löschen", False))
+                            _apply_inline_defaults(new_row)
+                            materialized_df = pd.concat(
+                                [materialized_df, pd.DataFrame([new_row], columns=editor_cols + ["Löschen"])],
+                                ignore_index=True,
+                            )
+                rows_to_drop: List[int] = []
+                if has_editor_changes and isinstance(deleted_rows, list):
                     for row_key in deleted_rows:
                         row_pos = _editor_state_row_pos(row_key)
-                        if row_pos is not None and row_pos in editor_row_by_pos:
+                        if row_pos is None:
+                            continue
+                        rows_to_drop.append(row_pos)
+                        if row_pos in editor_row_by_pos:
                             editor_deleted_excel_rows.add(editor_row_by_pos[row_pos])
+                if has_editor_changes:
+                    if rows_to_drop:
+                        materialized_df = materialized_df.drop(
+                            materialized_df.index[sorted(set(rows_to_drop))], errors="ignore"
+                        ).reset_index(drop=True)
+                    st.session_state[editor_pending_deletes_key] = sorted(editor_deleted_excel_rows)
+                    st.session_state[editor_override_key] = {
+                        "scope": editor_scope,
+                        "data": materialized_df.reset_index(drop=True),
+                    }
+                    st.session_state.pop(editor_key, None)
+                    st.session_state["_taetigkeiten_inline_editor_nonce"] = editor_nonce + 1
+                    st.rerun()
 
             edited_df = data_editor_fn(
                 editor_input_df,
@@ -4774,6 +4810,7 @@ def main() -> None:
                                                         width="small"),
                     "Dauer": st.column_config.TextColumn("Dauer",
                                                          help="Berechnet aus Zeit von/bis und Pause (oder Zeit h)",
+                                                         default="",
                                                          width="small"),
                     "km": st.column_config.NumberColumn("km", min_value=0, step=1, default=0),
                     "Tätigkeit": st.column_config.SelectboxColumn("Tätigkeit", options=typen_opts,
@@ -4784,9 +4821,9 @@ def main() -> None:
                                                                         default=""),
                     "Info": st.column_config.TextColumn("Leistungsbeschreibung", width="large", default=""),
                     "Abgerechnet": st.column_config.SelectboxColumn("Abgerechnet", options=[""] + ja_nein_opts,
-                                                                    default=""),
+                                                                    default="nein"),
                     "eingetragen": st.column_config.SelectboxColumn("eingetragen", options=[""] + ja_nein_opts,
-                                                                   default=""),
+                                                                   default="ja"),
                     "Löschen": st.column_config.CheckboxColumn("Löschen", default=False),
                 },
             )
@@ -4809,13 +4846,20 @@ def main() -> None:
                 except Exception:
                     km_val = 0
 
+                hours_value = _calc_hours_value(
+                    r.get("Zeit von"),
+                    r.get("Zeit bis"),
+                    pause_min,
+                    r.get("Zahl"),
+                )
+
                 return {
                     "Datum": _to_date(r.get("Datum")),
                     "Projekt": _safe_str(r.get("Projekt")).strip(),
                     "Zeit von": _to_time(r.get("Zeit von")),
                     "Zeit bis": _to_time(r.get("Zeit bis")),
                     "Pause_Min": pause_min,
-                    "Zahl": r.get("Zahl"),
+                    "Zahl": hours_value,
                     "km": km_val,
                     "Tätigkeit": _safe_str(r.get("Tätigkeit")).strip(),
                     "Kodierung": (
@@ -4937,6 +4981,10 @@ def main() -> None:
                             rec["Projekt"] = default_project
                         if not rec.get("Tätigkeit"):
                             rec["Tätigkeit"] = default_type
+                        if not rec.get("Abgerechnet"):
+                            rec["Abgerechnet"] = "nein"
+                        if not rec.get("eingetragen"):
+                            rec["eingetragen"] = "ja"
                         if rec.get("Projekt") and rec.get("Datum"):
                             inserts.append(rec)
                         continue
@@ -4982,13 +5030,12 @@ def main() -> None:
                         f"Gespeichert. Updates: {len(updates)}, Neu: {len(inserts)}, Gelöscht: {len(deletes)}. {msg}"
                     )
                     st.session_state.pop(editor_key, None)
+                    st.session_state.pop(editor_override_key, None)
+                    st.session_state.pop(editor_pending_deletes_key, None)
                     st.session_state["_taetigkeiten_inline_editor_nonce"] = editor_nonce + 1
                     _refresh_after_workbook_change()
                 else:
                     st.error(msg)
-
-            if editor_state_changed and not save_inline_clicked:
-                st.rerun()
 
         st.markdown("---")
         st.caption("Neue Tätigkeiten und Änderungen bitte direkt in der Tabelle oben erfassen.")
